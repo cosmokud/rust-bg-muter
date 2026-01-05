@@ -19,7 +19,6 @@ pub struct BackgroundMuterApp {
     engine: Arc<RwLock<MuterEngine>>,
     tray: Option<SystemTray>,
     tray_init_failed: bool,
-    tray_ctx_set: bool,
     allow_close: bool,
     start_hidden: bool,
     applied_start_hidden: bool,
@@ -30,8 +29,6 @@ pub struct BackgroundMuterApp {
     show_settings: bool,
     status_message: Option<(String, Instant)>,
     search_filter: String,
-    /// Deferred flag to show window (avoids deadlock from tray handler)
-    pending_show_window: bool,
     /// Track the last known minimized state to detect minimize button clicks
     was_minimized: bool,
 }
@@ -76,7 +73,6 @@ impl BackgroundMuterApp {
             engine,
             tray,
             tray_init_failed,
-            tray_ctx_set: false,
             allow_close: false,
             start_hidden,
             applied_start_hidden: start_hidden,
@@ -87,7 +83,6 @@ impl BackgroundMuterApp {
             show_settings: false,
             status_message: None,
             search_filter: String::new(),
-            pending_show_window: false,
             was_minimized: start_hidden,
         }
     }
@@ -110,10 +105,7 @@ impl BackgroundMuterApp {
 
         for event in events {
             match event {
-                TrayEvent::OpenWindow | TrayEvent::SingleClick => {
-                    // Defer window show to avoid deadlock when called from tray menu handler
-                    self.pending_show_window = true;
-                }
+                TrayEvent::OpenWindow => self.show_window(ctx),
                 TrayEvent::ToggleMuting => {
                     let enabled = self.config.write().toggle_muting();
                     if let Some(tray) = self.tray.as_mut() {
@@ -560,22 +552,8 @@ impl eframe::App for BackgroundMuterApp {
             self.applied_start_hidden = true;
         }
 
-        // Set egui context on tray so event handlers can wake up the event loop
-        if !self.tray_ctx_set {
-            if let Some(ref tray) = self.tray {
-                tray.set_egui_context(ctx.clone());
-                self.tray_ctx_set = true;
-            }
-        }
-
-        // Process tray events first (this may set pending_show_window)
+        // Process tray events
         self.process_tray(ctx);
-
-        // Handle deferred show window (avoids deadlock when called from tray menu handler)
-        if self.pending_show_window {
-            self.pending_show_window = false;
-            self.show_window(ctx);
-        }
 
         // Handle minimize button: detect transition to minimized state
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
@@ -600,7 +578,7 @@ impl eframe::App for BackgroundMuterApp {
             // If minimize_to_tray is false, allow the close to proceed
         }
 
-        let _ = frame; // frame kept for future integrations
+        let _ = frame; // keep borrowed for future integrations
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.set_min_width(500.0);

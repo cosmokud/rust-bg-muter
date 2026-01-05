@@ -8,6 +8,7 @@ pub mod config;
 pub mod gui;
 pub mod muter;
 pub mod process;
+pub mod startup;
 pub mod tray;
 
 pub use audio::AudioManager;

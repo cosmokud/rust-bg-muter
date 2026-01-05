@@ -3,6 +3,7 @@
 
 use crate::config::Config;
 use crate::muter::{AppAudioState, MuterEngine};
+use crate::startup;
 use eframe::egui::{self, Color32, RichText, Vec2, Visuals};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -307,9 +308,12 @@ impl BackgroundMuterApp {
         ui.label(RichText::new("⚙ Settings").size(18.0).strong());
         ui.add_space(8.0);
         
+        let mut pending_startup_change: Option<bool> = None;
+        let mut pending_status: Option<String> = None;
+
         {
             let mut config = self.config.write();
-            
+
             ui.horizontal(|ui| {
                 ui.label("Poll interval (ms):");
                 let mut interval = config.poll_interval_ms as i32;
@@ -318,7 +322,7 @@ impl BackgroundMuterApp {
                     let _ = config.save();
                 }
             });
-            
+
             ui.horizontal(|ui| {
                 let mut start_minimized = config.start_minimized;
                 if ui.checkbox(&mut start_minimized, "Start minimized to tray").changed() {
@@ -326,6 +330,30 @@ impl BackgroundMuterApp {
                     let _ = config.save();
                 }
             });
+
+            ui.horizontal(|ui| {
+                let mut start_with_windows = config.start_with_windows;
+                if ui.checkbox(&mut start_with_windows, "Run at startup").changed() {
+                    pending_startup_change = Some(start_with_windows);
+                }
+            });
+        }
+
+        if let Some(enable) = pending_startup_change {
+            match startup::set_run_at_startup(enable) {
+                Ok(()) => {
+                    let mut config = self.config.write();
+                    config.start_with_windows = enable;
+                    let _ = config.save();
+                }
+                Err(e) => {
+                    pending_status = Some(format!("Failed to update startup: {}", e));
+                }
+            }
+        }
+
+        if let Some(msg) = pending_status {
+            self.set_status(msg);
         }
         
         ui.add_space(8.0);

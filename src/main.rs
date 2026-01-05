@@ -11,6 +11,7 @@ mod config;
 mod gui;
 mod muter;
 mod process;
+mod startup;
 mod tray;
 
 use config::Config;
@@ -40,6 +41,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
     let config = Arc::new(RwLock::new(Config::load()));
     log::info!("Configuration loaded");
+
+    // Best-effort: ensure startup registry matches config
+    {
+        let start_with_windows = config.read().start_with_windows;
+        if let Err(e) = startup::apply_startup_setting(start_with_windows) {
+            log::warn!("Failed to apply startup setting: {}", e);
+        }
+    }
 
     // Create the muting engine
     let engine = Arc::new(RwLock::new(
@@ -134,6 +143,8 @@ fn run_tray_only(
     tray.initialize(config.read().muting_enabled)?;
     log::info!("System tray initialized");
 
+    let mut last_muting_enabled = config.read().muting_enabled;
+
     while !should_exit.load(Ordering::Relaxed) {
         for event in tray.process_events() {
             match event {
@@ -145,6 +156,7 @@ fn run_tray_only(
                 TrayEvent::ToggleMuting => {
                     let enabled = config.write().toggle_muting();
                     let _ = tray.update_icon(enabled);
+                    last_muting_enabled = enabled;
 
                     if !enabled {
                         if let Some(mut eng) = engine.try_write() {
@@ -161,9 +173,12 @@ fn run_tray_only(
             }
         }
 
-        // Update tray icon based on current state
+        // Update tray icon only if state changed (avoids flicker/unresponsive tray)
         let muting_enabled = config.read().muting_enabled;
-        let _ = tray.update_icon(muting_enabled);
+        if muting_enabled != last_muting_enabled {
+            let _ = tray.update_icon(muting_enabled);
+            last_muting_enabled = muting_enabled;
+        }
 
         thread::sleep(Duration::from_millis(50));
     }

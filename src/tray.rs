@@ -28,7 +28,11 @@ pub struct SystemTray {
     tray_icon: Option<TrayIcon>,
     event_receiver: Receiver<TrayEvent>,
     event_sender: Sender<TrayEvent>,
+    menu_open_id: Option<tray_icon::menu::MenuId>,
+    menu_toggle: Option<MenuItem>,
     menu_toggle_id: Option<tray_icon::menu::MenuId>,
+    menu_exit_id: Option<tray_icon::menu::MenuId>,
+    last_muting_enabled: Option<bool>,
 }
 
 impl SystemTray {
@@ -40,7 +44,11 @@ impl SystemTray {
             tray_icon: None,
             event_receiver,
             event_sender,
+            menu_open_id: None,
+            menu_toggle: None,
             menu_toggle_id: None,
+            menu_exit_id: None,
+            last_muting_enabled: None,
         })
     }
 
@@ -67,7 +75,11 @@ impl SystemTray {
         menu.append(&menu_separator)?;
         menu.append(&menu_exit)?;
 
+        self.menu_open_id = Some(menu_open.id().clone());
         self.menu_toggle_id = Some(menu_toggle.id().clone());
+        self.menu_exit_id = Some(menu_exit.id().clone());
+        self.menu_toggle = Some(menu_toggle.clone());
+        self.last_muting_enabled = Some(muting_enabled);
 
         // Build the tray icon
         let tray_icon = TrayIconBuilder::new()
@@ -92,11 +104,16 @@ impl SystemTray {
     }
 
     /// Updates the tray icon based on muting state
-    pub fn update_icon(&self, muting_enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn update_icon(&mut self, muting_enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if self.last_muting_enabled == Some(muting_enabled) {
+            return Ok(());
+        }
+        self.last_muting_enabled = Some(muting_enabled);
+
         if let Some(ref tray) = self.tray_icon {
             let icon = create_tray_icon(muting_enabled)?;
             tray.set_icon(Some(icon))?;
-            
+
             let tooltip = if muting_enabled {
                 "Background Muter - Active"
             } else {
@@ -104,6 +121,16 @@ impl SystemTray {
             };
             tray.set_tooltip(Some(tooltip))?;
         }
+
+        if let Some(ref menu_toggle) = self.menu_toggle {
+            let toggle_text = if muting_enabled {
+                "Disable Muting"
+            } else {
+                "Enable Muting"
+            };
+            let _ = menu_toggle.set_text(toggle_text);
+        }
+
         Ok(())
     }
 
@@ -126,19 +153,14 @@ impl SystemTray {
 
         // Process menu events
         while let Ok(event) = MenuEvent::receiver().try_recv() {
-            // Match by menu item text/position
-            let id_str = event.id.0.as_str();
-            
-            if id_str.contains("Open") || id_str == "1001" {
+            if self.menu_open_id.as_ref() == Some(&event.id) {
                 events.push(TrayEvent::OpenWindow);
-            } else if id_str.contains("able Muting") || id_str.contains("Toggle") {
+            } else if self.menu_toggle_id.as_ref() == Some(&event.id) {
                 events.push(TrayEvent::ToggleMuting);
-            } else if id_str.contains("Exit") || id_str.contains("Quit") {
+            } else if self.menu_exit_id.as_ref() == Some(&event.id) {
                 events.push(TrayEvent::Exit);
             } else {
-                // Try to determine by the menu item order
-                // Menu order: Open Window (0), Toggle Muting (1), separator (2), Exit (3)
-                log::debug!("Unknown menu event: {:?}", id_str);
+                log::debug!("Unknown menu event: {:?}", event.id);
             }
         }
 

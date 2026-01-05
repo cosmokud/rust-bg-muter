@@ -6,7 +6,9 @@ use crate::muter::{AppAudioState, MuterEngine};
 use crate::startup;
 use crate::tray::{SystemTray, TrayEvent};
 use eframe::egui::{self, Color32, RichText, Vec2, Visuals};
+use crossbeam_channel::Sender;
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +19,8 @@ const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 pub struct BackgroundMuterApp {
     config: Arc<RwLock<Config>>,
     engine: Arc<RwLock<MuterEngine>>,
+    should_exit: Arc<AtomicBool>,
+    shutdown_tx: Sender<()>,
     tray: Option<SystemTray>,
     tray_init_failed: bool,
     allow_close: bool,
@@ -39,6 +43,8 @@ impl BackgroundMuterApp {
         cc: &eframe::CreationContext<'_>,
         config: Arc<RwLock<Config>>,
         engine: Arc<RwLock<MuterEngine>>,
+        should_exit: Arc<AtomicBool>,
+        shutdown_tx: Sender<()>,
     ) -> Self {
         let start_hidden = config.read().start_minimized;
 
@@ -49,7 +55,7 @@ impl BackgroundMuterApp {
         match SystemTray::new() {
             Ok(mut t) => {
                 let enabled = config.read().muting_enabled;
-                if let Err(e) = t.initialize(enabled) {
+                if let Err(e) = t.initialize(enabled, should_exit.clone(), shutdown_tx.clone()) {
                     log::error!("Failed to initialize tray: {}", e);
                     tray_init_failed = true;
                 } else {
@@ -71,6 +77,8 @@ impl BackgroundMuterApp {
         Self {
             config,
             engine,
+            should_exit,
+            shutdown_tx,
             tray,
             tray_init_failed,
             allow_close: false,
@@ -111,14 +119,11 @@ impl BackgroundMuterApp {
                     if let Some(tray) = self.tray.as_mut() {
                         let _ = tray.update_icon(enabled);
                     }
-
-                    if !enabled {
-                        if let Some(mut engine) = self.engine.try_write() {
-                            engine.unmute_all();
-                        }
-                    }
                 }
                 TrayEvent::Exit => {
+                    // Ensure the background thread is requested to stop immediately.
+                    self.should_exit.store(true, Ordering::Relaxed);
+                    let _ = self.shutdown_tx.try_send(());
                     self.allow_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -134,10 +139,7 @@ impl BackgroundMuterApp {
 
     /// Refreshes the detected apps list
     fn refresh_apps(&mut self) {
-        if let Some(mut engine) = self.engine.try_write() {
-            let _ = engine.update();
-            self.detected_apps = engine.get_active_sessions();
-        } else if let Some(engine) = self.engine.try_read() {
+        if let Some(engine) = self.engine.try_read() {
             self.detected_apps = engine.get_active_sessions();
         }
         self.last_refresh = Instant::now();
@@ -172,16 +174,8 @@ impl BackgroundMuterApp {
                     } else {
                         "Muting disabled"
                     };
-                    let should_unmute = !config.muting_enabled;
                     drop(config);
                     self.set_status(status);
-                    
-                    // Unmute all if disabled
-                    if should_unmute {
-                        if let Some(mut engine) = self.engine.try_write() {
-                            engine.unmute_all();
-                        }
-                    }
                 }
             });
         });
@@ -298,15 +292,10 @@ impl BackgroundMuterApp {
             });
         
         // Process any pending action
-        if let Some((name, pid, is_add)) = action {
+        if let Some((name, _pid, is_add)) = action {
             if is_add {
                 self.config.write().add_excluded_app(&name);
                 self.set_status(format!("Added {} to exclusions", name));
-                
-                // Immediately unmute this app
-                if let Some(engine) = self.engine.try_read() {
-                    let _ = engine.audio_manager().unmute_process(pid);
-                }
             } else {
                 self.config.write().remove_excluded_app(&name);
                 self.set_status(format!("Removed {} from exclusions", name));
@@ -529,6 +518,12 @@ impl BackgroundMuterApp {
 
 impl eframe::App for BackgroundMuterApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // If shutdown was requested (e.g. from the tray callback while hidden), allow the
+        // window to close instead of being intercepted by minimize-to-tray logic.
+        if self.should_exit.load(Ordering::Relaxed) {
+            self.allow_close = true;
+        }
+
         // Auto-refresh
         if self.last_refresh.elapsed() >= self.refresh_interval {
             self.refresh_apps();
@@ -596,10 +591,9 @@ impl eframe::App for BackgroundMuterApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Unmute all on exit
-        if let Some(mut engine) = self.engine.try_write() {
-            engine.unmute_all();
-        }
+        // Ensure we stop the muting thread as early as possible.
+        self.should_exit.store(true, Ordering::Relaxed);
+        let _ = self.shutdown_tx.try_send(());
         
         // Save config
         let _ = self.config.read().save();

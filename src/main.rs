@@ -18,6 +18,7 @@ use config::Config;
 use gui::{create_native_options, BackgroundMuterApp};
 use muter::MuterEngine;
 use parking_lot::RwLock;
+use crossbeam_channel::{bounded, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -57,6 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create shared state
     let should_exit = Arc::new(AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
     let start_minimized = config.read().start_minimized;
 
     // Start the background muting thread
@@ -81,7 +83,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            thread::sleep(Duration::from_millis(poll_interval));
+            // Wait for the next poll tick, but wake immediately on shutdown.
+            if shutdown_rx.recv_timeout(Duration::from_millis(poll_interval)).is_ok() {
+                break;
+            }
         }
 
         log::info!("Background muting thread stopped");
@@ -92,17 +97,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.clone(),
         engine.clone(),
         should_exit.clone(),
+        shutdown_tx.clone(),
         !start_minimized,
     )?;
 
     // Signal background thread to stop
     should_exit.store(true, Ordering::Relaxed);
+    let _ = shutdown_tx.try_send(());
 
     // Wait for muting thread to finish
     let _ = muting_thread.join();
 
     // Unmute all apps before exiting
     if let Some(mut engine) = engine.try_write() {
+        let _ = engine.force_refresh();
         engine.unmute_all();
     }
 
@@ -115,19 +123,29 @@ fn run_with_gui(
     config: Arc<RwLock<Config>>,
     engine: Arc<RwLock<MuterEngine>>,
     should_exit: Arc<AtomicBool>,
+    shutdown_tx: Sender<()>,
     start_visible: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let options = create_native_options(start_visible);
+    let should_exit_for_app = should_exit.clone();
+    let shutdown_tx_for_app = shutdown_tx.clone();
     
     eframe::run_native(
         "Background Muter",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(BackgroundMuterApp::new(cc, config.clone(), engine.clone())))
+            Ok(Box::new(BackgroundMuterApp::new(
+                cc,
+                config.clone(),
+                engine.clone(),
+                should_exit_for_app.clone(),
+                shutdown_tx_for_app.clone(),
+            )))
         }),
     )?;
 
     should_exit.store(true, Ordering::Relaxed);
+    let _ = shutdown_tx.try_send(());
     Ok(())
 }
 

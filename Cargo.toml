@@ -61,6 +61,8 @@ parking_lot = "0.12"
 
 [build-dependencies]
 winres = "0.1"
+image = "0.25"
+ico = "0.3"
 
 [profile.release]
 opt-level = 3
@@ -70,10 +72,10 @@ panic = "abort"
 strip = true
 
 [[bin]]
-name = "rust-bg-muter"
+name = "bg-muter"
 path = "src/main.rs"
 
 [package.metadata.winres]
-OriginalFilename = "rust-bg-muter.exe"
+OriginalFilename = "bg-muter.exe"
 ProductName = "Background Muter"
 FileDescription = "Mute background applications automatically"

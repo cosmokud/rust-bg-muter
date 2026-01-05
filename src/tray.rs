@@ -8,16 +8,18 @@
 #![allow(dead_code)]
 
 use crossbeam_channel::{unbounded, Receiver, Sender, TrySendError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, FALSE, TRUE};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM, FALSE, TRUE};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetWindow, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, SetWindowPos,
     ShowWindow, GW_OWNER, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
+    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, PostMessageW, WM_CLOSE,
 };
 
 /// Embedded icon bytes (icon.png from assets folder)
@@ -58,7 +60,12 @@ impl SystemTray {
     }
 
     /// Initializes the tray icon (must be called from main thread)
-    pub fn initialize(&mut self, muting_enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn initialize(
+        &mut self,
+        muting_enabled: bool,
+        should_exit: Arc<AtomicBool>,
+        shutdown_tx: Sender<()>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let icon = load_tray_icon()?;
 
         let toggle_text = if muting_enabled {
@@ -82,6 +89,8 @@ impl SystemTray {
         let toggle_id = menu_toggle.id().clone();
         let exit_id = menu_exit.id().clone();
         let sender = self.sender.clone();
+        let should_exit = should_exit.clone();
+        let shutdown_tx = shutdown_tx.clone();
 
         // Menu callback: keep this lightweight. Crucially, Open Window uses Win32 directly.
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -89,6 +98,15 @@ impl SystemTray {
                 show_main_window_native();
                 let _ = sender.try_send(TrayEvent::OpenWindow);
                 return;
+            }
+
+            // Exit must work even if the main window is currently hidden and the GUI loop
+            // isn't producing frames. We request shutdown and also post a WM_CLOSE to the
+            // main window so eframe/winit exits promptly.
+            if event.id == exit_id {
+                should_exit.store(true, Ordering::Relaxed);
+                let _ = shutdown_tx.try_send(());
+                request_app_exit_native();
             }
 
             let ev = if event.id == toggle_id {
@@ -171,6 +189,47 @@ impl SystemTray {
             events.push(event);
         }
         events
+    }
+}
+
+/// Requests application shutdown by posting WM_CLOSE to the main window for this process.
+///
+/// This is intentionally independent of egui/eframe and works even when the window is hidden.
+fn request_app_exit_native() {
+    #[repr(C)]
+    struct EnumCtx {
+        target_pid: u32,
+        posted: bool,
+    }
+
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut EnumCtx);
+
+        let mut window_pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+        if window_pid != ctx.target_pid {
+            return TRUE;
+        }
+
+        // Prefer true top-level windows.
+        let owner = GetWindow(hwnd, GW_OWNER).unwrap_or(HWND(std::ptr::null_mut()));
+        if !owner.0.is_null() {
+            return TRUE;
+        }
+
+        let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        ctx.posted = true;
+        FALSE
+    }
+
+    let mut ctx = Box::new(EnumCtx {
+        target_pid: std::process::id(),
+        posted: false,
+    });
+
+    let ptr = (&mut *ctx) as *mut EnumCtx;
+    unsafe {
+        let _ = EnumWindows(Some(enum_cb), LPARAM(ptr as isize));
     }
 }
 

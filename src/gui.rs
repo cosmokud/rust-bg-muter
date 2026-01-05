@@ -19,6 +19,7 @@ pub struct BackgroundMuterApp {
     engine: Arc<RwLock<MuterEngine>>,
     tray: Option<SystemTray>,
     tray_init_failed: bool,
+    tray_ctx_set: bool,
     allow_close: bool,
     start_hidden: bool,
     applied_start_hidden: bool,
@@ -71,6 +72,7 @@ impl BackgroundMuterApp {
             engine,
             tray,
             tray_init_failed,
+            tray_ctx_set: false,
             allow_close: false,
             start_hidden,
             applied_start_hidden: start_hidden,
@@ -421,6 +423,14 @@ impl BackgroundMuterApp {
             });
 
             ui.horizontal(|ui| {
+                let mut minimize_to_tray = config.minimize_to_tray;
+                if ui.checkbox(&mut minimize_to_tray, "Minimize to tray on close").changed() {
+                    config.minimize_to_tray = minimize_to_tray;
+                    let _ = config.save();
+                }
+            });
+
+            ui.horizontal(|ui| {
                 let mut start_with_windows = config.start_with_windows;
                 if ui.checkbox(&mut start_with_windows, "Run at startup").changed() {
                     pending_startup_change = Some(start_with_windows);
@@ -535,12 +545,23 @@ impl eframe::App for BackgroundMuterApp {
             self.applied_start_hidden = true;
         }
 
-        // Close button (or Alt+F4): minimize to tray by default.
-        // Exit is done via tray menu "Exit" which sets `allow_close`.
+        // Set egui context on tray so event handlers can wake up the event loop
+        if !self.tray_ctx_set {
+            if let Some(ref tray) = self.tray {
+                tray.set_egui_context(ctx.clone());
+                self.tray_ctx_set = true;
+            }
+        }
+
+        // Close button (or Alt+F4): check config for minimize to tray behavior
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested && !self.allow_close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide_window(ctx);
+            let minimize_to_tray = self.config.read().minimize_to_tray;
+            if minimize_to_tray && self.tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.hide_window(ctx);
+            }
+            // If minimize_to_tray is false, allow the close to proceed
         }
 
         let _ = frame; // frame kept for future integrations

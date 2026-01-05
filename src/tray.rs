@@ -3,25 +3,25 @@
 
 #![allow(dead_code)]
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use parking_lot::Mutex;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, MenuId},
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
-use once_cell::sync::OnceCell;
 
 /// Embedded icon bytes (icon.png from assets folder)
 const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 
-/// Global storage for menu item IDs so the event handler can access them
-static MENU_IDS: OnceCell<MenuIds> = OnceCell::new();
-/// Global event sender for tray events
-static EVENT_SENDER: OnceCell<Sender<TrayEvent>> = OnceCell::new();
+/// Global state shared with event handlers
+static GLOBAL_STATE: Mutex<Option<TrayGlobalState>> = Mutex::new(None);
 
-struct MenuIds {
+struct TrayGlobalState {
+    sender: Sender<TrayEvent>,
     open_id: MenuId,
     toggle_id: MenuId,
     exit_id: MenuId,
+    ctx: Option<egui::Context>,
 }
 
 /// Events sent from the system tray
@@ -48,10 +48,19 @@ pub struct SystemTray {
 impl SystemTray {
     /// Creates a new system tray instance
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let (event_sender, event_receiver) = bounded(100);
+        let (event_sender, event_receiver) = unbounded();
 
-        // Store the sender globally so event handlers can use it
-        let _ = EVENT_SENDER.set(event_sender);
+        // Store the sender globally - use a mutex so we can replace it
+        {
+            let mut global = GLOBAL_STATE.lock();
+            *global = Some(TrayGlobalState {
+                sender: event_sender,
+                open_id: MenuId::new(""),
+                toggle_id: MenuId::new(""),
+                exit_id: MenuId::new(""),
+                ctx: None,
+            });
+        }
 
         Ok(Self {
             tray_icon: None,
@@ -59,6 +68,14 @@ impl SystemTray {
             menu_toggle: None,
             last_muting_enabled: None,
         })
+    }
+
+    /// Sets the egui context for waking up the event loop
+    pub fn set_egui_context(&self, ctx: egui::Context) {
+        let mut global = GLOBAL_STATE.lock();
+        if let Some(ref mut state) = *global {
+            state.ctx = Some(ctx);
+        }
     }
 
     /// Initializes the tray icon (must be called from main thread)
@@ -84,47 +101,59 @@ impl SystemTray {
         menu.append(&menu_separator)?;
         menu.append(&menu_exit)?;
 
-        // Store menu IDs globally for the event handler
-        let _ = MENU_IDS.set(MenuIds {
-            open_id: menu_open.id().clone(),
-            toggle_id: menu_toggle.id().clone(),
-            exit_id: menu_exit.id().clone(),
-        });
+        // Store menu IDs globally
+        {
+            let mut global = GLOBAL_STATE.lock();
+            if let Some(ref mut state) = *global {
+                state.open_id = menu_open.id().clone();
+                state.toggle_id = menu_toggle.id().clone();
+                state.exit_id = menu_exit.id().clone();
+            }
+        }
 
         self.menu_toggle = Some(menu_toggle.clone());
         self.last_muting_enabled = Some(muting_enabled);
 
-        // Set up the menu event handler - this is called synchronously when menu items are clicked
-        // even during the modal menu loop on Windows
+        // Set up the menu event handler - called synchronously even during modal menu
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if let (Some(ids), Some(sender)) = (MENU_IDS.get(), EVENT_SENDER.get()) {
-                let tray_event = if event.id == ids.open_id {
+            let global = GLOBAL_STATE.lock();
+            if let Some(ref state) = *global {
+                let tray_event = if event.id == state.open_id {
                     Some(TrayEvent::OpenWindow)
-                } else if event.id == ids.toggle_id {
+                } else if event.id == state.toggle_id {
                     Some(TrayEvent::ToggleMuting)
-                } else if event.id == ids.exit_id {
+                } else if event.id == state.exit_id {
                     Some(TrayEvent::Exit)
                 } else {
                     None
                 };
 
                 if let Some(ev) = tray_event {
-                    let _ = sender.try_send(ev);
+                    let _ = state.sender.send(ev);
+                    // Wake up the egui event loop
+                    if let Some(ref ctx) = state.ctx {
+                        ctx.request_repaint();
+                    }
                 }
             }
         }));
 
         // Set up tray icon click handler
         TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-            if let Some(sender) = EVENT_SENDER.get() {
-                match event {
-                    TrayIconEvent::DoubleClick { .. } => {
-                        let _ = sender.try_send(TrayEvent::OpenWindow);
+            let global = GLOBAL_STATE.lock();
+            if let Some(ref state) = *global {
+                let tray_event = match event {
+                    TrayIconEvent::DoubleClick { .. } => Some(TrayEvent::OpenWindow),
+                    TrayIconEvent::Click { .. } => Some(TrayEvent::SingleClick),
+                    _ => None,
+                };
+
+                if let Some(ev) = tray_event {
+                    let _ = state.sender.send(ev);
+                    // Wake up the egui event loop
+                    if let Some(ref ctx) = state.ctx {
+                        ctx.request_repaint();
                     }
-                    TrayIconEvent::Click { .. } => {
-                        let _ = sender.try_send(TrayEvent::SingleClick);
-                    }
-                    _ => {}
                 }
             }
         }));
@@ -200,8 +229,10 @@ fn load_tray_icon() -> Result<Icon, Box<dyn std::error::Error>> {
 
 impl Drop for SystemTray {
     fn drop(&mut self) {
-        // Clear the event handlers by setting them to a no-op
+        // Clear event handlers
         MenuEvent::set_event_handler(Some(|_: MenuEvent| {}));
         TrayIconEvent::set_event_handler(Some(|_: TrayIconEvent| {}));
+        // Clear global state
+        *GLOBAL_STATE.lock() = None;
     }
 }

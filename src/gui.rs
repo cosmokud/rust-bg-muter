@@ -10,6 +10,9 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Embedded icon bytes (icon.png from assets folder)
+const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
+
 /// Application state for the GUI
 pub struct BackgroundMuterApp {
     config: Arc<RwLock<Config>>,
@@ -578,48 +581,33 @@ pub fn create_native_options(start_visible: bool) -> eframe::NativeOptions {
             .with_inner_size(Vec2::new(550.0, 600.0))
             .with_min_inner_size(Vec2::new(450.0, 400.0))
             .with_visible(start_visible)
-            .with_icon(create_app_icon()),
+            .with_icon(load_app_icon()),
         centered: true,
         ..Default::default()
     }
 }
 
-/// Creates the application icon
-fn create_app_icon() -> egui::IconData {
-    let size = 64u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    
-    let center = size as f32 / 2.0;
-    let radius = (size as f32 / 2.0) - 4.0;
-    
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let dist = (dx * dx + dy * dy).sqrt();
-            
-            let idx = ((y * size + x) * 4) as usize;
-            
-            if dist <= radius {
-                // Green circle
-                rgba[idx] = 76;      // R
-                rgba[idx + 1] = 175; // G
-                rgba[idx + 2] = 80;  // B
-                rgba[idx + 3] = 255; // A
-            } else if dist <= radius + 2.0 {
-                // Anti-aliased edge
-                let alpha = ((radius + 2.0 - dist) * 127.0) as u8;
-                rgba[idx] = 76;
-                rgba[idx + 1] = 175;
-                rgba[idx + 2] = 80;
-                rgba[idx + 3] = alpha;
+/// Loads the application icon from the embedded PNG
+fn load_app_icon() -> egui::IconData {
+    match image::load_from_memory(ICON_BYTES) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            egui::IconData {
+                rgba: rgba.into_raw(),
+                width,
+                height,
             }
         }
-    }
-    
-    egui::IconData {
-        rgba,
-        width: size,
-        height: size,
+        Err(_) => {
+            // Fallback: simple green square
+            let size = 64u32;
+            let rgba = vec![76u8, 175, 80, 255].repeat((size * size) as usize);
+            egui::IconData {
+                rgba,
+                width: size,
+                height: size,
+            }
+        }
     }
 }

@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tray::{SystemTray, TrayEvent};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,12 +87,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::info!("Background muting thread stopped");
     });
 
-    // Main application loop
-    if start_minimized {
-        run_tray_only(config.clone(), engine.clone(), should_exit.clone())?;
-    } else {
-        run_with_gui(config.clone(), engine.clone(), should_exit.clone())?;
-    }
+    // Main application loop (always run under GUI event loop so tray is responsive)
+    run_with_gui(
+        config.clone(),
+        engine.clone(),
+        should_exit.clone(),
+        !start_minimized,
+    )?;
 
     // Signal background thread to stop
     should_exit.store(true, Ordering::Relaxed);
@@ -115,8 +115,9 @@ fn run_with_gui(
     config: Arc<RwLock<Config>>,
     engine: Arc<RwLock<MuterEngine>>,
     should_exit: Arc<AtomicBool>,
+    start_visible: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let options = create_native_options();
+    let options = create_native_options(start_visible);
     
     eframe::run_native(
         "Background Muter",
@@ -127,62 +128,6 @@ fn run_with_gui(
     )?;
 
     should_exit.store(true, Ordering::Relaxed);
-    Ok(())
-}
-
-/// Runs the application in tray-only mode
-fn run_tray_only(
-    config: Arc<RwLock<Config>>,
-    engine: Arc<RwLock<MuterEngine>>,
-    should_exit: Arc<AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Running in tray-only mode");
-
-    // Initialize system tray on main thread
-    let mut tray = SystemTray::new()?;
-    tray.initialize(config.read().muting_enabled)?;
-    log::info!("System tray initialized");
-
-    let mut last_muting_enabled = config.read().muting_enabled;
-
-    while !should_exit.load(Ordering::Relaxed) {
-        for event in tray.process_events() {
-            match event {
-                TrayEvent::OpenWindow | TrayEvent::SingleClick => {
-                    // Open the GUI window - we need to drop tray first
-                    drop(tray);
-                    return run_with_gui(config, engine, should_exit);
-                }
-                TrayEvent::ToggleMuting => {
-                    let enabled = config.write().toggle_muting();
-                    let _ = tray.update_icon(enabled);
-                    last_muting_enabled = enabled;
-
-                    if !enabled {
-                        if let Some(mut eng) = engine.try_write() {
-                            eng.unmute_all();
-                        }
-                    }
-
-                    log::info!("Muting toggled: {}", enabled);
-                }
-                TrayEvent::Exit => {
-                    should_exit.store(true, Ordering::Relaxed);
-                    break;
-                }
-            }
-        }
-
-        // Update tray icon only if state changed (avoids flicker/unresponsive tray)
-        let muting_enabled = config.read().muting_enabled;
-        if muting_enabled != last_muting_enabled {
-            let _ = tray.update_icon(muting_enabled);
-            last_muting_enabled = muting_enabled;
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
-
     Ok(())
 }
 

@@ -4,6 +4,7 @@
 use crate::config::Config;
 use crate::muter::{AppAudioState, MuterEngine};
 use crate::startup;
+use crate::tray::{SystemTray, TrayEvent};
 use eframe::egui::{self, Color32, RichText, Vec2, Visuals};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -13,6 +14,11 @@ use std::time::{Duration, Instant};
 pub struct BackgroundMuterApp {
     config: Arc<RwLock<Config>>,
     engine: Arc<RwLock<MuterEngine>>,
+    tray: Option<SystemTray>,
+    tray_init_failed: bool,
+    allow_close: bool,
+    start_hidden: bool,
+    applied_start_hidden: bool,
     detected_apps: Vec<AppAudioState>,
     manual_exe_input: String,
     last_refresh: Instant,
@@ -25,13 +31,46 @@ pub struct BackgroundMuterApp {
 impl BackgroundMuterApp {
     /// Creates a new application instance
     pub fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         config: Arc<RwLock<Config>>,
         engine: Arc<RwLock<MuterEngine>>,
     ) -> Self {
+        let start_hidden = config.read().start_minimized;
+
+        let mut tray: Option<SystemTray> = None;
+        let mut tray_init_failed = false;
+
+        // Create tray on the GUI thread (winit message pump must be alive for Windows tray).
+        match SystemTray::new() {
+            Ok(mut t) => {
+                let enabled = config.read().muting_enabled;
+                if let Err(e) = t.initialize(enabled) {
+                    log::error!("Failed to initialize tray: {}", e);
+                    tray_init_failed = true;
+                } else {
+                    tray = Some(t);
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to create tray: {}", e);
+                tray_init_failed = true;
+            }
+        }
+
+        // If we started hidden, hide the window ASAP.
+        if start_hidden {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         Self {
             config,
             engine,
+            tray,
+            tray_init_failed,
+            allow_close: false,
+            start_hidden,
+            applied_start_hidden: start_hidden,
             detected_apps: Vec::new(),
             manual_exe_input: String::new(),
             last_refresh: Instant::now(),
@@ -39,6 +78,53 @@ impl BackgroundMuterApp {
             show_settings: false,
             status_message: None,
             search_filter: String::new(),
+        }
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn process_tray(&mut self, ctx: &egui::Context) {
+        let events = match self.tray.as_ref() {
+            Some(tray) => tray.process_events(),
+            None => return,
+        };
+
+        for event in events {
+            match event {
+                TrayEvent::OpenWindow | TrayEvent::SingleClick => {
+                    self.show_window(ctx);
+                }
+                TrayEvent::ToggleMuting => {
+                    let enabled = self.config.write().toggle_muting();
+                    if let Some(tray) = self.tray.as_mut() {
+                        let _ = tray.update_icon(enabled);
+                    }
+
+                    if !enabled {
+                        if let Some(mut engine) = self.engine.try_write() {
+                            engine.unmute_all();
+                        }
+                    }
+                }
+                TrayEvent::Exit => {
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        // Keep tray icon state synced (cheap because SystemTray caches last state).
+        let enabled = self.config.read().muting_enabled;
+        if let Some(tray) = self.tray.as_mut() {
+            let _ = tray.update_icon(enabled);
         }
     }
 
@@ -422,17 +508,41 @@ impl BackgroundMuterApp {
 }
 
 impl eframe::App for BackgroundMuterApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Auto-refresh
         if self.last_refresh.elapsed() >= self.refresh_interval {
             self.refresh_apps();
         }
 
-        // Request repaint for animation
+        // Ensure we continue receiving events (including tray events) even when minimized/hidden.
         ctx.request_repaint_after(Duration::from_millis(100));
 
         // Set dark theme
         ctx.set_visuals(Visuals::dark());
+
+        // If tray failed to init in `new`, don't keep retrying every frame.
+        if self.tray.is_none() && !self.tray_init_failed {
+            // Should be unreachable, but keep it safe.
+            self.tray_init_failed = true;
+        }
+
+        // Apply initial hidden state once if needed.
+        if self.start_hidden && !self.applied_start_hidden {
+            self.hide_window(ctx);
+            self.applied_start_hidden = true;
+        }
+
+        // Close button (or Alt+F4): minimize to tray by default.
+        // Exit is done via tray menu "Exit" which sets `allow_close`.
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx);
+        }
+
+        let _ = frame; // frame kept for future integrations
+
+        self.process_tray(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.set_min_width(500.0);
@@ -461,12 +571,13 @@ impl eframe::App for BackgroundMuterApp {
 }
 
 /// Native options for the application window
-pub fn create_native_options() -> eframe::NativeOptions {
+pub fn create_native_options(start_visible: bool) -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Background Muter")
             .with_inner_size(Vec2::new(550.0, 600.0))
             .with_min_inner_size(Vec2::new(450.0, 400.0))
+            .with_visible(start_visible)
             .with_icon(create_app_icon()),
         centered: true,
         ..Default::default()

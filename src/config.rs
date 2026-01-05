@@ -29,6 +29,10 @@ pub struct Config {
     #[serde(default = "default_minimize_to_tray")]
     pub minimize_to_tray: bool,
     
+    /// Whether to minimize to tray when minimize button is clicked
+    #[serde(default = "default_minimize_button_to_tray")]
+    pub minimize_button_to_tray: bool,
+    
     /// Whether to start with Windows
     #[serde(default)]
     pub start_with_windows: bool,
@@ -62,6 +66,10 @@ fn default_minimize_to_tray() -> bool {
     true
 }
 
+fn default_minimize_button_to_tray() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -70,6 +78,7 @@ impl Default for Config {
             poll_interval_ms: 100,
             start_minimized: false,
             minimize_to_tray: true,
+            minimize_button_to_tray: true,
             start_with_windows: false,
             window_state: None,
         }

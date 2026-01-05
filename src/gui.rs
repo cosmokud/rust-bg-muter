@@ -30,6 +30,10 @@ pub struct BackgroundMuterApp {
     show_settings: bool,
     status_message: Option<(String, Instant)>,
     search_filter: String,
+    /// Deferred flag to show window (avoids deadlock from tray handler)
+    pending_show_window: bool,
+    /// Track the last known minimized state to detect minimize button clicks
+    was_minimized: bool,
 }
 
 impl BackgroundMuterApp {
@@ -83,6 +87,8 @@ impl BackgroundMuterApp {
             show_settings: false,
             status_message: None,
             search_filter: String::new(),
+            pending_show_window: false,
+            was_minimized: start_hidden,
         }
     }
 
@@ -105,7 +111,8 @@ impl BackgroundMuterApp {
         for event in events {
             match event {
                 TrayEvent::OpenWindow | TrayEvent::SingleClick => {
-                    self.show_window(ctx);
+                    // Defer window show to avoid deadlock when called from tray menu handler
+                    self.pending_show_window = true;
                 }
                 TrayEvent::ToggleMuting => {
                     let enabled = self.config.write().toggle_muting();
@@ -424,8 +431,16 @@ impl BackgroundMuterApp {
 
             ui.horizontal(|ui| {
                 let mut minimize_to_tray = config.minimize_to_tray;
-                if ui.checkbox(&mut minimize_to_tray, "Minimize to tray on close").changed() {
+                if ui.checkbox(&mut minimize_to_tray, "Minimize to tray on close (X button)").changed() {
                     config.minimize_to_tray = minimize_to_tray;
+                    let _ = config.save();
+                }
+            });
+
+            ui.horizontal(|ui| {
+                let mut minimize_button_to_tray = config.minimize_button_to_tray;
+                if ui.checkbox(&mut minimize_button_to_tray, "Minimize to tray on minimize (─ button)").changed() {
+                    config.minimize_button_to_tray = minimize_button_to_tray;
                     let _ = config.save();
                 }
             });
@@ -553,6 +568,27 @@ impl eframe::App for BackgroundMuterApp {
             }
         }
 
+        // Process tray events first (this may set pending_show_window)
+        self.process_tray(ctx);
+
+        // Handle deferred show window (avoids deadlock when called from tray menu handler)
+        if self.pending_show_window {
+            self.pending_show_window = false;
+            self.show_window(ctx);
+        }
+
+        // Handle minimize button: detect transition to minimized state
+        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if is_minimized && !self.was_minimized {
+            // Window was just minimized
+            let minimize_button_to_tray = self.config.read().minimize_button_to_tray;
+            if minimize_button_to_tray && self.tray.is_some() {
+                // Hide to tray instead of showing in taskbar as minimized
+                self.hide_window(ctx);
+            }
+        }
+        self.was_minimized = is_minimized;
+
         // Close button (or Alt+F4): check config for minimize to tray behavior
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested && !self.allow_close {
@@ -565,8 +601,6 @@ impl eframe::App for BackgroundMuterApp {
         }
 
         let _ = frame; // frame kept for future integrations
-
-        self.process_tray(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.set_min_width(500.0);

@@ -7,6 +7,7 @@ pub mod audio;
 pub mod config;
 pub mod muter;
 pub mod process;
+pub mod settings_dialog;
 pub mod startup;
 pub mod tray;
 

@@ -9,6 +9,7 @@ mod audio;
 mod config;
 mod muter;
 mod process;
+mod settings_dialog;
 mod startup;
 mod tray;
 
@@ -180,8 +181,23 @@ fn run_tray_loop(
                     log::info!("Muting toggled: {}", enabled);
                 }
                 TrayCommand::OpenSettings => {
-                    // Open native settings dialog (non-blocking)
-                    open_settings_dialog(config.clone(), muting_enabled.clone());
+                    // Open native Win32 settings dialog
+                    settings_dialog::open_settings_dialog(
+                        config.clone(),
+                        muting_enabled.clone(),
+                    );
+                    
+                    // Sync muting state after dialog closes (user may have changed it)
+                    let new_enabled = config.read().muting_enabled;
+                    muting_enabled.store(new_enabled, Ordering::SeqCst);
+                    tray.update_state(new_enabled);
+                    
+                    // If muting was disabled, unmute everything
+                    if !new_enabled {
+                        if let Some(mut eng) = engine.try_write() {
+                            eng.unmute_all();
+                        }
+                    }
                 }
                 TrayCommand::Exit => {
                     should_exit.store(true, Ordering::SeqCst);
@@ -193,67 +209,6 @@ fn run_tray_loop(
         if should_exit.load(Ordering::Relaxed) {
             break;
         }
-    }
-}
-
-/// Opens a native Win32 settings dialog
-fn open_settings_dialog(config: Arc<RwLock<Config>>, muting_enabled: Arc<AtomicBool>) {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::*;
-
-    fn to_wide(s: &str) -> Vec<u16> {
-        OsStr::new(s)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    // Build settings info text
-    let cfg = config.read();
-    let info = format!(
-        "Background Muter Settings\n\n\
-         Status: {}\n\
-         Poll Interval: {}ms\n\
-         Start Minimized: {}\n\
-         Start with Windows: {}\n\n\
-         Excluded Apps ({}):\n{}\n\n\
-         Edit the config file to change settings:\n{}",
-        if muting_enabled.load(Ordering::Relaxed) {
-            "Active"
-        } else {
-            "Disabled"
-        },
-        cfg.poll_interval_ms,
-        cfg.start_minimized,
-        cfg.start_with_windows,
-        cfg.excluded_apps.len(),
-        if cfg.excluded_apps.is_empty() {
-            "  (none)".to_string()
-        } else {
-            cfg.excluded_apps
-                .iter()
-                .map(|s| format!("  • {}", s))
-                .collect::<Vec<_>>()
-                .join("\n")
-        },
-        Config::config_path().display()
-    );
-    drop(cfg);
-
-    let title = to_wide("Background Muter - Settings");
-    let text = to_wide(&info);
-
-    // Show a simple message box (zero resource usage when closed)
-    unsafe {
-        MessageBoxW(
-            HWND::default(),
-            PCWSTR(text.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONINFORMATION,
-        );
     }
 }
 

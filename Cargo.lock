@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "rust-bg-muter"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "crossbeam-channel",
  "dirs 5.0.1",

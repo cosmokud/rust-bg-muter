@@ -1,6 +1,6 @@
 //! Native Win32 Settings Dialog
 //!
-//! A lightweight settings window using pure Win32 API.
+//! A lightweight settings window using pure Win32 API with Windows 11 visual styles.
 //! Uses GDI rendering (CPU-based) - zero GPU/VRAM usage.
 
 use crate::audio::AudioManager;
@@ -14,8 +14,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, HBRUSH, WHITE_BRUSH};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontW, DeleteObject, HBRUSH, HFONT, HGDIOBJ,
+    DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+    DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, COLOR_BTNFACE,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Control IDs
@@ -30,18 +35,21 @@ const ID_CHECK_START_WINDOWS: i32 = 108;
 const ID_EDIT_POLL_INTERVAL: i32 = 109;
 const ID_BTN_SAVE: i32 = 110;
 const ID_BTN_CLOSE: i32 = 111;
+const ID_GROUP_SETTINGS: i32 = 113;
+const ID_LABEL_POLL: i32 = 114;
 
-// Window dimensions
-const WINDOW_WIDTH: i32 = 500;
-const WINDOW_HEIGHT: i32 = 520;
+// Window dimensions (slightly larger for better spacing)
+const WINDOW_WIDTH: i32 = 540;
+const WINDOW_HEIGHT: i32 = 500;
 
-// Button states (not in windows-rs WindowsAndMessaging by default)
+// Button states
 const BST_CHECKED: usize = 1;
 const BST_UNCHECKED: usize = 0;
 
-// Thread-local storage for dialog state
+// Thread-local storage for dialog state and font
 thread_local! {
     static DIALOG_STATE: RefCell<Option<DialogState>> = const { RefCell::new(None) };
+    static UI_FONT: RefCell<Option<HFONT>> = const { RefCell::new(None) };
 }
 
 struct DialogState {
@@ -69,6 +77,37 @@ unsafe fn get_dlg_item(hwnd: HWND, id: i32) -> HWND {
     GetDlgItem(hwnd, id).unwrap_or_default()
 }
 
+/// Create the Segoe UI font for modern Windows look
+unsafe fn create_ui_font() -> HFONT {
+    CreateFontW(
+        -14,                    // Height (negative = character height)
+        0,                      // Width (0 = default)
+        0,                      // Escapement
+        0,                      // Orientation
+        FW_NORMAL.0 as i32,     // Weight
+        0,                      // Italic
+        0,                      // Underline
+        0,                      // StrikeOut
+        DEFAULT_CHARSET.0 as u32,
+        OUT_TT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+        to_wide_ptr("Segoe UI"),
+    )
+}
+
+/// Initialize common controls for Windows 11 visual styles
+fn init_common_controls() {
+    unsafe {
+        let icc = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_STANDARD_CLASSES,
+        };
+        let _ = InitCommonControlsEx(&icc);
+    }
+}
+
 /// Opens the settings dialog (blocks until closed)
 pub fn open_settings_dialog(
     config: Arc<RwLock<Config>>,
@@ -93,7 +132,14 @@ pub fn open_settings_dialog(
         });
     });
 
+    // Initialize common controls for visual styles
+    init_common_controls();
+
     unsafe {
+        // Create the UI font
+        let font = create_ui_font();
+        UI_FONT.with(|f| *f.borrow_mut() = Some(font));
+
         // Register window class
         let class_name = to_wide("BgMuterSettingsClass");
         let hmodule = GetModuleHandleW(None).unwrap_or_default();
@@ -107,7 +153,7 @@ pub fn open_settings_dialog(
             hInstance: hmodule.into(),
             hIcon: HICON::default(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: HBRUSH(GetStockObject(WHITE_BRUSH).0),
+            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as *mut c_void), // System button face color
             lpszMenuName: PCWSTR::null(),
             lpszClassName: PCWSTR(class_name.as_ptr()),
             hIconSm: HICON::default(),
@@ -163,6 +209,13 @@ pub fn open_settings_dialog(
 
         // Cleanup
         let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), hmodule);
+        
+        // Delete the font
+        UI_FONT.with(|f| {
+            if let Some(font) = f.borrow_mut().take() {
+                let _ = DeleteObject(HGDIOBJ(font.0));
+            }
+        });
     }
 
     // Clear thread-local state
@@ -205,162 +258,141 @@ unsafe extern "system" fn window_proc(
 unsafe fn create_controls(hwnd: HWND) {
     let hmodule = GetModuleHandleW(None).unwrap_or_default();
 
-    // Static labels
-    create_static(hwnd, hmodule, "Detected Audio Apps:", 10, 10, 200, 20);
-    create_static(hwnd, hmodule, "Excluded Apps:", 260, 10, 200, 20);
+    // Get the font
+    let font = UI_FONT.with(|f| f.borrow().unwrap_or_default());
+
+    // === Audio Apps Section ===
+    // Group box for detected apps
+    let grp_detected = create_control(hwnd, hmodule, "BUTTON", "Detected Audio Apps", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32), 
+        12, 8, 250, 230, 0);
+    set_font(grp_detected, font);
 
     // Detected apps listbox
-    let _ = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
-        to_wide_ptr("LISTBOX"),
-        PCWSTR::null(),
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
-        10,
-        30,
-        230,
-        200,
-        hwnd,
-        HMENU(ID_LIST_DETECTED as *mut c_void),
-        hmodule,
-        None,
-    );
+    let list_detected = create_control(hwnd, hmodule, "LISTBOX", "", 
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32 | WS_EX_CLIENTEDGE.0), 
+        22, 28, 230, 175, ID_LIST_DETECTED);
+    set_font(list_detected, font);
+
+    // Refresh button under detected list
+    let btn_refresh = create_control(hwnd, hmodule, "BUTTON", "Refresh List", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
+        22, 206, 100, 26, ID_BTN_REFRESH);
+    set_font(btn_refresh, font);
+
+    // Group box for excluded apps
+    let grp_excluded = create_control(hwnd, hmodule, "BUTTON", "Excluded Apps (Always Audible)", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32), 
+        272, 8, 250, 230, 0);
+    set_font(grp_excluded, font);
 
     // Excluded apps listbox
-    let _ = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
-        to_wide_ptr("LISTBOX"),
-        PCWSTR::null(),
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
-        260,
-        30,
-        220,
-        200,
-        hwnd,
-        HMENU(ID_LIST_EXCLUDED as *mut c_void),
-        hmodule,
-        None,
-    );
+    let list_excluded = create_control(hwnd, hmodule, "LISTBOX", "", 
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32 | WS_EX_CLIENTEDGE.0), 
+        282, 28, 230, 175, ID_LIST_EXCLUDED);
+    set_font(list_excluded, font);
 
-    // Buttons row 1
-    create_button(hwnd, hmodule, "Add Exclusion >>", 10, 235, 140, 28, ID_BTN_ADD_EXCLUSION);
-    create_button(hwnd, hmodule, "<< Remove", 330, 235, 100, 28, ID_BTN_REMOVE_EXCLUSION);
-    create_button(hwnd, hmodule, "Refresh", 160, 235, 70, 28, ID_BTN_REFRESH);
+    // Add/Remove buttons between lists
+    let btn_add = create_control(hwnd, hmodule, "BUTTON", "Add to Exclusions →", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
+        22, 245, 145, 28, ID_BTN_ADD_EXCLUSION);
+    set_font(btn_add, font);
 
-    // Separator line using static text
-    create_static(hwnd, hmodule, "_______________________________________________________________", 10, 265, 470, 15);
+    let btn_remove = create_control(hwnd, hmodule, "BUTTON", "← Remove from Exclusions", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
+        347, 245, 165, 28, ID_BTN_REMOVE_EXCLUSION);
+    set_font(btn_remove, font);
 
-    // Settings section
-    create_static(hwnd, hmodule, "Settings", 10, 290, 200, 20);
+    // === Settings Section ===
+    let grp_settings = create_control(hwnd, hmodule, "BUTTON", "Settings", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32), 
+        12, 280, 510, 130, ID_GROUP_SETTINGS);
+    set_font(grp_settings, font);
 
     // Checkboxes
-    let _ = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        to_wide_ptr("BUTTON"),
-        to_wide_ptr("Muting Enabled"),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-        10,
-        315,
-        200,
-        25,
-        hwnd,
-        HMENU(ID_CHECK_ENABLED as *mut c_void),
-        hmodule,
-        None,
-    );
+    let chk_enabled = create_control(hwnd, hmodule, "BUTTON", "Muting Enabled", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
+        25, 302, 200, 22, ID_CHECK_ENABLED);
+    set_font(chk_enabled, font);
 
-    let _ = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        to_wide_ptr("BUTTON"),
-        to_wide_ptr("Start Minimized to Tray"),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-        10,
-        345,
-        200,
-        25,
-        hwnd,
-        HMENU(ID_CHECK_START_MINIMIZED as *mut c_void),
-        hmodule,
-        None,
-    );
+    let chk_minimized = create_control(hwnd, hmodule, "BUTTON", "Start Minimized to Tray", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
+        25, 326, 200, 22, ID_CHECK_START_MINIMIZED);
+    set_font(chk_minimized, font);
 
-    let _ = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        to_wide_ptr("BUTTON"),
-        to_wide_ptr("Start with Windows"),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-        10,
-        375,
-        200,
-        25,
-        hwnd,
-        HMENU(ID_CHECK_START_WINDOWS as *mut c_void),
-        hmodule,
-        None,
-    );
+    let chk_startup = create_control(hwnd, hmodule, "BUTTON", "Start with Windows", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
+        25, 350, 200, 22, ID_CHECK_START_WINDOWS);
+    set_font(chk_startup, font);
 
-    // Poll interval
-    create_static(hwnd, hmodule, "Poll Interval (ms):", 260, 318, 120, 20);
-    let _ = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
-        to_wide_ptr("EDIT"),
-        PCWSTR::null(),
-        WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32),
-        385,
-        315,
-        80,
-        24,
-        hwnd,
-        HMENU(ID_EDIT_POLL_INTERVAL as *mut c_void),
-        hmodule,
-        None,
-    );
+    // Poll interval on the right side
+    let lbl_poll = create_control(hwnd, hmodule, "STATIC", "Poll Interval:", 
+        WS_CHILD | WS_VISIBLE, 
+        290, 305, 90, 20, ID_LABEL_POLL);
+    set_font(lbl_poll, font);
 
-    create_static(hwnd, hmodule, "(100-2000)", 385, 342, 80, 18);
+    let edit_poll = create_control(hwnd, hmodule, "EDIT", "", 
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32), 
+        385, 302, 60, 24, ID_EDIT_POLL_INTERVAL);
+    set_font(edit_poll, font);
 
-    // Info text
-    create_static(hwnd, hmodule, "Config file location:", 10, 410, 120, 20);
+    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", 
+        WS_CHILD | WS_VISIBLE, 
+        450, 305, 25, 20, 0);
+    set_font(lbl_ms, font);
+
+    let lbl_range = create_control(hwnd, hmodule, "STATIC", "(Range: 100-2000 ms)", 
+        WS_CHILD | WS_VISIBLE, 
+        290, 330, 150, 18, 0);
+    set_font(lbl_range, font);
+
+    // Config path info
+    let lbl_config = create_control(hwnd, hmodule, "STATIC", "Config file:", 
+        WS_CHILD | WS_VISIBLE, 
+        25, 378, 70, 18, 0);
+    set_font(lbl_config, font);
     
     let config_path = Config::config_path();
     let path_str = config_path.to_string_lossy();
-    create_static(hwnd, hmodule, &path_str, 10, 428, 470, 20);
+    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, 
+        WS_CHILD | WS_VISIBLE, 
+        95, 378, 415, 18, 0);
+    set_font(lbl_path, font);
 
-    // Bottom buttons
-    create_button(hwnd, hmodule, "Save && Close", 260, 455, 110, 30, ID_BTN_SAVE);
-    create_button(hwnd, hmodule, "Cancel", 380, 455, 90, 30, ID_BTN_CLOSE);
+    // === Bottom Buttons ===
+    let btn_save = create_control(hwnd, hmodule, "BUTTON", "Save && Close", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
+        310, 420, 105, 32, ID_BTN_SAVE);
+    set_font(btn_save, font);
+
+    let btn_cancel = create_control(hwnd, hmodule, "BUTTON", "Cancel", 
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
+        422, 420, 100, 32, ID_BTN_CLOSE);
+    set_font(btn_cancel, font);
 }
 
-unsafe fn create_static(hwnd: HWND, hmodule: HMODULE, text: &str, x: i32, y: i32, w: i32, h: i32) {
-    let _ = CreateWindowExW(
+/// Helper to create a control and return its handle
+unsafe fn create_control(hwnd: HWND, hmodule: HMODULE, class: &str, text: &str, style: WINDOW_STYLE, x: i32, y: i32, w: i32, h: i32, id: i32) -> HWND {
+    let hwnd_ctl = CreateWindowExW(
         WINDOW_EX_STYLE(0),
-        to_wide_ptr("STATIC"),
+        to_wide_ptr(class),
         to_wide_ptr(text),
-        WS_CHILD | WS_VISIBLE,
+        style,
         x,
         y,
         w,
         h,
         hwnd,
-        None,
+        if id != 0 { HMENU(id as *mut c_void) } else { HMENU::default() },
         hmodule,
         None,
     );
+    hwnd_ctl.unwrap_or_default()
 }
 
-unsafe fn create_button(hwnd: HWND, hmodule: HMODULE, text: &str, x: i32, y: i32, w: i32, h: i32, id: i32) {
-    let _ = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        to_wide_ptr("BUTTON"),
-        to_wide_ptr(text),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        x,
-        y,
-        w,
-        h,
-        hwnd,
-        HMENU(id as *mut c_void),
-        hmodule,
-        None,
-    );
+/// Set font on a control
+unsafe fn set_font(hwnd: HWND, font: HFONT) {
+    SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
 }
 
 unsafe fn refresh_detected_apps(hwnd: HWND) {

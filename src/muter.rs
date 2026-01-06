@@ -63,11 +63,13 @@ impl MuterEngine {
         let config = self.config.read();
         let muting_enabled = config.muting_enabled;
         let excluded_apps = config.excluded_apps.clone();
+        let always_muted_apps = config.always_muted_apps.clone();
         drop(config);
 
         // Get current foreground PID
         let foreground_pid = get_foreground_pid();
-        let foreground_changed = foreground_pid != self.last_foreground_pid;
+        let previous_foreground_pid = self.last_foreground_pid;
+        let foreground_changed = foreground_pid != previous_foreground_pid;
         self.last_foreground_pid = foreground_pid;
 
         // Only refresh audio sessions periodically OR when foreground changes
@@ -102,6 +104,7 @@ impl MuterEngine {
 
             let is_foreground = foreground_pid == Some(session.process_id);
             let is_excluded = excluded_apps.contains(&session.process_name.to_lowercase());
+            let is_always_muted = always_muted_apps.contains(&session.process_name.to_lowercase());
             let is_own_process = session.process_id == self.own_pid;
 
             let app_state = self
@@ -122,25 +125,38 @@ impl MuterEngine {
             app_state.display_name = session.display_name.clone();
 
             // Apply muting logic if enabled
-            if muting_enabled && !is_excluded && !is_own_process {
-                if is_foreground {
-                    // Unmute foreground app if we muted it
+            if muting_enabled && !is_own_process {
+                // Priority 1: Always-muted apps stay muted even when foreground.
+                if is_always_muted {
+                    if !session.is_muted {
+                        app_state.original_mute_state = session.is_muted;
+                        let _ = self.audio_manager.mute_process(session.process_id);
+                        app_state.is_muted_by_us = true;
+                        self.muted_pids.insert(session.process_id);
+                    }
+                } else if is_excluded {
+                    // Excluded apps are always audible; if we muted them earlier, undo it.
                     if app_state.is_muted_by_us {
                         let _ = self.audio_manager.unmute_process(session.process_id);
                         app_state.is_muted_by_us = false;
                         self.muted_pids.remove(&session.process_id);
                     }
+                } else if is_foreground {
+                    // Always try to unmute the foreground app, even if it was muted externally.
+                    let _ = self.audio_manager.unmute_process(session.process_id);
+                    app_state.is_muted_by_us = false;
+                    self.muted_pids.remove(&session.process_id);
                 } else {
-                    // Mute background app
-                    if !app_state.is_muted_by_us && !session.is_muted {
+                    // Mute background app (only if currently unmuted)
+                    if !session.is_muted {
                         app_state.original_mute_state = session.is_muted;
                         let _ = self.audio_manager.mute_process(session.process_id);
                         app_state.is_muted_by_us = true;
                         self.muted_pids.insert(session.process_id);
                     }
                 }
-            } else if !muting_enabled || is_excluded {
-                // Unmute if we previously muted this app
+            } else if !muting_enabled {
+                // Muting disabled: unmute anything we previously muted.
                 if app_state.is_muted_by_us {
                     let _ = self.audio_manager.unmute_process(session.process_id);
                     app_state.is_muted_by_us = false;
@@ -158,16 +174,38 @@ impl MuterEngine {
 
                 let is_foreground = foreground_pid == Some(*pid);
                 let is_excluded = excluded_apps.contains(&state.process_name.to_lowercase());
+                let is_always_muted = always_muted_apps.contains(&state.process_name.to_lowercase());
 
-                if muting_enabled && !is_excluded && *pid != self.own_pid {
-                    if is_foreground && state.is_muted_by_us {
-                        let _ = self.audio_manager.unmute_process(*pid);
-                        state.is_muted_by_us = false;
-                        self.muted_pids.remove(pid);
-                    } else if !is_foreground && !state.is_muted_by_us {
+                if muting_enabled && *pid != self.own_pid {
+                    if is_always_muted {
                         let _ = self.audio_manager.mute_process(*pid);
                         state.is_muted_by_us = true;
                         self.muted_pids.insert(*pid);
+                    } else if is_excluded {
+                        if state.is_muted_by_us {
+                            let _ = self.audio_manager.unmute_process(*pid);
+                            state.is_muted_by_us = false;
+                            self.muted_pids.remove(pid);
+                        }
+                    } else if is_foreground {
+                        let _ = self.audio_manager.unmute_process(*pid);
+                        state.is_muted_by_us = false;
+                        self.muted_pids.remove(pid);
+                    } else {
+                        // Avoid muting every background PID here (we don't have fresh mute state).
+                        // Only newly-mute the PID that just lost focus, plus anything we already muted.
+                        let should_mute = state.is_muted_by_us || previous_foreground_pid == Some(*pid);
+                        if should_mute {
+                            let _ = self.audio_manager.mute_process(*pid);
+                            state.is_muted_by_us = true;
+                            self.muted_pids.insert(*pid);
+                        }
+                    }
+                } else if !muting_enabled {
+                    if state.is_muted_by_us {
+                        let _ = self.audio_manager.unmute_process(*pid);
+                        state.is_muted_by_us = false;
+                        self.muted_pids.remove(pid);
                     }
                 }
             }

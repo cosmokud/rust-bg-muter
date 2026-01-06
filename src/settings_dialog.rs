@@ -26,8 +26,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 // Control IDs
 const ID_LIST_DETECTED: i32 = 101;
 const ID_LIST_EXCLUDED: i32 = 102;
+const ID_LIST_ALWAYS_MUTED: i32 = 112;
 const ID_BTN_ADD_EXCLUSION: i32 = 103;
 const ID_BTN_REMOVE_EXCLUSION: i32 = 104;
+const ID_BTN_ADD_ALWAYS_MUTED: i32 = 115;
+const ID_BTN_REMOVE_ALWAYS_MUTED: i32 = 116;
 const ID_BTN_REFRESH: i32 = 105;
 const ID_CHECK_ENABLED: i32 = 106;
 const ID_CHECK_START_MINIMIZED: i32 = 107;
@@ -40,7 +43,7 @@ const ID_LABEL_POLL: i32 = 114;
 
 // Window dimensions (wider so process name + PID fits without truncation)
 const WINDOW_WIDTH: i32 = 820;
-const WINDOW_HEIGHT: i32 = 500;
+const WINDOW_HEIGHT: i32 = 560;
 
 // Button states
 const BST_CHECKED: usize = 1;
@@ -308,7 +311,7 @@ unsafe fn create_controls(hwnd: HWND) {
         418,
         8,
         390,
-        230,
+        115,
         0,
     );
     set_font(grp_excluded, font);
@@ -323,10 +326,40 @@ unsafe fn create_controls(hwnd: HWND) {
         428,
         28,
         370,
-        175,
+        85,
         ID_LIST_EXCLUDED,
     );
     set_font(list_excluded, font);
+
+    // Group box for always muted apps
+    let grp_always_muted = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "Always Muted",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
+        418,
+        128,
+        390,
+        110,
+        0,
+    );
+    set_font(grp_always_muted, font);
+
+    // Always muted listbox
+    let list_always_muted = create_control(
+        hwnd,
+        hmodule,
+        "LISTBOX",
+        "",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
+        428,
+        148,
+        370,
+        80,
+        ID_LIST_ALWAYS_MUTED,
+    );
+    set_font(list_always_muted, font);
 
     // Add/Remove buttons
     let btn_add = create_control(
@@ -343,6 +376,20 @@ unsafe fn create_controls(hwnd: HWND) {
     );
     set_font(btn_add, font);
 
+    let btn_add_always = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "Add to Always Muted →",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        22,
+        275,
+        180,
+        28,
+        ID_BTN_ADD_ALWAYS_MUTED,
+    );
+    set_font(btn_add_always, font);
+
     let btn_remove = create_control(
         hwnd,
         hmodule,
@@ -357,6 +404,20 @@ unsafe fn create_controls(hwnd: HWND) {
     );
     set_font(btn_remove, font);
 
+    let btn_remove_always = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "← Remove from Always Muted",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        568,
+        275,
+        240,
+        28,
+        ID_BTN_REMOVE_ALWAYS_MUTED,
+    );
+    set_font(btn_remove_always, font);
+
     // === Settings Section ===
     let grp_settings = create_control(
         hwnd,
@@ -365,7 +426,7 @@ unsafe fn create_controls(hwnd: HWND) {
         "Settings",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
         12,
-        280,
+        312,
         796,
         130,
         ID_GROUP_SETTINGS,
@@ -375,17 +436,17 @@ unsafe fn create_controls(hwnd: HWND) {
     // Checkboxes
     let chk_enabled = create_control(hwnd, hmodule, "BUTTON", "Muting Enabled", 
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
-        25, 302, 200, 22, ID_CHECK_ENABLED);
+        25, 334, 200, 22, ID_CHECK_ENABLED);
     set_font(chk_enabled, font);
 
     let chk_minimized = create_control(hwnd, hmodule, "BUTTON", "Start Minimized to Tray", 
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
-        25, 326, 200, 22, ID_CHECK_START_MINIMIZED);
+        25, 358, 200, 22, ID_CHECK_START_MINIMIZED);
     set_font(chk_minimized, font);
 
     let chk_startup = create_control(hwnd, hmodule, "BUTTON", "Start with Windows", 
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
-        25, 350, 200, 22, ID_CHECK_START_WINDOWS);
+        25, 382, 200, 22, ID_CHECK_START_WINDOWS);
     set_font(chk_startup, font);
 
     // Poll interval on the right side
@@ -396,7 +457,7 @@ unsafe fn create_controls(hwnd: HWND) {
         "Poll Interval:",
         WS_CHILD | WS_VISIBLE,
         560,
-        305,
+        337,
         90,
         20,
         ID_LABEL_POLL,
@@ -410,14 +471,14 @@ unsafe fn create_controls(hwnd: HWND) {
         "",
         WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32),
         655,
-        302,
+        334,
         60,
         24,
         ID_EDIT_POLL_INTERVAL,
     );
     set_font(edit_poll, font);
 
-    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", WS_CHILD | WS_VISIBLE, 722, 305, 25, 20, 0);
+    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", WS_CHILD | WS_VISIBLE, 722, 337, 25, 20, 0);
     set_font(lbl_ms, font);
 
     let lbl_range = create_control(
@@ -427,7 +488,7 @@ unsafe fn create_controls(hwnd: HWND) {
         "(Range: 100-2000 ms)",
         WS_CHILD | WS_VISIBLE,
         560,
-        330,
+        362,
         180,
         18,
         0,
@@ -437,12 +498,12 @@ unsafe fn create_controls(hwnd: HWND) {
     // Config path info
     let lbl_config = create_control(hwnd, hmodule, "STATIC", "Config file:", 
         WS_CHILD | WS_VISIBLE, 
-        25, 378, 70, 18, 0);
+        25, 410, 70, 18, 0);
     set_font(lbl_config, font);
     
     let config_path = Config::config_path();
     let path_str = config_path.to_string_lossy();
-    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, WS_CHILD | WS_VISIBLE, 95, 378, 710, 18, 0);
+    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, WS_CHILD | WS_VISIBLE, 95, 410, 710, 18, 0);
     set_font(lbl_path, font);
 
     // === Bottom Buttons ===
@@ -453,7 +514,7 @@ unsafe fn create_controls(hwnd: HWND) {
         "Save && Close",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         595,
-        420,
+        465,
         105,
         32,
         ID_BTN_SAVE,
@@ -467,7 +528,7 @@ unsafe fn create_controls(hwnd: HWND) {
         "Cancel",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         708,
-        420,
+        465,
         100,
         32,
         ID_BTN_CLOSE,
@@ -511,11 +572,19 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
             let sessions = s.audio_manager.get_sessions();
             s.detected_apps.clear();
 
-            let excluded = s.config.read().excluded_apps.clone();
+            let config = s.config.read();
+            let excluded = config.excluded_apps.clone();
+            let always_muted = config.always_muted_apps.clone();
+            drop(config);
 
             for session in sessions {
                 // Skip if already excluded
                 if excluded.contains(&session.process_name.to_lowercase()) {
+                    continue;
+                }
+
+                // Skip if already always-muted
+                if always_muted.contains(&session.process_name.to_lowercase()) {
                     continue;
                 }
 
@@ -535,6 +604,9 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
 
     // Refresh excluded list too
     refresh_excluded_list(hwnd);
+
+    // Refresh always muted list too
+    refresh_always_muted_list(hwnd);
 }
 
 unsafe fn refresh_excluded_list(hwnd: HWND) {
@@ -551,6 +623,29 @@ unsafe fn refresh_excluded_list(hwnd: HWND) {
                 let wide = to_wide(&app);
                 SendMessageW(
                     list_excluded,
+                    LB_ADDSTRING,
+                    WPARAM(0),
+                    LPARAM(wide.as_ptr() as isize),
+                );
+            }
+        }
+    });
+}
+
+unsafe fn refresh_always_muted_list(hwnd: HWND) {
+    let list_always_muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
+
+    // Clear list
+    SendMessageW(list_always_muted, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+
+    DIALOG_STATE.with(|state| {
+        if let Some(ref s) = *state.borrow() {
+            let always_muted: Vec<_> = s.config.read().always_muted_apps.iter().cloned().collect();
+
+            for app in always_muted {
+                let wide = to_wide(&app);
+                SendMessageW(
+                    list_always_muted,
                     LB_ADDSTRING,
                     WPARAM(0),
                     LPARAM(wide.as_ptr() as isize),
@@ -607,6 +702,12 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, _notification: u16) {
         }
         ID_BTN_REMOVE_EXCLUSION => {
             remove_selected_exclusion(hwnd);
+        }
+        ID_BTN_ADD_ALWAYS_MUTED => {
+            add_selected_to_always_muted(hwnd);
+        }
+        ID_BTN_REMOVE_ALWAYS_MUTED => {
+            remove_selected_always_muted(hwnd);
         }
         ID_BTN_SAVE => {
             save_settings(hwnd);
@@ -667,6 +768,60 @@ unsafe fn remove_selected_exclusion(hwnd: HWND) {
         if let Some(ref s) = *state.borrow() {
             let mut config = s.config.write();
             config.remove_excluded_app(&app_name);
+        }
+    });
+
+    refresh_detected_apps(hwnd);
+}
+
+unsafe fn add_selected_to_always_muted(hwnd: HWND) {
+    let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
+    let sel_idx = SendMessageW(list_detected, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
+
+    if sel_idx < 0 {
+        return; // Nothing selected
+    }
+
+    DIALOG_STATE.with(|state| {
+        if let Some(ref s) = *state.borrow() {
+            if let Some((_, name)) = s.detected_apps.get(sel_idx as usize) {
+                let mut config = s.config.write();
+                config.add_always_muted_app(name);
+            }
+        }
+    });
+
+    refresh_detected_apps(hwnd);
+}
+
+unsafe fn remove_selected_always_muted(hwnd: HWND) {
+    let list_always_muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
+    let sel_idx = SendMessageW(list_always_muted, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
+
+    if sel_idx < 0 {
+        return; // Nothing selected
+    }
+
+    // Get the selected text
+    let text_len = SendMessageW(list_always_muted, LB_GETTEXTLEN, WPARAM(sel_idx as usize), LPARAM(0)).0 as usize;
+    if text_len == 0 {
+        return;
+    }
+
+    let mut buffer: Vec<u16> = vec![0; text_len + 1];
+    SendMessageW(
+        list_always_muted,
+        LB_GETTEXT,
+        WPARAM(sel_idx as usize),
+        LPARAM(buffer.as_mut_ptr() as isize),
+    );
+
+    let app_name = String::from_utf16_lossy(&buffer[..text_len]);
+
+    DIALOG_STATE.with(|state| {
+        if let Some(ref s) = *state.borrow() {
+            let mut config = s.config.write();
+            config.remove_always_muted_app(&app_name);
         }
     });
 

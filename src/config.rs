@@ -12,6 +12,10 @@ pub struct Config {
     /// List of excluded process names (e.g., "spotify.exe")
     #[serde(default)]
     pub excluded_apps: HashSet<String>,
+
+    /// List of apps that should always be muted (even when foreground)
+    #[serde(default)]
+    pub always_muted_apps: HashSet<String>,
     
     /// Whether the muting functionality is enabled
     #[serde(default = "default_enabled")]
@@ -74,6 +78,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             excluded_apps: HashSet::new(),
+            always_muted_apps: HashSet::new(),
             muting_enabled: true,
             poll_interval_ms: 500,
             start_minimized: false,
@@ -162,6 +167,26 @@ impl Config {
         self.excluded_apps.contains(&normalized)
     }
 
+    /// Adds an app to the always-muted list
+    pub fn add_always_muted_app(&mut self, app_name: &str) {
+        let normalized = app_name.to_lowercase();
+        self.always_muted_apps.insert(normalized);
+        let _ = self.save();
+    }
+
+    /// Removes an app from the always-muted list
+    pub fn remove_always_muted_app(&mut self, app_name: &str) {
+        let normalized = app_name.to_lowercase();
+        self.always_muted_apps.remove(&normalized);
+        let _ = self.save();
+    }
+
+    /// Checks if an app is in the always-muted list
+    pub fn is_always_muted(&self, app_name: &str) -> bool {
+        let normalized = app_name.to_lowercase();
+        self.always_muted_apps.contains(&normalized)
+    }
+
     /// Toggles muting functionality
     pub fn toggle_muting(&mut self) -> bool {
         self.muting_enabled = !self.muting_enabled;
@@ -185,7 +210,8 @@ mod tests {
         let config = Config::default();
         assert!(config.muting_enabled);
         assert!(config.excluded_apps.is_empty());
-        assert_eq!(config.poll_interval_ms, 100);
+        assert!(config.always_muted_apps.is_empty());
+        assert_eq!(config.poll_interval_ms, 500);
     }
 
     #[test]
@@ -204,10 +230,12 @@ mod tests {
     fn test_serialization() {
         let mut config = Config::default();
         config.add_excluded_app("test.exe");
+        config.add_always_muted_app("always.exe");
         
         let json = serde_json::to_string(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
         
         assert!(loaded.is_excluded("test.exe"));
+        assert!(loaded.is_always_muted("always.exe"));
     }
 }

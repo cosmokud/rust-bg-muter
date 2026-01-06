@@ -104,15 +104,27 @@ impl SystemTray {
             // isn't producing frames. We request shutdown and also post a WM_CLOSE to the
             // main window so eframe/winit exits promptly.
             if event.id == exit_id {
-                should_exit.store(true, Ordering::Relaxed);
+                should_exit.store(true, Ordering::SeqCst);
                 let _ = shutdown_tx.try_send(());
+                
+                // Send the Exit event first
+                let _ = sender.try_send(TrayEvent::Exit);
+                
+                // Post WM_CLOSE to the main window
                 request_app_exit_native();
+                
+                // Schedule a forced termination after a short delay.
+                // This ensures the process exits even if the GUI loop is stuck.
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    // Force terminate if still running after 500ms
+                    std::process::exit(0);
+                });
+                return;
             }
 
             let ev = if event.id == toggle_id {
                 Some(TrayEvent::ToggleMuting)
-            } else if event.id == exit_id {
-                Some(TrayEvent::Exit)
             } else {
                 None
             };

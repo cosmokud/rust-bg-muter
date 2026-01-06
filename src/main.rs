@@ -115,7 +115,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!("Background Muter shutdown complete");
-    Ok(())
+    
+    // Force terminate the process to ensure all threads are stopped.
+    // This is necessary because some background threads (COM, tray icon handlers, etc.)
+    // may not respond to graceful shutdown signals in time.
+    std::process::exit(0);
 }
 
 /// Runs the application with the GUI visible
@@ -130,7 +134,7 @@ fn run_with_gui(
     let should_exit_for_app = should_exit.clone();
     let shutdown_tx_for_app = shutdown_tx.clone();
     
-    eframe::run_native(
+    let result = eframe::run_native(
         "Background Muter",
         options,
         Box::new(move |cc| {
@@ -142,11 +146,13 @@ fn run_with_gui(
                 shutdown_tx_for_app.clone(),
             )))
         }),
-    )?;
+    );
 
-    should_exit.store(true, Ordering::Relaxed);
+    // Signal shutdown immediately after GUI exits
+    should_exit.store(true, Ordering::SeqCst);
     let _ = shutdown_tx.try_send(());
-    Ok(())
+    
+    result.map_err(|e| e.into())
 }
 
 #[cfg(test)]

@@ -17,12 +17,14 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     // Prefer a checked-in ICO if the user provides one.
     let repo_ico_path = Path::new("assets/icon.ico");
     let generated_ico_path = out_dir.join("bg-muter.ico");
     let ico_path: PathBuf = if repo_ico_path.exists() {
-        repo_ico_path.to_path_buf()
+        // Use absolute path to ensure winres can find it
+        std::fs::canonicalize(repo_ico_path).unwrap_or_else(|_| repo_ico_path.to_path_buf())
     } else {
         if let Err(e) = generate_ico(Path::new("assets/icon.png"), &generated_ico_path) {
             eprintln!(
@@ -44,14 +46,35 @@ fn main() {
     res.set("FileVersion", env!("CARGO_PKG_VERSION"));
 
     if ico_path.exists() {
-        if let Some(p) = ico_path.to_str() {
-            res.set_icon(p);
-        }
+        // Convert to string, handling the \\?\ prefix from canonicalize on Windows
+        let ico_str = ico_path.to_string_lossy();
+        let ico_str = ico_str.strip_prefix(r"\\?\").unwrap_or(&ico_str);
+        res.set_icon(ico_str);
+        println!("cargo:warning=Using icon: {}", ico_str);
+    } else {
+        println!("cargo:warning=Icon file not found: {}", ico_path.display());
     }
 
     // Compile the resource
-    if let Err(e) = res.compile() {
-        eprintln!("Warning: Failed to compile Windows resources: {}", e);
+    // Note: winres outputs cargo:rustc-link-lib=dylib=resource which doesn't work properly
+    // We need to link the resource.lib statically instead
+    match res.compile() {
+        Ok(_) => {
+            println!("cargo:warning=Windows resources compiled successfully");
+            
+            // For MSVC, explicitly link the resource library as a static library
+            // This overrides winres's default dylib linking
+            if target_env == "msvc" {
+                let resource_lib = out_dir.join("resource.lib");
+                if resource_lib.exists() {
+                    // Link the resource library directly using link.exe arguments
+                    println!("cargo:rustc-link-arg={}", resource_lib.display());
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: Failed to compile Windows resources: {}", e);
+        }
     }
 }
 

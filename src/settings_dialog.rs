@@ -38,8 +38,8 @@ const ID_BTN_CLOSE: i32 = 111;
 const ID_GROUP_SETTINGS: i32 = 113;
 const ID_LABEL_POLL: i32 = 114;
 
-// Window dimensions (slightly larger for better spacing)
-const WINDOW_WIDTH: i32 = 540;
+// Window dimensions (wider so process name + PID fits without truncation)
+const WINDOW_WIDTH: i32 = 820;
 const WINDOW_HEIGHT: i32 = 500;
 
 // Button states
@@ -263,15 +263,33 @@ unsafe fn create_controls(hwnd: HWND) {
 
     // === Audio Apps Section ===
     // Group box for detected apps
-    let grp_detected = create_control(hwnd, hmodule, "BUTTON", "Detected Audio Apps", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32), 
-        12, 8, 250, 230, 0);
+    let grp_detected = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "Detected Audio Apps",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
+        12,
+        8,
+        390,
+        230,
+        0,
+    );
     set_font(grp_detected, font);
 
     // Detected apps listbox
-    let list_detected = create_control(hwnd, hmodule, "LISTBOX", "", 
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32 | WS_EX_CLIENTEDGE.0), 
-        22, 28, 230, 175, ID_LIST_DETECTED);
+    let list_detected = create_control(
+        hwnd,
+        hmodule,
+        "LISTBOX",
+        "",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
+        22,
+        28,
+        370,
+        175,
+        ID_LIST_DETECTED,
+    );
     set_font(list_detected, font);
 
     // Refresh button under detected list
@@ -281,32 +299,77 @@ unsafe fn create_controls(hwnd: HWND) {
     set_font(btn_refresh, font);
 
     // Group box for excluded apps
-    let grp_excluded = create_control(hwnd, hmodule, "BUTTON", "Excluded Apps (Always Audible)", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32), 
-        272, 8, 250, 230, 0);
+    let grp_excluded = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "Excluded Apps (Always Audible)",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
+        418,
+        8,
+        390,
+        230,
+        0,
+    );
     set_font(grp_excluded, font);
 
     // Excluded apps listbox
-    let list_excluded = create_control(hwnd, hmodule, "LISTBOX", "", 
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32 | WS_EX_CLIENTEDGE.0), 
-        282, 28, 230, 175, ID_LIST_EXCLUDED);
+    let list_excluded = create_control(
+        hwnd,
+        hmodule,
+        "LISTBOX",
+        "",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
+        428,
+        28,
+        370,
+        175,
+        ID_LIST_EXCLUDED,
+    );
     set_font(list_excluded, font);
 
-    // Add/Remove buttons between lists
-    let btn_add = create_control(hwnd, hmodule, "BUTTON", "Add to Exclusions →", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
-        22, 245, 145, 28, ID_BTN_ADD_EXCLUSION);
+    // Add/Remove buttons
+    let btn_add = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "Add to Exclusions →",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        22,
+        245,
+        180,
+        28,
+        ID_BTN_ADD_EXCLUSION,
+    );
     set_font(btn_add, font);
 
-    let btn_remove = create_control(hwnd, hmodule, "BUTTON", "← Remove from Exclusions", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
-        347, 245, 165, 28, ID_BTN_REMOVE_EXCLUSION);
+    let btn_remove = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "← Remove from Exclusions",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        588,
+        245,
+        220,
+        28,
+        ID_BTN_REMOVE_EXCLUSION,
+    );
     set_font(btn_remove, font);
 
     // === Settings Section ===
-    let grp_settings = create_control(hwnd, hmodule, "BUTTON", "Settings", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32), 
-        12, 280, 510, 130, ID_GROUP_SETTINGS);
+    let grp_settings = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "Settings",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
+        12,
+        280,
+        796,
+        130,
+        ID_GROUP_SETTINGS,
+    );
     set_font(grp_settings, font);
 
     // Checkboxes
@@ -326,24 +389,49 @@ unsafe fn create_controls(hwnd: HWND) {
     set_font(chk_startup, font);
 
     // Poll interval on the right side
-    let lbl_poll = create_control(hwnd, hmodule, "STATIC", "Poll Interval:", 
-        WS_CHILD | WS_VISIBLE, 
-        290, 305, 90, 20, ID_LABEL_POLL);
+    let lbl_poll = create_control(
+        hwnd,
+        hmodule,
+        "STATIC",
+        "Poll Interval:",
+        WS_CHILD | WS_VISIBLE,
+        560,
+        305,
+        90,
+        20,
+        ID_LABEL_POLL,
+    );
     set_font(lbl_poll, font);
 
-    let edit_poll = create_control(hwnd, hmodule, "EDIT", "", 
-        WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32), 
-        385, 302, 60, 24, ID_EDIT_POLL_INTERVAL);
+    let edit_poll = create_control(
+        hwnd,
+        hmodule,
+        "EDIT",
+        "",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32),
+        655,
+        302,
+        60,
+        24,
+        ID_EDIT_POLL_INTERVAL,
+    );
     set_font(edit_poll, font);
 
-    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", 
-        WS_CHILD | WS_VISIBLE, 
-        450, 305, 25, 20, 0);
+    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", WS_CHILD | WS_VISIBLE, 722, 305, 25, 20, 0);
     set_font(lbl_ms, font);
 
-    let lbl_range = create_control(hwnd, hmodule, "STATIC", "(Range: 100-2000 ms)", 
-        WS_CHILD | WS_VISIBLE, 
-        290, 330, 150, 18, 0);
+    let lbl_range = create_control(
+        hwnd,
+        hmodule,
+        "STATIC",
+        "(Range: 100-2000 ms)",
+        WS_CHILD | WS_VISIBLE,
+        560,
+        330,
+        180,
+        18,
+        0,
+    );
     set_font(lbl_range, font);
 
     // Config path info
@@ -354,20 +442,36 @@ unsafe fn create_controls(hwnd: HWND) {
     
     let config_path = Config::config_path();
     let path_str = config_path.to_string_lossy();
-    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, 
-        WS_CHILD | WS_VISIBLE, 
-        95, 378, 415, 18, 0);
+    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, WS_CHILD | WS_VISIBLE, 95, 378, 710, 18, 0);
     set_font(lbl_path, font);
 
     // === Bottom Buttons ===
-    let btn_save = create_control(hwnd, hmodule, "BUTTON", "Save && Close", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
-        310, 420, 105, 32, ID_BTN_SAVE);
+    let btn_save = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "Save && Close",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        595,
+        420,
+        105,
+        32,
+        ID_BTN_SAVE,
+    );
     set_font(btn_save, font);
 
-    let btn_cancel = create_control(hwnd, hmodule, "BUTTON", "Cancel", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
-        422, 420, 100, 32, ID_BTN_CLOSE);
+    let btn_cancel = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "Cancel",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        708,
+        420,
+        100,
+        32,
+        ID_BTN_CLOSE,
+    );
     set_font(btn_cancel, font);
 }
 

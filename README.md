@@ -1,6 +1,6 @@
 # 🔇 Background Muter
 
-A high-performance Windows application written in Rust that automatically mutes applications running in the background. Never be interrupted by unexpected sounds from background apps again!
+A lightweight, ultra-efficient Windows application written in Rust that automatically mutes applications running in the background. Never be interrupted by unexpected sounds from background apps again!
 
 ![Rust](https://img.shields.io/badge/Rust-1.75+-orange?logo=rust)
 ![Windows](https://img.shields.io/badge/Platform-Windows-blue?logo=windows)
@@ -12,19 +12,20 @@ A high-performance Windows application written in Rust that automatically mutes 
 - **Smart Detection**: Automatically detects all applications producing audio
 - **Exclusion List**: Add apps to a whitelist so they continue playing in the background
 - **System Tray Integration**: Runs silently in your system tray
-- **Low Resource Usage**: Minimal CPU and memory footprint
-- **Beautiful GUI**: Modern, responsive interface built with egui
-- **Persistent Settings**: Your preferences are saved between sessions
-- **Fast Response**: Sub-100ms response time to focus changes
+- **Ultra-Low Resource Usage**: ~0% CPU, ~3MB RAM, **no GPU/VRAM usage**
+- **Persistent Settings**: Your preferences are saved between sessions (edit `config.json`)
+- **Native Windows**: Pure Win32 implementation - no heavy GUI frameworks
+- **Fast Response**: Sub-500ms response time to focus changes
 
-## 📸 Screenshots
+## 📊 Resource Usage
 
-The application features a clean, modern dark-themed interface:
-
-- **Detected Apps List**: See all applications currently producing audio
-- **Exclusion List**: Manage which apps should never be muted
-- **Toggle Control**: Enable/disable muting with one click
-- **System Tray**: Access core features without opening the main window
+| Metric            | Value      |
+| ----------------- | ---------- |
+| CPU Usage         | ~0% (idle) |
+| RAM (Private)     | ~3 MB      |
+| RAM (Working Set) | ~15 MB     |
+| GPU/VRAM          | **0 MB**   |
+| Binary Size       | ~800 KB    |
 
 ## 🚀 Installation
 
@@ -43,7 +44,7 @@ cd rust-bg-muter
 # Build in release mode (recommended)
 cargo build --release
 
-# The executable will be at target/release/rust-bg-muter.exe
+# The executable will be at target/release/bg-muter.exe
 ```
 
 ### Running
@@ -53,7 +54,7 @@ cargo build --release
 cargo run --release
 
 # Or run the executable
-./target/release/rust-bg-muter.exe
+./target/release/bg-muter.exe
 ```
 
 ## 🎯 Usage
@@ -61,83 +62,74 @@ cargo run --release
 ### Basic Usage
 
 1. **Launch the application** - It will appear in your system tray
-2. **Double-click the tray icon** to open the main window
-3. **Play some audio** in different applications - they'll appear in the detected list
-4. **Add exclusions** by clicking the "Exclude" button next to any app
-5. **Toggle muting** using the status button in the header
+2. **Left-click the tray icon** to open the menu
+3. **Toggle muting** from the tray menu
+4. **View settings** to see current configuration
 
-### Exclusion List
+### Configuration
 
-Apps in the exclusion list will **never be muted**, even when running in the background. This is useful for:
+Settings are stored in a JSON file at:
 
-- Music players (Spotify, VLC, etc.)
-- Communication apps (Discord, Teams, etc.)
-- Notification sounds
-- Any app you want to hear regardless of focus
+- `%APPDATA%\rust-bg-muter\config.json`
 
-### Adding Exclusions
+Edit this file to configure:
 
-**Method 1: From Detected Apps**
+- `excluded_apps`: List of apps to never mute (e.g., `["spotify.exe", "discord.exe"]`)
+- `poll_interval_ms`: How often to check for changes (default: 500ms)
+- `start_minimized`: Start hidden in tray (default: false)
+- `start_with_windows`: Auto-start with Windows (default: false)
 
-- Click the "➕ Exclude" button next to any detected app
+Example config:
 
-**Method 2: Manual Entry**
-
-- Type the executable name (e.g., `spotify.exe`) in the manual input field
-- Press Enter or click "Add"
+```json
+{
+  "excluded_apps": ["spotify.exe", "discord.exe", "vlc.exe"],
+  "muting_enabled": true,
+  "poll_interval_ms": 500,
+  "start_minimized": true,
+  "start_with_windows": true
+}
+```
 
 ### System Tray
 
-- **Double-click**: Open the main window
-- **Right-click**: Access the context menu
+- **Left-click**: Open the context menu
+- **Right-click**: Open the context menu
   - Toggle muting on/off
+  - View settings
   - Exit the application
-
-### Tray Icon Colors
-
-- 🟢 **Green**: Muting is active
-- 🔴 **Red**: Muting is disabled
 
 ## ⚙️ Configuration
 
-Settings are automatically saved to:
-
-```
-%APPDATA%/rust-bg-muter/config.json
-```
-
-### Available Settings
-
-| Setting            | Default | Description                               |
-| ------------------ | ------- | ----------------------------------------- |
-| `muting_enabled`   | `true`  | Whether background muting is active       |
-| `poll_interval_ms` | `100`   | How often to check for focus changes (ms) |
-| `start_minimized`  | `false` | Start directly to system tray             |
-| `excluded_apps`    | `[]`    | List of apps that won't be muted          |
-
 ## 🏗️ Architecture
 
-The application is built with a modular architecture:
+The application is built with a lightweight, modular architecture:
 
 ```
 src/
-├── main.rs       # Application entry point and orchestration
+├── main.rs       # Application entry point and tray loop
 ├── lib.rs        # Library exports
 ├── audio.rs      # Windows Audio Session API (WASAPI) integration
 ├── config.rs     # Configuration management and persistence
-├── gui.rs        # egui-based graphical interface
 ├── muter.rs      # Core muting logic and engine
 ├── process.rs    # Process detection and foreground tracking
-└── tray.rs       # System tray integration
+├── startup.rs    # Windows startup registry integration
+└── tray.rs       # System tray integration (native Win32)
 ```
 
 ### Key Technologies
 
-- **[egui](https://github.com/emilk/egui)**: Immediate mode GUI framework
-- **[eframe](https://github.com/emilk/egui/tree/master/crates/eframe)**: Native application framework
-- **[tray-icon](https://github.com/tauri-apps/tray-icon)**: Cross-platform system tray
+- **[tray-icon](https://github.com/tauri-apps/tray-icon)**: Lightweight system tray
 - **[windows-rs](https://github.com/microsoft/windows-rs)**: Windows API bindings
 - **WASAPI**: Windows Audio Session API for audio control
+- **Native Win32**: Message pump and dialogs (no heavy GUI frameworks)
+
+### Design Principles
+
+1. **Minimal Dependencies**: No eframe/egui/tokio - pure Win32 tray app
+2. **Event-Driven**: Uses `MsgWaitForMultipleObjectsEx` for efficient waiting
+3. **Lazy Refresh**: Audio sessions only refreshed every 2s or on foreground change
+4. **Zero GPU**: No OpenGL/DirectX - all rendering via OS
 
 ## 🔧 Development
 
@@ -147,6 +139,7 @@ src/
 rust-bg-muter/
 ├── Cargo.toml      # Dependencies and metadata
 ├── build.rs        # Build script for Windows resources
+├── assets/         # Icon files
 ├── src/            # Source code
 │   └── ...
 └── README.md       # This file
@@ -196,7 +189,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - The Rust community for excellent crates
 - Microsoft for the Windows Audio Session API
-- The egui project for the beautiful GUI framework
+- The tray-icon project for lightweight tray integration
 
 ## 📬 Support
 

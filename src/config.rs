@@ -55,7 +55,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_poll_interval() -> u64 {
-    100 // 100ms polling interval for responsiveness
+    500 // 500ms polling interval - balances responsiveness with CPU efficiency
 }
 
 fn default_start_minimized() -> bool {
@@ -75,7 +75,7 @@ impl Default for Config {
         Self {
             excluded_apps: HashSet::new(),
             muting_enabled: true,
-            poll_interval_ms: 100,
+            poll_interval_ms: 500,
             start_minimized: false,
             minimize_to_tray: true,
             minimize_button_to_tray: true,

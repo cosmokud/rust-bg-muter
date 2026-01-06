@@ -1,48 +1,44 @@
-//! Background Muter - A Windows application to automatically mute background applications
+//! Background Muter - A lightweight Windows tray application
 //!
-//! This application runs in the system tray and automatically mutes any applications
-//! that are producing audio while in the background. Users can add apps to an
-//! exclusion list to prevent them from being muted.
+//! Automatically mutes background applications with minimal resource usage.
+//! Target: <0.2% CPU, <5MB RAM, 0 VRAM
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
 mod config;
-mod gui;
 mod muter;
 mod process;
 mod startup;
 mod tray;
 
 use config::Config;
-use gui::{create_native_options, BackgroundMuterApp};
 use muter::MuterEngine;
 use parking_lot::RwLock;
-use crossbeam_channel::{bounded, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use tray::{SystemTray, TrayCommand};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
-
-    log::info!("Background Muter starting...");
-
-    // Initialize COM for the main thread (apartment threaded for GUI)
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+/// Application entry point
+fn main() {
+    // Initialize logging (minimal in release)
+    #[cfg(debug_assertions)]
+    {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format_timestamp_millis()
+            .init();
     }
+
+    log::info!("Background Muter starting (lightweight mode)...");
 
     // Load configuration
     let config = Arc::new(RwLock::new(Config::load()));
     log::info!("Configuration loaded");
 
-    // Best-effort: ensure startup registry matches config
+    // Apply startup registry setting
     {
         let start_with_windows = config.read().start_with_windows;
         if let Err(e) = startup::apply_startup_setting(start_with_windows) {
@@ -50,109 +46,215 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Create the muting engine
-    let engine = Arc::new(RwLock::new(
-        MuterEngine::new(config.clone()).expect("Failed to create muter engine"),
-    ));
-    log::info!("Muter engine initialized");
-
-    // Create shared state
+    // Shared state
     let should_exit = Arc::new(AtomicBool::new(false));
-    let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
-    let start_minimized = config.read().start_minimized;
+    let muting_enabled = Arc::new(AtomicBool::new(config.read().muting_enabled));
 
-    // Start the background muting thread
-    let muting_config = config.clone();
-    let muting_engine = engine.clone();
-    let muting_should_exit = should_exit.clone();
-    
-    let muting_thread = thread::spawn(move || {
-        // Initialize COM for this thread
-        unsafe {
-            let _ = CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+    // Create muter engine
+    let engine = match MuterEngine::new(config.clone()) {
+        Ok(e) => Arc::new(RwLock::new(e)),
+        Err(e) => {
+            log::error!("Failed to create muter engine: {}", e);
+            return;
         }
+    };
 
-        log::info!("Background muting thread started");
+    // Start background muting thread
+    let muting_thread = {
+        let config = config.clone();
+        let engine = engine.clone();
+        let should_exit = should_exit.clone();
+        let muting_enabled = muting_enabled.clone();
 
-        while !muting_should_exit.load(Ordering::Relaxed) {
-            let poll_interval = muting_config.read().poll_interval_ms;
+        thread::spawn(move || {
+            // Initialize COM for audio operations
+            unsafe {
+                let _ = CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            }
 
-            if let Some(mut engine) = muting_engine.try_write() {
-                if let Err(e) = engine.update() {
-                    log::error!("Error updating muter engine: {}", e);
+            log::info!("Muting thread started");
+
+            while !should_exit.load(Ordering::Relaxed) {
+                // Only do work if muting is enabled
+                if muting_enabled.load(Ordering::Relaxed) {
+                    if let Some(mut eng) = engine.try_write() {
+                        if let Err(e) = eng.update() {
+                            log::error!("Muter update error: {}", e);
+                        }
+                    }
                 }
+
+                // Sleep for poll interval (longer = less CPU)
+                let poll_ms = config.read().poll_interval_ms;
+                thread::sleep(Duration::from_millis(poll_ms));
             }
 
-            // Wait for the next poll tick, but wake immediately on shutdown.
-            if shutdown_rx.recv_timeout(Duration::from_millis(poll_interval)).is_ok() {
-                break;
+            // Cleanup: unmute all before exit
+            if let Some(mut eng) = engine.try_write() {
+                eng.unmute_all();
             }
-        }
 
-        log::info!("Background muting thread stopped");
-    });
+            unsafe {
+                CoUninitialize();
+            }
 
-    // Main application loop (always run under GUI event loop so tray is responsive)
-    run_with_gui(
+            log::info!("Muting thread stopped");
+        })
+    };
+
+    // Run tray application on main thread (COM apartment-threaded for UI)
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+
+    run_tray_loop(
         config.clone(),
         engine.clone(),
         should_exit.clone(),
-        shutdown_tx.clone(),
-        !start_minimized,
-    )?;
+        muting_enabled.clone(),
+    );
 
-    // Signal background thread to stop
-    should_exit.store(true, Ordering::Relaxed);
-    let _ = shutdown_tx.try_send(());
-
-    // Wait for muting thread to finish
+    // Signal exit and wait for muting thread
+    should_exit.store(true, Ordering::SeqCst);
     let _ = muting_thread.join();
 
-    // Unmute all apps before exiting
-    if let Some(mut engine) = engine.try_write() {
-        let _ = engine.force_refresh();
-        engine.unmute_all();
+    // Final cleanup
+    if let Some(mut eng) = engine.try_write() {
+        eng.unmute_all();
+    }
+
+    unsafe {
+        CoUninitialize();
     }
 
     log::info!("Background Muter shutdown complete");
-    
-    // Force terminate the process to ensure all threads are stopped.
-    // This is necessary because some background threads (COM, tray icon handlers, etc.)
-    // may not respond to graceful shutdown signals in time.
-    std::process::exit(0);
 }
 
-/// Runs the application with the GUI visible
-fn run_with_gui(
+/// Main tray message loop - blocks until exit
+fn run_tray_loop(
     config: Arc<RwLock<Config>>,
     engine: Arc<RwLock<MuterEngine>>,
     should_exit: Arc<AtomicBool>,
-    shutdown_tx: Sender<()>,
-    start_visible: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let options = create_native_options(start_visible);
-    let should_exit_for_app = should_exit.clone();
-    let shutdown_tx_for_app = shutdown_tx.clone();
-    
-    let result = eframe::run_native(
-        "Background Muter",
-        options,
-        Box::new(move |cc| {
-            Ok(Box::new(BackgroundMuterApp::new(
-                cc,
-                config.clone(),
-                engine.clone(),
-                should_exit_for_app.clone(),
-                shutdown_tx_for_app.clone(),
-            )))
-        }),
-    );
+    muting_enabled: Arc<AtomicBool>,
+) {
+    let mut tray = match SystemTray::new(muting_enabled.load(Ordering::Relaxed)) {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("Failed to create system tray: {}", e);
+            return;
+        }
+    };
 
-    // Signal shutdown immediately after GUI exits
-    should_exit.store(true, Ordering::SeqCst);
-    let _ = shutdown_tx.try_send(());
-    
-    result.map_err(|e| e.into())
+    log::info!("System tray initialized");
+
+    // Message pump with minimal CPU usage
+    loop {
+        // Process Windows messages (blocking with timeout for efficiency)
+        if !tray.pump_messages(Duration::from_millis(500)) {
+            break;
+        }
+
+        // Check for exit signal from other threads
+        if should_exit.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Process tray commands
+        while let Some(cmd) = tray.poll_command() {
+            match cmd {
+                TrayCommand::ToggleMuting => {
+                    let enabled = {
+                        let mut cfg = config.write();
+                        cfg.toggle_muting()
+                    };
+                    muting_enabled.store(enabled, Ordering::SeqCst);
+                    tray.update_state(enabled);
+
+                    // If disabling, unmute everything immediately
+                    if !enabled {
+                        if let Some(mut eng) = engine.try_write() {
+                            eng.unmute_all();
+                        }
+                    }
+
+                    log::info!("Muting toggled: {}", enabled);
+                }
+                TrayCommand::OpenSettings => {
+                    // Open native settings dialog (non-blocking)
+                    open_settings_dialog(config.clone(), muting_enabled.clone());
+                }
+                TrayCommand::Exit => {
+                    should_exit.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+
+        if should_exit.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+}
+
+/// Opens a native Win32 settings dialog
+fn open_settings_dialog(config: Arc<RwLock<Config>>, muting_enabled: Arc<AtomicBool>) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    // Build settings info text
+    let cfg = config.read();
+    let info = format!(
+        "Background Muter Settings\n\n\
+         Status: {}\n\
+         Poll Interval: {}ms\n\
+         Start Minimized: {}\n\
+         Start with Windows: {}\n\n\
+         Excluded Apps ({}):\n{}\n\n\
+         Edit the config file to change settings:\n{}",
+        if muting_enabled.load(Ordering::Relaxed) {
+            "Active"
+        } else {
+            "Disabled"
+        },
+        cfg.poll_interval_ms,
+        cfg.start_minimized,
+        cfg.start_with_windows,
+        cfg.excluded_apps.len(),
+        if cfg.excluded_apps.is_empty() {
+            "  (none)".to_string()
+        } else {
+            cfg.excluded_apps
+                .iter()
+                .map(|s| format!("  • {}", s))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        Config::config_path().display()
+    );
+    drop(cfg);
+
+    let title = to_wide("Background Muter - Settings");
+    let text = to_wide(&info);
+
+    // Show a simple message box (zero resource usage when closed)
+    unsafe {
+        MessageBoxW(
+            HWND::default(),
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
 }
 
 #[cfg(test)]

@@ -36,8 +36,9 @@ const ID_CHECK_ENABLED: i32 = 106;
 const ID_CHECK_START_MINIMIZED: i32 = 107;
 const ID_CHECK_START_WINDOWS: i32 = 108;
 const ID_EDIT_POLL_INTERVAL: i32 = 109;
-const ID_BTN_SAVE: i32 = 110;
+const ID_BTN_SAVE_CLOSE: i32 = 110;
 const ID_BTN_CLOSE: i32 = 111;
+const ID_BTN_SAVE_ONLY: i32 = 126;
 const ID_GROUP_SETTINGS: i32 = 113;
 const ID_LABEL_POLL: i32 = 114;
 const ID_EDIT_SEARCH: i32 = 117;
@@ -590,7 +591,21 @@ unsafe fn create_controls(hwnd: HWND) {
     set_font(lbl_path, font);
 
     // === Bottom Buttons ===
-    let btn_save = create_control(
+    let btn_save_only = create_control(
+        hwnd,
+        hmodule,
+        "BUTTON",
+        "Save",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        width - 330,
+        height - 45,
+        95,
+        32,
+        ID_BTN_SAVE_ONLY,
+    );
+    set_font(btn_save_only, font);
+
+    let btn_save_close = create_control(
         hwnd,
         hmodule,
         "BUTTON",
@@ -600,9 +615,9 @@ unsafe fn create_controls(hwnd: HWND) {
         height - 45,
         105,
         32,
-        ID_BTN_SAVE,
+        ID_BTN_SAVE_CLOSE,
     );
-    set_font(btn_save, font);
+    set_font(btn_save_close, font);
 
     let btn_cancel = create_control(
         hwnd,
@@ -674,7 +689,8 @@ unsafe fn resize_controls(hwnd: HWND, width: i32, height: i32) {
     move_control(hwnd, ID_LABEL_PATH, margin + 85, settings_y + 98, width - margin * 2 - 90, 18);
 
     // Bottom buttons
-    move_control(hwnd, ID_BTN_SAVE, width - 225, height - 45, 105, 32);
+    move_control(hwnd, ID_BTN_SAVE_ONLY, width - 330, height - 45, 95, 32);
+    move_control(hwnd, ID_BTN_SAVE_CLOSE, width - 225, height - 45, 105, 32);
     move_control(hwnd, ID_BTN_CLOSE, width - 112, height - 45, 100, 32);
 
     // Force redraw
@@ -938,7 +954,10 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
         ID_BTN_REMOVE_ALWAYS_MUTED => {
             remove_selected_always_muted(hwnd);
         }
-        ID_BTN_SAVE => {
+        ID_BTN_SAVE_ONLY => {
+            save_settings(hwnd);
+        }
+        ID_BTN_SAVE_CLOSE => {
             save_settings(hwnd);
             let _ = DestroyWindow(hwnd);
         }

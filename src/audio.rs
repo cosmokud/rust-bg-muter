@@ -14,7 +14,11 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
 use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+};
+use windows::core::PWSTR;
 
 /// Represents an audio session with minimal metadata
 #[derive(Debug, Clone)]
@@ -161,8 +165,10 @@ impl Default for AudioManager {
 }
 
 /// Gets the process name from a PID with minimal overhead
+/// Uses multiple fallback methods to handle system processes like Explorer.exe
 fn get_process_name_cached(pid: u32) -> String {
     unsafe {
+        // First try: PROCESS_QUERY_INFORMATION | PROCESS_VM_READ with K32GetModuleFileNameExW
         if let Ok(handle) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) {
             let mut buffer = [0u16; 260];
             let len = K32GetModuleFileNameExW(handle, None, &mut buffer);
@@ -176,8 +182,35 @@ fn get_process_name_cached(pid: u32) -> String {
                 }
             }
         }
+
+        // Second try: PROCESS_QUERY_LIMITED_INFORMATION with QueryFullProcessImageNameW
+        // This works for system processes like Explorer.exe where the first method fails
+        if let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) {
+            let mut buffer = [0u16; 260];
+            let mut size = buffer.len() as u32;
+            if QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buffer.as_mut_ptr()),
+                &mut size,
+            )
+            .is_ok()
+            {
+                let _ = CloseHandle(handle);
+                if size > 0 {
+                    let path = OsString::from_wide(&buffer[..size as usize]);
+                    if let Some(path_str) = path.to_str() {
+                        if let Some(name) = std::path::Path::new(path_str).file_name() {
+                            return name.to_string_lossy().to_string();
+                        }
+                    }
+                }
+            } else {
+                let _ = CloseHandle(handle);
+            }
+        }
     }
-    format!("Process {}", pid)
+    format!("Unknown (PID: {})", pid)
 }
 
 /// Gets the display name of an audio session

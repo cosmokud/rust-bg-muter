@@ -10,7 +10,7 @@ use std::time::Duration;
 use crossbeam_channel::{unbounded, Receiver};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    Icon, TrayIcon, TrayIconBuilder,
+    Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 /// Embedded icon bytes
@@ -85,6 +85,17 @@ impl SystemTray {
             }
         }));
 
+        // Tray icon event handler for double-click
+        let tx_tray = command_tx.clone();
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            // Only handle double-click with left mouse button
+            if let TrayIconEvent::DoubleClick { button, .. } = event {
+                if button == MouseButton::Left {
+                    let _ = tx_tray.try_send(TrayCommand::OpenSettings);
+                }
+            }
+        }));
+
         // Build tray icon
         let tooltip = if muting_enabled {
             "Background Muter - Active"
@@ -92,11 +103,12 @@ impl SystemTray {
             "Background Muter - Disabled"
         };
 
+        // Do NOT show menu on left click - only right click shows context menu
         let tray_icon = TrayIconBuilder::new()
             .with_tooltip(tooltip)
             .with_icon(icon)
             .with_menu(Box::new(menu))
-            .with_menu_on_left_click(true)
+            .with_menu_on_left_click(false)  // Only right-click shows menu
             .build()?;
 
         Ok(Self {
@@ -174,6 +186,7 @@ impl Drop for SystemTray {
     fn drop(&mut self) {
         // Clear event handlers
         MenuEvent::set_event_handler(Some(|_: MenuEvent| {}));
+        TrayIconEvent::set_event_handler(Some(|_: TrayIconEvent| {}));
     }
 }
 

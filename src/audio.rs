@@ -80,12 +80,16 @@ impl AudioManager {
                 if let Ok(control) = session_enumerator.GetSession(i) {
                     if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
                         if let Ok(pid) = control2.GetProcessId() {
-                            // Skip system sounds (PID 0)
-                            if pid == 0 {
-                                continue;
-                            }
-
-                            let process_name = get_process_name_cached(pid);
+                            // Check if this is a system sounds session
+                            let is_system_sounds = control2.IsSystemSoundsSession().is_ok();
+                            
+                            // Determine process name
+                            let process_name = if is_system_sounds || pid == 0 {
+                                "System Sounds".to_string()
+                            } else {
+                                get_process_name_cached(pid)
+                            };
+                            
                             let display_name =
                                 get_session_display_name(&control2).unwrap_or_else(|| process_name.clone());
 
@@ -177,7 +181,7 @@ fn get_process_name_cached(pid: u32) -> String {
                 let path = OsString::from_wide(&buffer[..len as usize]);
                 if let Some(path_str) = path.to_str() {
                     if let Some(name) = std::path::Path::new(path_str).file_name() {
-                        return name.to_string_lossy().to_string();
+                        return normalize_system_process_name(name.to_string_lossy().to_string());
                     }
                 }
             }
@@ -201,7 +205,7 @@ fn get_process_name_cached(pid: u32) -> String {
                     let path = OsString::from_wide(&buffer[..size as usize]);
                     if let Some(path_str) = path.to_str() {
                         if let Some(name) = std::path::Path::new(path_str).file_name() {
-                            return name.to_string_lossy().to_string();
+                            return normalize_system_process_name(name.to_string_lossy().to_string());
                         }
                     }
                 }
@@ -210,7 +214,30 @@ fn get_process_name_cached(pid: u32) -> String {
             }
         }
     }
-    format!("Unknown (PID: {})", pid)
+    // If we can't detect the process, it's likely a system sound
+    "System Sounds".to_string()
+}
+
+/// Normalizes known system processes to "System Sounds" for cleaner display
+fn normalize_system_process_name(name: String) -> String {
+    let lower = name.to_lowercase();
+    
+    // Known Windows system sound processes - these should be tagged as "System Sounds"
+    const SYSTEM_SOUND_PROCESSES: &[&str] = &[
+        "audiodg.exe",           // Windows Audio Device Graph Isolation
+        "svchost.exe",           // Service Host (often handles system sounds)
+        "dwm.exe",               // Desktop Window Manager
+        "systemsounds.exe",      // System Sounds
+        "rundll32.exe",          // Often used for playing system sounds
+    ];
+    
+    for sys_proc in SYSTEM_SOUND_PROCESSES {
+        if lower == *sys_proc {
+            return "System Sounds".to_string();
+        }
+    }
+    
+    name
 }
 
 /// Gets the display name of an audio session

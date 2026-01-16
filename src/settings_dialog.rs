@@ -15,7 +15,7 @@ use std::sync::Arc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, HBRUSH, HFONT, HGDIOBJ,
+    CreateFontW, DeleteObject, HBRUSH, HFONT, HGDIOBJ, InvalidateRect,
     DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
     DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, COLOR_BTNFACE,
 };
@@ -40,10 +40,24 @@ const ID_BTN_SAVE: i32 = 110;
 const ID_BTN_CLOSE: i32 = 111;
 const ID_GROUP_SETTINGS: i32 = 113;
 const ID_LABEL_POLL: i32 = 114;
+const ID_EDIT_SEARCH: i32 = 117;
+const ID_GRP_DETECTED: i32 = 118;
+const ID_GRP_EXCLUDED: i32 = 119;
+const ID_GRP_ALWAYS_MUTED: i32 = 120;
+const ID_LABEL_SEARCH: i32 = 121;
+const ID_LABEL_MS: i32 = 122;
+const ID_LABEL_RANGE: i32 = 123;
+const ID_LABEL_CONFIG: i32 = 124;
+const ID_LABEL_PATH: i32 = 125;
+
+// Edit notification
+const EN_CHANGE: u16 = 0x0300;
 
 // Window dimensions (wider so process name + PID fits without truncation)
-const WINDOW_WIDTH: i32 = 820;
-const WINDOW_HEIGHT: i32 = 560;
+const WINDOW_WIDTH: i32 = 920;
+const WINDOW_HEIGHT: i32 = 680;
+const MIN_WINDOW_WIDTH: i32 = 820;
+const MIN_WINDOW_HEIGHT: i32 = 600;
 
 // Button states
 const BST_CHECKED: usize = 1;
@@ -60,6 +74,8 @@ struct DialogState {
     muting_enabled: Arc<AtomicBool>,
     audio_manager: Arc<AudioManager>,
     detected_apps: Vec<(u32, String)>, // (pid, name)
+    all_detected_apps: Vec<(u32, String)>, // All apps before filtering
+    search_filter: String,
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -132,6 +148,8 @@ pub fn open_settings_dialog(
             muting_enabled,
             audio_manager,
             detected_apps: Vec::new(),
+            all_detected_apps: Vec::new(),
+            search_filter: String::new(),
         });
     });
 
@@ -170,12 +188,12 @@ pub fn open_settings_dialog(
         let x = (screen_width - WINDOW_WIDTH) / 2;
         let y = (screen_height - WINDOW_HEIGHT) / 2;
 
-        // Create window
+        // Create window (resizable)
         let hwnd_result = CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             PCWSTR(class_name.as_ptr()),
             to_wide_ptr("Background Muter - Settings"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
             x,
             y,
             WINDOW_WIDTH,
@@ -246,6 +264,20 @@ unsafe extern "system" fn window_proc(
             handle_command(hwnd, control_id, notification);
             LRESULT(0)
         }
+        WM_SIZE => {
+            let width = (lparam.0 & 0xFFFF) as i32;
+            let height = ((lparam.0 >> 16) & 0xFFFF) as i32;
+            resize_controls(hwnd, width, height);
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            let mmi = lparam.0 as *mut MINMAXINFO;
+            if !mmi.is_null() {
+                (*mmi).ptMinTrackSize.x = MIN_WINDOW_WIDTH;
+                (*mmi).ptMinTrackSize.y = MIN_WINDOW_HEIGHT;
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -264,21 +296,67 @@ unsafe fn create_controls(hwnd: HWND) {
     // Get the font
     let font = UI_FONT.with(|f| f.borrow().unwrap_or_default());
 
+    // Get client rect for initial sizing
+    let mut rect = std::mem::zeroed();
+    let _ = GetClientRect(hwnd, &mut rect);
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    
+    // Calculate layout
+    let margin = 12;
+    let left_panel_width = (width - margin * 3) / 2;
+    let right_panel_x = margin * 2 + left_panel_width;
+    let right_panel_width = width - right_panel_x - margin;
+    
+    // Calculate list heights - split the right side into two equal parts
+    let detected_group_height = 280;
+    let right_panel_height = (detected_group_height - 20) / 2;
+
     // === Audio Apps Section ===
-    // Group box for detected apps
+    // Group box for detected apps (left side)
     let grp_detected = create_control(
         hwnd,
         hmodule,
         "BUTTON",
         "Detected Audio Apps",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
-        12,
+        margin,
         8,
-        390,
-        230,
-        0,
+        left_panel_width,
+        detected_group_height,
+        ID_GRP_DETECTED,
     );
     set_font(grp_detected, font);
+
+    // Search label
+    let lbl_search = create_control(
+        hwnd,
+        hmodule,
+        "STATIC",
+        "Search:",
+        WS_CHILD | WS_VISIBLE,
+        margin + 10,
+        28,
+        50,
+        20,
+        ID_LABEL_SEARCH,
+    );
+    set_font(lbl_search, font);
+
+    // Search box
+    let edit_search = create_control(
+        hwnd,
+        hmodule,
+        "EDIT",
+        "",
+        WS_CHILD | WS_VISIBLE | WS_BORDER,
+        margin + 65,
+        26,
+        left_panel_width - 85,
+        22,
+        ID_EDIT_SEARCH,
+    );
+    set_font(edit_search, font);
 
     // Detected apps listbox
     let list_detected = create_control(
@@ -286,11 +364,11 @@ unsafe fn create_controls(hwnd: HWND) {
         hmodule,
         "LISTBOX",
         "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
-        22,
-        28,
-        370,
-        175,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
+        margin + 10,
+        52,
+        left_panel_width - 20,
+        195,
         ID_LIST_DETECTED,
     );
     set_font(list_detected, font);
@@ -298,21 +376,21 @@ unsafe fn create_controls(hwnd: HWND) {
     // Refresh button under detected list
     let btn_refresh = create_control(hwnd, hmodule, "BUTTON", "Refresh List", 
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
-        22, 206, 100, 26, ID_BTN_REFRESH);
+        margin + 10, 252, 100, 26, ID_BTN_REFRESH);
     set_font(btn_refresh, font);
 
-    // Group box for excluded apps
+    // Group box for excluded apps (right side, top)
     let grp_excluded = create_control(
         hwnd,
         hmodule,
         "BUTTON",
         "Excluded Apps (Always Audible)",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
-        418,
+        right_panel_x,
         8,
-        390,
-        115,
-        0,
+        right_panel_width,
+        right_panel_height,
+        ID_GRP_EXCLUDED,
     );
     set_font(grp_excluded, font);
 
@@ -322,27 +400,27 @@ unsafe fn create_controls(hwnd: HWND) {
         hmodule,
         "LISTBOX",
         "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
-        428,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
+        right_panel_x + 10,
         28,
-        370,
-        85,
+        right_panel_width - 20,
+        right_panel_height - 28,
         ID_LIST_EXCLUDED,
     );
     set_font(list_excluded, font);
 
-    // Group box for always muted apps
+    // Group box for always muted apps (right side, bottom)
     let grp_always_muted = create_control(
         hwnd,
         hmodule,
         "BUTTON",
         "Always Muted",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
-        418,
-        128,
-        390,
-        110,
-        0,
+        right_panel_x,
+        8 + right_panel_height + 5,
+        right_panel_width,
+        right_panel_height,
+        ID_GRP_ALWAYS_MUTED,
     );
     set_font(grp_always_muted, font);
 
@@ -352,24 +430,26 @@ unsafe fn create_controls(hwnd: HWND) {
         hmodule,
         "LISTBOX",
         "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
-        428,
-        148,
-        370,
-        80,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
+        right_panel_x + 10,
+        28 + right_panel_height + 5,
+        right_panel_width - 20,
+        right_panel_height - 28,
         ID_LIST_ALWAYS_MUTED,
     );
     set_font(list_always_muted, font);
 
-    // Add/Remove buttons
+    // Add/Remove buttons row
+    let buttons_y = detected_group_height + 15;
+    
     let btn_add = create_control(
         hwnd,
         hmodule,
         "BUTTON",
         "Add to Exclusions →",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        22,
-        245,
+        margin + 10,
+        buttons_y,
         180,
         28,
         ID_BTN_ADD_EXCLUSION,
@@ -382,8 +462,8 @@ unsafe fn create_controls(hwnd: HWND) {
         "BUTTON",
         "Add to Always Muted →",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        22,
-        275,
+        margin + 10,
+        buttons_y + 32,
         180,
         28,
         ID_BTN_ADD_ALWAYS_MUTED,
@@ -396,8 +476,8 @@ unsafe fn create_controls(hwnd: HWND) {
         "BUTTON",
         "← Remove from Exclusions",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        588,
-        245,
+        right_panel_x + right_panel_width - 220,
+        buttons_y,
         220,
         28,
         ID_BTN_REMOVE_EXCLUSION,
@@ -410,8 +490,8 @@ unsafe fn create_controls(hwnd: HWND) {
         "BUTTON",
         "← Remove from Always Muted",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        568,
-        275,
+        right_panel_x + right_panel_width - 240,
+        buttons_y + 32,
         240,
         28,
         ID_BTN_REMOVE_ALWAYS_MUTED,
@@ -419,16 +499,19 @@ unsafe fn create_controls(hwnd: HWND) {
     set_font(btn_remove_always, font);
 
     // === Settings Section ===
+    let settings_y = buttons_y + 75;
+    let settings_height = 130;
+    
     let grp_settings = create_control(
         hwnd,
         hmodule,
         "BUTTON",
         "Settings",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
-        12,
-        312,
-        796,
-        130,
+        margin,
+        settings_y,
+        width - margin * 2,
+        settings_height,
         ID_GROUP_SETTINGS,
     );
     set_font(grp_settings, font);
@@ -436,17 +519,17 @@ unsafe fn create_controls(hwnd: HWND) {
     // Checkboxes
     let chk_enabled = create_control(hwnd, hmodule, "BUTTON", "Muting Enabled", 
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
-        25, 334, 200, 22, ID_CHECK_ENABLED);
+        margin + 13, settings_y + 22, 200, 22, ID_CHECK_ENABLED);
     set_font(chk_enabled, font);
 
     let chk_minimized = create_control(hwnd, hmodule, "BUTTON", "Start Minimized to Tray", 
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
-        25, 358, 200, 22, ID_CHECK_START_MINIMIZED);
+        margin + 13, settings_y + 46, 200, 22, ID_CHECK_START_MINIMIZED);
     set_font(chk_minimized, font);
 
     let chk_startup = create_control(hwnd, hmodule, "BUTTON", "Start with Windows", 
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
-        25, 382, 200, 22, ID_CHECK_START_WINDOWS);
+        margin + 13, settings_y + 70, 200, 22, ID_CHECK_START_WINDOWS);
     set_font(chk_startup, font);
 
     // Poll interval on the right side
@@ -456,8 +539,8 @@ unsafe fn create_controls(hwnd: HWND) {
         "STATIC",
         "Poll Interval:",
         WS_CHILD | WS_VISIBLE,
-        560,
-        337,
+        width - 260,
+        settings_y + 25,
         90,
         20,
         ID_LABEL_POLL,
@@ -470,15 +553,15 @@ unsafe fn create_controls(hwnd: HWND) {
         "EDIT",
         "",
         WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32),
-        655,
-        334,
+        width - 165,
+        settings_y + 22,
         60,
         24,
         ID_EDIT_POLL_INTERVAL,
     );
     set_font(edit_poll, font);
 
-    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", WS_CHILD | WS_VISIBLE, 722, 337, 25, 20, 0);
+    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", WS_CHILD | WS_VISIBLE, width - 100, settings_y + 25, 25, 20, ID_LABEL_MS);
     set_font(lbl_ms, font);
 
     let lbl_range = create_control(
@@ -487,23 +570,23 @@ unsafe fn create_controls(hwnd: HWND) {
         "STATIC",
         "(Range: 100-2000 ms)",
         WS_CHILD | WS_VISIBLE,
-        560,
-        362,
+        width - 260,
+        settings_y + 50,
         180,
         18,
-        0,
+        ID_LABEL_RANGE,
     );
     set_font(lbl_range, font);
 
     // Config path info
     let lbl_config = create_control(hwnd, hmodule, "STATIC", "Config file:", 
         WS_CHILD | WS_VISIBLE, 
-        25, 410, 70, 18, 0);
+        margin + 13, settings_y + 98, 70, 18, ID_LABEL_CONFIG);
     set_font(lbl_config, font);
     
     let config_path = Config::config_path();
     let path_str = config_path.to_string_lossy();
-    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, WS_CHILD | WS_VISIBLE, 95, 410, 710, 18, 0);
+    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, WS_CHILD | WS_VISIBLE, margin + 85, settings_y + 98, width - margin * 2 - 90, 18, ID_LABEL_PATH);
     set_font(lbl_path, font);
 
     // === Bottom Buttons ===
@@ -513,8 +596,8 @@ unsafe fn create_controls(hwnd: HWND) {
         "BUTTON",
         "Save && Close",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        595,
-        465,
+        width - 225,
+        height - 45,
         105,
         32,
         ID_BTN_SAVE,
@@ -527,13 +610,83 @@ unsafe fn create_controls(hwnd: HWND) {
         "BUTTON",
         "Cancel",
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        708,
-        465,
+        width - 112,
+        height - 45,
         100,
         32,
         ID_BTN_CLOSE,
     );
     set_font(btn_cancel, font);
+}
+
+/// Handle window resize - reposition all controls
+unsafe fn resize_controls(hwnd: HWND, width: i32, height: i32) {
+    if width < 100 || height < 100 {
+        return; // Prevent invalid sizes during minimize
+    }
+
+    let margin = 12;
+    let left_panel_width = (width - margin * 3) / 2;
+    let right_panel_x = margin * 2 + left_panel_width;
+    let right_panel_width = width - right_panel_x - margin;
+    
+    // Calculate available height for app lists (leave room for settings, buttons)
+    let settings_height = 130;
+    let bottom_buttons_height = 50;
+    let buttons_row_height = 75;
+    let available_for_lists = height - settings_height - bottom_buttons_height - buttons_row_height - 30;
+    let detected_group_height = available_for_lists.max(200);
+    let right_panel_height = (detected_group_height - 20) / 2;
+
+    // Detected apps group
+    move_control(hwnd, ID_GRP_DETECTED, margin, 8, left_panel_width, detected_group_height);
+    move_control(hwnd, ID_LABEL_SEARCH, margin + 10, 28, 50, 20);
+    move_control(hwnd, ID_EDIT_SEARCH, margin + 65, 26, left_panel_width - 85, 22);
+    move_control(hwnd, ID_LIST_DETECTED, margin + 10, 52, left_panel_width - 20, detected_group_height - 85);
+    move_control(hwnd, ID_BTN_REFRESH, margin + 10, detected_group_height - 25, 100, 26);
+
+    // Excluded apps group
+    move_control(hwnd, ID_GRP_EXCLUDED, right_panel_x, 8, right_panel_width, right_panel_height);
+    move_control(hwnd, ID_LIST_EXCLUDED, right_panel_x + 10, 28, right_panel_width - 20, right_panel_height - 28);
+
+    // Always muted group
+    move_control(hwnd, ID_GRP_ALWAYS_MUTED, right_panel_x, 8 + right_panel_height + 5, right_panel_width, right_panel_height);
+    move_control(hwnd, ID_LIST_ALWAYS_MUTED, right_panel_x + 10, 28 + right_panel_height + 5, right_panel_width - 20, right_panel_height - 28);
+
+    // Add/Remove buttons
+    let buttons_y = detected_group_height + 15;
+    move_control(hwnd, ID_BTN_ADD_EXCLUSION, margin + 10, buttons_y, 180, 28);
+    move_control(hwnd, ID_BTN_ADD_ALWAYS_MUTED, margin + 10, buttons_y + 32, 180, 28);
+    move_control(hwnd, ID_BTN_REMOVE_EXCLUSION, right_panel_x + right_panel_width - 220, buttons_y, 220, 28);
+    move_control(hwnd, ID_BTN_REMOVE_ALWAYS_MUTED, right_panel_x + right_panel_width - 240, buttons_y + 32, 240, 28);
+
+    // Settings group
+    let settings_y = buttons_y + 75;
+    move_control(hwnd, ID_GROUP_SETTINGS, margin, settings_y, width - margin * 2, settings_height);
+    move_control(hwnd, ID_CHECK_ENABLED, margin + 13, settings_y + 22, 200, 22);
+    move_control(hwnd, ID_CHECK_START_MINIMIZED, margin + 13, settings_y + 46, 200, 22);
+    move_control(hwnd, ID_CHECK_START_WINDOWS, margin + 13, settings_y + 70, 200, 22);
+    move_control(hwnd, ID_LABEL_POLL, width - 260, settings_y + 25, 90, 20);
+    move_control(hwnd, ID_EDIT_POLL_INTERVAL, width - 165, settings_y + 22, 60, 24);
+    move_control(hwnd, ID_LABEL_MS, width - 100, settings_y + 25, 25, 20);
+    move_control(hwnd, ID_LABEL_RANGE, width - 260, settings_y + 50, 180, 18);
+    move_control(hwnd, ID_LABEL_CONFIG, margin + 13, settings_y + 98, 70, 18);
+    move_control(hwnd, ID_LABEL_PATH, margin + 85, settings_y + 98, width - margin * 2 - 90, 18);
+
+    // Bottom buttons
+    move_control(hwnd, ID_BTN_SAVE, width - 225, height - 45, 105, 32);
+    move_control(hwnd, ID_BTN_CLOSE, width - 112, height - 45, 100, 32);
+
+    // Force redraw
+    let _ = InvalidateRect(hwnd, None, true);
+}
+
+/// Helper to move/resize a control
+unsafe fn move_control(hwnd: HWND, id: i32, x: i32, y: i32, w: i32, h: i32) {
+    let ctrl = get_dlg_item(hwnd, id);
+    if !ctrl.0.is_null() {
+        let _ = SetWindowPos(ctrl, None, x, y, w, h, SWP_NOZORDER);
+    }
 }
 
 /// Helper to create a control and return its handle
@@ -570,6 +723,7 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
         if let Some(ref mut s) = *state.borrow_mut() {
             // Get current audio sessions
             let sessions = s.audio_manager.get_sessions();
+            s.all_detected_apps.clear();
             s.detected_apps.clear();
 
             let config = s.config.read();
@@ -577,6 +731,8 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
             let always_muted = config.always_muted_apps.clone();
             drop(config);
 
+            // Build the full list of apps (excluding already excluded/always-muted)
+            let mut apps: Vec<(u32, String)> = Vec::new();
             for session in sessions {
                 // Skip if already excluded
                 if excluded.contains(&session.process_name.to_lowercase()) {
@@ -588,16 +744,28 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
                     continue;
                 }
 
-                s.detected_apps.push((session.process_id, session.process_name.clone()));
-                
-                let display = format!("{} (PID: {})", session.process_name, session.process_id);
-                let wide = to_wide(&display);
-                SendMessageW(
-                    list_detected,
-                    LB_ADDSTRING,
-                    WPARAM(0),
-                    LPARAM(wide.as_ptr() as isize),
-                );
+                apps.push((session.process_id, session.process_name.clone()));
+            }
+
+            // Sort alphabetically by process name (case-insensitive)
+            apps.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+            s.all_detected_apps = apps;
+
+            // Apply search filter
+            let filter = s.search_filter.to_lowercase();
+            for (pid, name) in &s.all_detected_apps {
+                if filter.is_empty() || name.to_lowercase().contains(&filter) {
+                    s.detected_apps.push((*pid, name.clone()));
+                    
+                    let display = format!("{} (PID: {})", name, pid);
+                    let wide = to_wide(&display);
+                    SendMessageW(
+                        list_detected,
+                        LB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(wide.as_ptr() as isize),
+                    );
+                }
             }
         }
     });
@@ -609,6 +777,37 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
     refresh_always_muted_list(hwnd);
 }
 
+/// Apply search filter without refreshing from audio manager
+unsafe fn apply_search_filter(hwnd: HWND) {
+    let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
+    
+    // Clear list
+    SendMessageW(list_detected, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+
+    DIALOG_STATE.with(|state| {
+        if let Some(ref mut s) = *state.borrow_mut() {
+            s.detected_apps.clear();
+
+            // Apply search filter
+            let filter = s.search_filter.to_lowercase();
+            for (pid, name) in &s.all_detected_apps {
+                if filter.is_empty() || name.to_lowercase().contains(&filter) {
+                    s.detected_apps.push((*pid, name.clone()));
+                    
+                    let display = format!("{} (PID: {})", name, pid);
+                    let wide = to_wide(&display);
+                    SendMessageW(
+                        list_detected,
+                        LB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(wide.as_ptr() as isize),
+                    );
+                }
+            }
+        }
+    });
+}
+
 unsafe fn refresh_excluded_list(hwnd: HWND) {
     let list_excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
     
@@ -617,7 +816,10 @@ unsafe fn refresh_excluded_list(hwnd: HWND) {
 
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
-            let excluded: Vec<_> = s.config.read().excluded_apps.iter().cloned().collect();
+            let mut excluded: Vec<_> = s.config.read().excluded_apps.iter().cloned().collect();
+            
+            // Sort alphabetically (case-insensitive)
+            excluded.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
             
             for app in excluded {
                 let wide = to_wide(&app);
@@ -640,7 +842,10 @@ unsafe fn refresh_always_muted_list(hwnd: HWND) {
 
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
-            let always_muted: Vec<_> = s.config.read().always_muted_apps.iter().cloned().collect();
+            let mut always_muted: Vec<_> = s.config.read().always_muted_apps.iter().cloned().collect();
+
+            // Sort alphabetically (case-insensitive)
+            always_muted.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
 
             for app in always_muted {
                 let wide = to_wide(&app);
@@ -692,8 +897,32 @@ unsafe fn load_settings_to_controls(hwnd: HWND) {
     });
 }
 
-unsafe fn handle_command(hwnd: HWND, control_id: i32, _notification: u16) {
+unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
     match control_id {
+        ID_EDIT_SEARCH => {
+            // Handle search box text change
+            if notification == EN_CHANGE {
+                // Get search text
+                let edit_search = get_dlg_item(hwnd, ID_EDIT_SEARCH);
+                let mut buffer: [u16; 256] = [0; 256];
+                let len = GetWindowTextW(edit_search, &mut buffer);
+                let search_text = if len > 0 {
+                    String::from_utf16_lossy(&buffer[..len as usize])
+                } else {
+                    String::new()
+                };
+                
+                // Update search filter in state
+                DIALOG_STATE.with(|state| {
+                    if let Some(ref mut s) = *state.borrow_mut() {
+                        s.search_filter = search_text;
+                    }
+                });
+                
+                // Apply filter
+                apply_search_filter(hwnd);
+            }
+        }
         ID_BTN_REFRESH => {
             refresh_detected_apps(hwnd);
         }

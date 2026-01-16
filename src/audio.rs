@@ -7,10 +7,11 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::Arc;
 use windows::core::Interface;
-use windows::Win32::Foundation::{CloseHandle, FALSE, TRUE};
+use windows::Win32::Foundation::{CloseHandle, FALSE, TRUE, S_OK};
 use windows::Win32::Media::Audio::{
-    eMultimedia, eRender, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
-    IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
+    eConsole, eMultimedia, eRender, IAudioSessionControl2, IAudioSessionEnumerator,
+    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
+    MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
 use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
@@ -59,52 +60,66 @@ impl AudioManager {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-            let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
-
-            let session_manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
-
-            let session_enumerator: IAudioSessionEnumerator =
-                session_manager.GetSessionEnumerator()?;
-
-            let count = session_enumerator.GetCount()?;
             let mut sessions_lock = self.sessions.lock();
             sessions_lock.clear();
 
-            let mut result = Vec::with_capacity(count as usize);
+            let mut result = Vec::new();
+            let mut seen_pids = std::collections::HashSet::new();
 
-            for i in 0..count {
-                if let Ok(control) = session_enumerator.GetSession(i) {
-                    if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
-                        if let Ok(pid) = control2.GetProcessId() {
-                            // Skip system sounds (PID 0)
-                            if pid == 0 {
-                                continue;
-                            }
+            for role in [eConsole, eMultimedia] {
+                let device: IMMDevice = match enumerator.GetDefaultAudioEndpoint(eRender, role) {
+                    Ok(device) => device,
+                    Err(_) => continue,
+                };
 
-                            let process_name = get_process_name_cached(pid);
-                            let display_name =
-                                get_session_display_name(&control2).unwrap_or_else(|| process_name.clone());
+                let session_manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+                let session_enumerator: IAudioSessionEnumerator =
+                    session_manager.GetSessionEnumerator()?;
 
-                            if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
-                                let is_muted = volume.GetMute().map(|b| b.as_bool()).unwrap_or(false);
+                let count = session_enumerator.GetCount()?;
+                for i in 0..count {
+                    if let Ok(control) = session_enumerator.GetSession(i) {
+                        if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
+                            if let Ok(pid) = control2.GetProcessId() {
+                                if seen_pids.contains(&pid) {
+                                    continue;
+                                }
 
-                                let session = AudioSession {
-                                    process_id: pid,
-                                    process_name: process_name.clone(),
-                                    display_name: display_name.clone(),
-                                    is_muted,
+                                let is_system_sounds = control2.IsSystemSoundsSession() == S_OK;
+
+                                let (process_name, display_name) = if pid == 0 || is_system_sounds {
+                                    let display = get_session_display_name(&control2)
+                                        .unwrap_or_else(|| "System Sounds".to_string());
+                                    (display.clone(), display)
+                                } else {
+                                    let process_name = get_process_name_cached(pid);
+                                    let display_name = get_session_display_name(&control2)
+                                        .unwrap_or_else(|| process_name.clone());
+                                    (process_name, display_name)
                                 };
 
-                                result.push(session);
+                                if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
+                                    let is_muted = volume.GetMute().map(|b| b.as_bool()).unwrap_or(false);
 
-                                sessions_lock.insert(
-                                    pid,
-                                    CachedSession {
-                                        volume,
-                                        process_name,
-                                        display_name,
-                                    },
-                                );
+                                    let session = AudioSession {
+                                        process_id: pid,
+                                        process_name: process_name.clone(),
+                                        display_name: display_name.clone(),
+                                        is_muted,
+                                    };
+
+                                    result.push(session);
+                                    seen_pids.insert(pid);
+
+                                    sessions_lock.insert(
+                                        pid,
+                                        CachedSession {
+                                            volume,
+                                            process_name,
+                                            display_name,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }

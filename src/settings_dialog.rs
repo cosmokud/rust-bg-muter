@@ -13,7 +13,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, DeleteObject, HBRUSH, HFONT, HGDIOBJ,
     DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -40,6 +40,15 @@ const ID_BTN_SAVE: i32 = 110;
 const ID_BTN_CLOSE: i32 = 111;
 const ID_GROUP_SETTINGS: i32 = 113;
 const ID_LABEL_POLL: i32 = 114;
+const ID_GROUP_DETECTED: i32 = 117;
+const ID_GROUP_EXCLUDED: i32 = 118;
+const ID_GROUP_ALWAYS_MUTED: i32 = 119;
+const ID_LABEL_SEARCH: i32 = 120;
+const ID_EDIT_SEARCH: i32 = 121;
+const ID_LABEL_MS: i32 = 122;
+const ID_LABEL_POLL_RANGE: i32 = 123;
+const ID_LABEL_CONFIG: i32 = 124;
+const ID_LABEL_CONFIG_PATH: i32 = 125;
 
 // Window dimensions (wider so process name + PID fits without truncation)
 const WINDOW_WIDTH: i32 = 820;
@@ -59,6 +68,7 @@ struct DialogState {
     config: Arc<RwLock<Config>>,
     muting_enabled: Arc<AtomicBool>,
     audio_manager: Arc<AudioManager>,
+    all_detected_apps: Vec<(u32, String)>,
     detected_apps: Vec<(u32, String)>, // (pid, name)
 }
 
@@ -131,6 +141,7 @@ pub fn open_settings_dialog(
             config,
             muting_enabled,
             audio_manager,
+            all_detected_apps: Vec::new(),
             detected_apps: Vec::new(),
         });
     });
@@ -175,7 +186,14 @@ pub fn open_settings_dialog(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             PCWSTR(class_name.as_ptr()),
             to_wide_ptr("Background Muter - Settings"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            WS_OVERLAPPED
+                | WS_CAPTION
+                | WS_SYSMENU
+                | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX
+                | WS_THICKFRAME
+                | WS_CLIPCHILDREN
+                | WS_VISIBLE,
             x,
             y,
             WINDOW_WIDTH,
@@ -236,8 +254,19 @@ unsafe extern "system" fn window_proc(
     match msg {
         WM_CREATE => {
             create_controls(hwnd);
+            layout_controls(hwnd);
             refresh_detected_apps(hwnd);
             load_settings_to_controls(hwnd);
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            layout_controls(hwnd);
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            let mmi = &mut *(lparam.0 as *mut MINMAXINFO);
+            mmi.ptMinTrackSize.x = WINDOW_WIDTH;
+            mmi.ptMinTrackSize.y = WINDOW_HEIGHT;
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -276,9 +305,38 @@ unsafe fn create_controls(hwnd: HWND) {
         8,
         390,
         230,
-        0,
+        ID_GROUP_DETECTED,
     );
     set_font(grp_detected, font);
+
+    // Search label + box (within detected apps)
+    let lbl_search = create_control(
+        hwnd,
+        hmodule,
+        "STATIC",
+        "Search:",
+        WS_CHILD | WS_VISIBLE,
+        22,
+        30,
+        50,
+        20,
+        ID_LABEL_SEARCH,
+    );
+    set_font(lbl_search, font);
+
+    let edit_search = create_control(
+        hwnd,
+        hmodule,
+        "EDIT",
+        "",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        76,
+        28,
+        316,
+        22,
+        ID_EDIT_SEARCH,
+    );
+    set_font(edit_search, font);
 
     // Detected apps listbox
     let list_detected = create_control(
@@ -288,9 +346,9 @@ unsafe fn create_controls(hwnd: HWND) {
         "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
         22,
-        28,
+        54,
         370,
-        175,
+        149,
         ID_LIST_DETECTED,
     );
     set_font(list_detected, font);
@@ -312,7 +370,7 @@ unsafe fn create_controls(hwnd: HWND) {
         8,
         390,
         115,
-        0,
+        ID_GROUP_EXCLUDED,
     );
     set_font(grp_excluded, font);
 
@@ -322,7 +380,7 @@ unsafe fn create_controls(hwnd: HWND) {
         hmodule,
         "LISTBOX",
         "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32 | LBS_SORT as u32),
         428,
         28,
         370,
@@ -342,7 +400,7 @@ unsafe fn create_controls(hwnd: HWND) {
         128,
         390,
         110,
-        0,
+        ID_GROUP_ALWAYS_MUTED,
     );
     set_font(grp_always_muted, font);
 
@@ -352,7 +410,7 @@ unsafe fn create_controls(hwnd: HWND) {
         hmodule,
         "LISTBOX",
         "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32 | LBS_SORT as u32),
         428,
         148,
         370,
@@ -478,7 +536,7 @@ unsafe fn create_controls(hwnd: HWND) {
     );
     set_font(edit_poll, font);
 
-    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", WS_CHILD | WS_VISIBLE, 722, 337, 25, 20, 0);
+    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", WS_CHILD | WS_VISIBLE, 722, 337, 25, 20, ID_LABEL_MS);
     set_font(lbl_ms, font);
 
     let lbl_range = create_control(
@@ -491,19 +549,19 @@ unsafe fn create_controls(hwnd: HWND) {
         362,
         180,
         18,
-        0,
+        ID_LABEL_POLL_RANGE,
     );
     set_font(lbl_range, font);
 
     // Config path info
     let lbl_config = create_control(hwnd, hmodule, "STATIC", "Config file:", 
         WS_CHILD | WS_VISIBLE, 
-        25, 410, 70, 18, 0);
+        25, 410, 70, 18, ID_LABEL_CONFIG);
     set_font(lbl_config, font);
     
     let config_path = Config::config_path();
     let path_str = config_path.to_string_lossy();
-    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, WS_CHILD | WS_VISIBLE, 95, 410, 710, 18, 0);
+    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, WS_CHILD | WS_VISIBLE, 95, 410, 710, 18, ID_LABEL_CONFIG_PATH);
     set_font(lbl_path, font);
 
     // === Bottom Buttons ===
@@ -536,6 +594,171 @@ unsafe fn create_controls(hwnd: HWND) {
     set_font(btn_cancel, font);
 }
 
+unsafe fn layout_controls(hwnd: HWND) {
+    let mut rect = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rect);
+    let client_w = rect.right - rect.left;
+    let client_h = rect.bottom - rect.top;
+
+    let margin = 12;
+    let gap = 8;
+    let col_gap = 16;
+    let button_height = 32;
+    let settings_height = 130;
+    let buttons_area_height = 62;
+
+    let top_section_height = client_h - (margin * 3) - settings_height - button_height;
+    let top_section_height = top_section_height.max(220);
+
+    let top_y = margin;
+    let settings_y = top_y + top_section_height + margin;
+    let buttons_y = client_h - margin - button_height;
+
+    let left_w = (client_w - margin * 2 - col_gap) / 2;
+    let right_w = client_w - margin * 2 - col_gap - left_w;
+    let left_x = margin;
+    let right_x = left_x + left_w + col_gap;
+
+    let group_area_height = top_section_height - buttons_area_height - gap;
+    let group_area_height = group_area_height.max(140);
+
+    let right_top_h = (group_area_height - gap) / 2;
+    let right_bottom_h = group_area_height - gap - right_top_h;
+
+    // Detected group
+    let detected_group = get_dlg_item(hwnd, ID_GROUP_DETECTED);
+    move_window(detected_group, left_x, top_y, left_w, group_area_height);
+
+    let inner_margin = 10;
+    let group_header = 22;
+    let search_height = 22;
+    let refresh_height = 26;
+
+    let search_label = get_dlg_item(hwnd, ID_LABEL_SEARCH);
+    let search_edit = get_dlg_item(hwnd, ID_EDIT_SEARCH);
+
+    let search_y = top_y + group_header;
+    let search_label_w = 50;
+    let search_label_x = left_x + inner_margin;
+    move_window(search_label, search_label_x, search_y, search_label_w, 20);
+
+    let search_edit_x = search_label_x + search_label_w + 6;
+    let search_edit_w = left_w - inner_margin * 2 - search_label_w - 6;
+    move_window(search_edit, search_edit_x, search_y - 2, search_edit_w, search_height);
+
+    let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
+    let refresh_btn = get_dlg_item(hwnd, ID_BTN_REFRESH);
+
+    let refresh_y = top_y + group_area_height - inner_margin - refresh_height;
+    move_window(refresh_btn, left_x + inner_margin, refresh_y, 110, refresh_height);
+
+    let list_y = search_y + search_height + 8;
+    let list_h = (refresh_y - list_y - 8).max(60);
+    move_window(list_detected, left_x + inner_margin, list_y, left_w - inner_margin * 2, list_h);
+
+    // Excluded group
+    let excluded_group = get_dlg_item(hwnd, ID_GROUP_EXCLUDED);
+    move_window(excluded_group, right_x, top_y, right_w, right_top_h);
+
+    let list_excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
+    let list_excluded_y = top_y + group_header;
+    let list_excluded_h = right_top_h - group_header - inner_margin;
+    move_window(
+        list_excluded,
+        right_x + inner_margin,
+        list_excluded_y,
+        right_w - inner_margin * 2,
+        list_excluded_h.max(40),
+    );
+
+    // Always muted group
+    let always_group = get_dlg_item(hwnd, ID_GROUP_ALWAYS_MUTED);
+    let always_y = top_y + right_top_h + gap;
+    move_window(always_group, right_x, always_y, right_w, right_bottom_h);
+
+    let list_always = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
+    let list_always_y = always_y + group_header;
+    let list_always_h = right_bottom_h - group_header - inner_margin;
+    move_window(
+        list_always,
+        right_x + inner_margin,
+        list_always_y,
+        right_w - inner_margin * 2,
+        list_always_h.max(40),
+    );
+
+    // Add/Remove buttons area
+    let buttons_top = top_y + group_area_height + gap;
+    let row_gap = 6;
+    let row1_y = buttons_top;
+    let row2_y = buttons_top + button_height + row_gap;
+
+    let add_btn = get_dlg_item(hwnd, ID_BTN_ADD_EXCLUSION);
+    let add_always_btn = get_dlg_item(hwnd, ID_BTN_ADD_ALWAYS_MUTED);
+    let remove_btn = get_dlg_item(hwnd, ID_BTN_REMOVE_EXCLUSION);
+    let remove_always_btn = get_dlg_item(hwnd, ID_BTN_REMOVE_ALWAYS_MUTED);
+
+    let left_btn_w = (left_w - inner_margin * 2).max(120);
+    move_window(add_btn, left_x + inner_margin, row1_y, left_btn_w, 28);
+    move_window(add_always_btn, left_x + inner_margin, row2_y, left_btn_w, 28);
+
+    let right_btn_w = (right_w - inner_margin * 2).max(160);
+    move_window(remove_btn, right_x + inner_margin, row1_y, right_btn_w, 28);
+    move_window(remove_always_btn, right_x + inner_margin, row2_y, right_btn_w, 28);
+
+    // Settings group
+    let grp_settings = get_dlg_item(hwnd, ID_GROUP_SETTINGS);
+    move_window(grp_settings, margin, settings_y, client_w - margin * 2, settings_height);
+
+    let chk_enabled = get_dlg_item(hwnd, ID_CHECK_ENABLED);
+    let chk_minimized = get_dlg_item(hwnd, ID_CHECK_START_MINIMIZED);
+    let chk_startup = get_dlg_item(hwnd, ID_CHECK_START_WINDOWS);
+
+    move_window(chk_enabled, margin + 13, settings_y + 22, 220, 22);
+    move_window(chk_minimized, margin + 13, settings_y + 46, 220, 22);
+    move_window(chk_startup, margin + 13, settings_y + 70, 220, 22);
+
+    let lbl_poll = get_dlg_item(hwnd, ID_LABEL_POLL);
+    let edit_poll = get_dlg_item(hwnd, ID_EDIT_POLL_INTERVAL);
+    let lbl_ms = get_dlg_item(hwnd, ID_LABEL_MS);
+    let lbl_range = get_dlg_item(hwnd, ID_LABEL_POLL_RANGE);
+
+    let right_inner = margin + (client_w - margin * 2) - inner_margin;
+    let edit_w = 60;
+    let ms_w = 22;
+    let poll_label_w = 90;
+    let poll_label_x = right_inner - (poll_label_w + edit_w + ms_w + 10);
+    move_window(lbl_poll, poll_label_x, settings_y + 25, poll_label_w, 20);
+    move_window(edit_poll, poll_label_x + poll_label_w + 6, settings_y + 22, edit_w, 24);
+    move_window(lbl_ms, poll_label_x + poll_label_w + 6 + edit_w + 4, settings_y + 25, ms_w, 20);
+    move_window(lbl_range, poll_label_x, settings_y + 50, 180, 18);
+
+    let lbl_config = get_dlg_item(hwnd, ID_LABEL_CONFIG);
+    let lbl_path = get_dlg_item(hwnd, ID_LABEL_CONFIG_PATH);
+    move_window(lbl_config, margin + 13, settings_y + 92, 80, 18);
+    move_window(lbl_path, margin + 90, settings_y + 92, client_w - (margin + 90) - margin, 18);
+
+    // Bottom buttons
+    let btn_save = get_dlg_item(hwnd, ID_BTN_SAVE);
+    let btn_cancel = get_dlg_item(hwnd, ID_BTN_CLOSE);
+
+    let btn_cancel_w = 100;
+    let btn_save_w = 105;
+    let btn_gap = 10;
+    let btn_cancel_x = client_w - margin - btn_cancel_w;
+    let btn_save_x = btn_cancel_x - btn_gap - btn_save_w;
+
+    move_window(btn_save, btn_save_x, buttons_y, btn_save_w, button_height);
+    move_window(btn_cancel, btn_cancel_x, buttons_y, btn_cancel_w, button_height);
+}
+
+unsafe fn move_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
+    if hwnd.0 == std::ptr::null_mut() {
+        return;
+    }
+    let _ = MoveWindow(hwnd, x, y, w, h, true);
+}
+
 /// Helper to create a control and return its handle
 unsafe fn create_control(hwnd: HWND, hmodule: HMODULE, class: &str, text: &str, style: WINDOW_STYLE, x: i32, y: i32, w: i32, h: i32, id: i32) -> HWND {
     let hwnd_ctl = CreateWindowExW(
@@ -561,16 +784,11 @@ unsafe fn set_font(hwnd: HWND, font: HFONT) {
 }
 
 unsafe fn refresh_detected_apps(hwnd: HWND) {
-    let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
-    
-    // Clear list
-    SendMessageW(list_detected, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-
     DIALOG_STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
             // Get current audio sessions
             let sessions = s.audio_manager.get_sessions();
-            s.detected_apps.clear();
+            s.all_detected_apps.clear();
 
             let config = s.config.read();
             let excluded = config.excluded_apps.clone();
@@ -588,9 +806,61 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
                     continue;
                 }
 
-                s.detected_apps.push((session.process_id, session.process_name.clone()));
-                
-                let display = format!("{} (PID: {})", session.process_name, session.process_id);
+                s.all_detected_apps
+                    .push((session.process_id, session.process_name.clone()));
+            }
+        }
+    });
+
+    apply_detected_filter(hwnd);
+
+    // Refresh excluded list too
+    refresh_excluded_list(hwnd);
+
+    // Refresh always muted list too
+    refresh_always_muted_list(hwnd);
+}
+
+unsafe fn get_search_text(hwnd: HWND) -> String {
+    let edit_search = get_dlg_item(hwnd, ID_EDIT_SEARCH);
+    if edit_search.0 == std::ptr::null_mut() {
+        return String::new();
+    }
+
+    let mut buffer: Vec<u16> = vec![0; 256];
+    let len = GetWindowTextW(edit_search, &mut buffer) as usize;
+    if len == 0 {
+        return String::new();
+    }
+
+    let text = String::from_utf16_lossy(&buffer[..len]);
+    text.trim().to_string()
+}
+
+unsafe fn apply_detected_filter(hwnd: HWND) {
+    let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
+    if list_detected.0 == std::ptr::null_mut() {
+        return;
+    }
+
+    // Clear list
+    SendMessageW(list_detected, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+
+    let query = get_search_text(hwnd).to_lowercase();
+
+    DIALOG_STATE.with(|state| {
+        if let Some(ref mut s) = *state.borrow_mut() {
+            s.detected_apps.clear();
+
+            for (pid, name) in &s.all_detected_apps {
+                let name_lower = name.to_lowercase();
+                if !query.is_empty() && !name_lower.contains(&query) {
+                    continue;
+                }
+
+                s.detected_apps.push((*pid, name.clone()));
+
+                let display = format!("{} (PID: {})", name, pid);
                 let wide = to_wide(&display);
                 SendMessageW(
                     list_detected,
@@ -601,12 +871,6 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
             }
         }
     });
-
-    // Refresh excluded list too
-    refresh_excluded_list(hwnd);
-
-    // Refresh always muted list too
-    refresh_always_muted_list(hwnd);
 }
 
 unsafe fn refresh_excluded_list(hwnd: HWND) {
@@ -617,7 +881,8 @@ unsafe fn refresh_excluded_list(hwnd: HWND) {
 
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
-            let excluded: Vec<_> = s.config.read().excluded_apps.iter().cloned().collect();
+            let mut excluded: Vec<_> = s.config.read().excluded_apps.iter().cloned().collect();
+            excluded.sort();
             
             for app in excluded {
                 let wide = to_wide(&app);
@@ -640,7 +905,8 @@ unsafe fn refresh_always_muted_list(hwnd: HWND) {
 
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
-            let always_muted: Vec<_> = s.config.read().always_muted_apps.iter().cloned().collect();
+            let mut always_muted: Vec<_> = s.config.read().always_muted_apps.iter().cloned().collect();
+            always_muted.sort();
 
             for app in always_muted {
                 let wide = to_wide(&app);
@@ -694,6 +960,11 @@ unsafe fn load_settings_to_controls(hwnd: HWND) {
 
 unsafe fn handle_command(hwnd: HWND, control_id: i32, _notification: u16) {
     match control_id {
+        ID_EDIT_SEARCH => {
+            if _notification as u32 == EN_CHANGE {
+                apply_detected_filter(hwnd);
+            }
+        }
         ID_BTN_REFRESH => {
             refresh_detected_apps(hwnd);
         }

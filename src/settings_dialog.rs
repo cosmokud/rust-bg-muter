@@ -15,8 +15,8 @@ use std::sync::Arc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, FillRect, GetSysColorBrush, HBRUSH, HDC, HFONT,
-    HGDIOBJ, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+    CreateFontW, DeleteObject, HBRUSH, HFONT, HGDIOBJ,
+    DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
     DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, COLOR_BTNFACE,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -192,7 +192,6 @@ pub fn open_settings_dialog(
                 | WS_MINIMIZEBOX
                 | WS_MAXIMIZEBOX
                 | WS_THICKFRAME
-                | WS_CLIPSIBLINGS
                 | WS_CLIPCHILDREN
                 | WS_VISIBLE,
             x,
@@ -275,18 +274,6 @@ unsafe extern "system" fn window_proc(
             let notification = ((wparam.0 >> 16) & 0xFFFF) as u16;
             handle_command(hwnd, control_id, notification);
             LRESULT(0)
-        }
-        WM_CTLCOLORLISTBOX | WM_CTLCOLOREDIT => {
-            let brush = GetSysColorBrush(COLOR_BTNFACE);
-            LRESULT(brush.0 as isize)
-        }
-        WM_ERASEBKGND => {
-            let hdc = HDC(wparam.0 as *mut c_void);
-            let mut rect = RECT::default();
-            let _ = GetClientRect(hwnd, &mut rect);
-            let brush = GetSysColorBrush(COLOR_BTNFACE);
-            let _ = FillRect(hdc, &rect, brush);
-            LRESULT(1)
         }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);

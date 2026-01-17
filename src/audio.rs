@@ -2,15 +2,16 @@
 //! Provides efficient, low-overhead audio session management.
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::Arc;
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, FALSE, TRUE};
 use windows::Win32::Media::Audio::{
-    eMultimedia, eRender, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
-    IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
+    eCommunications, eConsole, eMultimedia, eRender, IAudioSessionControl2,
+    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
+    MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
 use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
@@ -63,61 +64,31 @@ impl AudioManager {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-            let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
-
-            let session_manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
-
-            let session_enumerator: IAudioSessionEnumerator =
-                session_manager.GetSessionEnumerator()?;
-
-            let count = session_enumerator.GetCount()?;
-            let mut sessions_lock = self.sessions.lock();
-            sessions_lock.clear();
-
-            let mut result = Vec::with_capacity(count as usize);
-
-            for i in 0..count {
-                if let Ok(control) = session_enumerator.GetSession(i) {
-                    if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
-                        if let Ok(pid) = control2.GetProcessId() {
-                            // Check if this is a system sounds session
-                            let is_system_sounds = control2.IsSystemSoundsSession().is_ok();
-                            
-                            // Determine process name
-                            let process_name = if is_system_sounds || pid == 0 {
-                                "System Sounds".to_string()
-                            } else {
-                                get_process_name_cached(pid)
-                            };
-                            
-                            let display_name =
-                                get_session_display_name(&control2).unwrap_or_else(|| process_name.clone());
-
-                            if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
-                                let is_muted = volume.GetMute().map(|b| b.as_bool()).unwrap_or(false);
-
-                                let session = AudioSession {
-                                    process_id: pid,
-                                    process_name: process_name.clone(),
-                                    display_name: display_name.clone(),
-                                    is_muted,
-                                };
-
-                                result.push(session);
-
-                                sessions_lock.insert(
-                                    pid,
-                                    CachedSession {
-                                        volume,
-                                        process_name,
-                                        display_name,
-                                    },
-                                );
-                            }
-                        }
-                    }
+            // Enumerate sessions from all default render roles for better coverage
+            let mut devices: Vec<IMMDevice> = Vec::new();
+            for role in [eConsole, eMultimedia, eCommunications] {
+                if let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, role) {
+                    devices.push(device);
                 }
             }
+
+            let mut result = Vec::new();
+            let mut seen_pids = HashSet::new();
+            let mut new_sessions: HashMap<u32, CachedSession> = HashMap::new();
+
+            for device in devices {
+                if let Err(e) = collect_sessions_for_device(
+                    &device,
+                    &mut new_sessions,
+                    &mut seen_pids,
+                    &mut result,
+                ) {
+                    log::warn!("Failed to enumerate audio sessions for a device: {}", e);
+                }
+            }
+
+            let mut sessions_lock = self.sessions.lock();
+            *sessions_lock = new_sessions;
 
             Ok(result)
         }
@@ -166,6 +137,70 @@ impl Default for AudioManager {
     fn default() -> Self {
         Self::new().expect("Failed to create AudioManager")
     }
+}
+
+/// Collects sessions for a specific audio device
+fn collect_sessions_for_device(
+    device: &IMMDevice,
+    sessions: &mut HashMap<u32, CachedSession>,
+    seen_pids: &mut HashSet<u32>,
+    result: &mut Vec<AudioSession>,
+) -> windows::core::Result<()> {
+    unsafe {
+        let session_manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+        let session_enumerator = session_manager.GetSessionEnumerator()?;
+        let count = session_enumerator.GetCount()?;
+
+        for i in 0..count {
+            if let Ok(control) = session_enumerator.GetSession(i) {
+                if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
+                    if let Ok(pid) = control2.GetProcessId() {
+                        let mut process_name = if pid == 0 {
+                            "System Sounds".to_string()
+                        } else {
+                            get_process_name_cached(pid)
+                        };
+
+                        let display_name =
+                            get_session_display_name(&control2).unwrap_or_else(|| process_name.clone());
+
+                        if pid != 0
+                            && process_name == "System Sounds"
+                            && display_name.to_lowercase() != "system sounds"
+                        {
+                            process_name = display_name.clone();
+                        }
+
+                        if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
+                            let is_muted = volume.GetMute().map(|b| b.as_bool()).unwrap_or(false);
+
+                            if seen_pids.insert(pid) {
+                                result.push(AudioSession {
+                                    process_id: pid,
+                                    process_name: process_name.clone(),
+                                    display_name: display_name.clone(),
+                                    is_muted,
+                                });
+                            }
+
+                            if !sessions.contains_key(&pid) {
+                                sessions.insert(
+                                    pid,
+                                    CachedSession {
+                                        volume,
+                                        process_name,
+                                        display_name,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Gets the process name from a PID with minimal overhead

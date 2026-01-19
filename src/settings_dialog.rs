@@ -259,6 +259,19 @@ unsafe extern "system" fn window_proc(
             load_settings_to_controls(hwnd);
             LRESULT(0)
         }
+        WM_SHOWWINDOW => {
+            if wparam.0 != 0 {
+                refresh_detected_apps(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            let state = (wparam.0 & 0xFFFF) as u32;
+            if state != WA_INACTIVE {
+                refresh_detected_apps(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_COMMAND => {
             let control_id = (wparam.0 & 0xFFFF) as i32;
             let notification = ((wparam.0 >> 16) & 0xFFFF) as u16;

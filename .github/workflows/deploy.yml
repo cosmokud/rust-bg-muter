@@ -37,8 +37,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           prerelease: false
           files: target/release/rust-bg-muter.exe
-          body: |
-            Automated release build for tag ${{ github.ref_name }}.

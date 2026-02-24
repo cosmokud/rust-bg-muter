@@ -62,10 +62,10 @@ strip = true         # Strip all symbols
 opt-level = 1        # Some optimization in dev for faster iteration
 
 [[bin]]
-name = "bg-muter"
+name = "rust-bg-muter"
 path = "src/main.rs"
 
 [package.metadata.winres]
-OriginalFilename = "bg-muter.exe"
+OriginalFilename = "rust-bg-muter.exe"
 ProductName = "Background Muter"
 FileDescription = "Mute background applications automatically"

@@ -62,7 +62,7 @@ fn main() {
 
     // Prefer a checked-in ICO if the user provides one.
     let repo_ico_path = Path::new("assets/icon.ico");
-    let generated_ico_path = out_dir.join("bg-muter.ico");
+    let generated_ico_path = out_dir.join("rust-bg-muter.ico");
     let ico_path: PathBuf = if repo_ico_path.exists() {
         // Use absolute path to ensure winres can find it
         std::fs::canonicalize(repo_ico_path).unwrap_or_else(|_| repo_ico_path.to_path_buf())
@@ -97,7 +97,7 @@ fn main() {
     }
 
     // Write the visual styles manifest and embed it
-    let manifest_path = out_dir.join("bg-muter.manifest");
+    let manifest_path = out_dir.join("rust-bg-muter.manifest");
     if let Ok(mut f) = std::fs::File::create(&manifest_path) {
         let _ = f.write_all(VISUAL_STYLES_MANIFEST.as_bytes());
         let manifest_str = manifest_path.to_string_lossy();

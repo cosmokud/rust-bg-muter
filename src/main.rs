@@ -21,7 +21,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tray::{SystemTray, TrayCommand};
+use windows::core::PCWSTR;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 /// Application entry point
 fn main() {
@@ -199,6 +202,9 @@ fn run_tray_loop(
                         }
                     }
                 }
+                TrayCommand::EditConfig => {
+                    open_config_in_default_editor();
+                }
                 TrayCommand::Exit => {
                     should_exit.store(true, Ordering::SeqCst);
                     break;
@@ -209,6 +215,51 @@ fn run_tray_loop(
         if should_exit.load(Ordering::Relaxed) {
             break;
         }
+    }
+}
+
+fn open_config_in_default_editor() {
+    let config_path = Config::config_path();
+
+    if !config_path.exists() {
+        if let Err(err) = Config::default().save() {
+            log::error!("Failed to create config file: {}", err);
+            return;
+        }
+    }
+
+    if let Err(err) = shell_open_path(&config_path) {
+        log::error!("Failed to open config file {:?}: {}", config_path, err);
+    }
+}
+
+fn shell_open_path(path: &std::path::Path) -> std::io::Result<()> {
+    let operation: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let target: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    if (result.0 as isize) <= 32 {
+        Err(std::io::Error::other(format!(
+            "ShellExecuteW failed with code {}",
+            result.0 as isize
+        )))
+    } else {
+        Ok(())
     }
 }
 

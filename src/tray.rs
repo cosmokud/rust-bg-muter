@@ -21,6 +21,7 @@ const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 pub enum TrayCommand {
     ToggleMuting,
     OpenSettings,
+    EditConfig,
     Exit,
 }
 
@@ -47,12 +48,14 @@ impl SystemTray {
 
         let menu_toggle = MenuItem::new(toggle_text, true, None);
         let menu_settings = MenuItem::new("Settings...", true, None);
+        let menu_edit_config = MenuItem::new("Edit Config.json", true, None);
         let menu_separator = PredefinedMenuItem::separator();
         let menu_exit = MenuItem::new("Exit", true, None);
 
         let menu = Menu::new();
         menu.append(&menu_toggle)?;
         menu.append(&menu_settings)?;
+        menu.append(&menu_edit_config)?;
         menu.append(&menu_separator)?;
         menu.append(&menu_exit)?;
 
@@ -61,6 +64,7 @@ impl SystemTray {
 
         let toggle_id = menu_toggle.id().clone();
         let settings_id = menu_settings.id().clone();
+        let edit_config_id = menu_edit_config.id().clone();
         let exit_id = menu_exit.id().clone();
 
         let exit_flag = Arc::new(AtomicBool::new(false));
@@ -73,6 +77,8 @@ impl SystemTray {
                 Some(TrayCommand::ToggleMuting)
             } else if event.id == settings_id {
                 Some(TrayCommand::OpenSettings)
+            } else if event.id == edit_config_id {
+                Some(TrayCommand::EditConfig)
             } else if event.id == exit_id {
                 exit_flag_clone.store(true, Ordering::SeqCst);
                 Some(TrayCommand::Exit)

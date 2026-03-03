@@ -1,4 +1,4 @@
-# Background Muter
+# Rust Background Muter
 
 ![Rust](https://img.shields.io/badge/Rust-1.75+-orange?logo=rust) ![Platform](https://img.shields.io/badge/Platform-Windows-blue?logo=windows) ![License](https://img.shields.io/badge/License-MIT-green)
 

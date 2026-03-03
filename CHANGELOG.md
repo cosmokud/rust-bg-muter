@@ -18,6 +18,7 @@ Initial release.
 - Process name resolution with fallback strategies for better system process coverage.
 - Normalization of known Windows system sound processes under `System Sounds`.
 - System tray integration with menu actions: toggle muting, open settings, and exit.
+- System tray action to open/edit `config.ini` using the default Windows text editor.
 - Dynamic tray tooltip and menu label updates reflecting muting state.
 - Tray icon double-click shortcut to open the settings dialog.
 - Native Win32 settings dialog with a modern common-controls UI.
@@ -25,8 +26,8 @@ Initial release.
 - UI flows to add/remove apps in Excluded and Always Muted lists.
 - Configurable poll interval with validation/clamping (`100`-`2000` ms).
 - Settings toggles for muting enabled, start minimized, and start with Windows.
-- Persistent JSON configuration load/save with sensible defaults.
-- Config storage under `%APPDATA%\rust-bg-muter\config.json`.
+- Persistent INI configuration load/save with sensible defaults.
+- Config storage under `%APPDATA%\rust-bg-muter\config.ini`.
 - Windows startup integration via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (no admin elevation required).
 - Worker thread model with COM initialization for background audio operations.
 - Safe shutdown behavior that unmutes sessions previously muted by the app.

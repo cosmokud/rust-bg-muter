@@ -4,6 +4,8 @@
 
 Background Muter is a native Windows tray application written in Rust that automatically mutes audio from background applications while keeping the active app audible.
 
+![Showcase](https://github.com/user-attachments/assets/ee6017fe-11a3-4727-a5e1-9ac254e502ec)
+
 ## Overview
 
 The app runs quietly in the system tray, tracks the current foreground process, and applies muting rules to active audio sessions through WASAPI. It is designed for low overhead and predictable behavior, with settings persisted in a local JSON config file.

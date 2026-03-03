@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.1] - 2026-03-03
+
+### Added
+
+- **Edit Config.json** tray menu item that opens the configuration file in the user's default text editor on Windows (creates file if missing).
+- ShellExecute-based helper and associated Windows API feature to launch external editors.
+
+### Changed
+
+- Updated tray menu ordering and command handling to accommodate new action.
+
 ## [0.1.0] - 2026-03-03
 
 Initial release.

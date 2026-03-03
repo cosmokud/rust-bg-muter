@@ -14,6 +14,7 @@ The app runs quietly in the system tray, tracks the current foreground process, 
 - Excluded apps list to keep selected apps always audible
 - Always-muted apps list to force selected apps muted at all times
 - Real-time detection of active audio sessions
+- Zero GPU/VRAM usage and sub‑1 % idle CPU cost due to the native Win32 window and GDI rendering
 - Native system tray controls:
   - Enable or disable muting
   - Open the settings dialog

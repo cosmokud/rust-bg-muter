@@ -38,7 +38,7 @@ Download the latest Windows executable from the repository's GitHub Releases tab
 
 - [GitHub Releases](../../releases)
 
-After downloading, run `bg-muter.exe`. No installer is required.
+After downloading, run `bg-muter.exe`. This is a portable app. Copy or place the folder anywhere you like. No installer is required.
 
 ## Usage
 

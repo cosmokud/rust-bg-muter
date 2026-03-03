@@ -8,7 +8,7 @@ Background Muter is a native Windows tray application written in Rust that autom
 
 ## Overview
 
-The app runs quietly in the system tray, tracks the current foreground process, and applies muting rules to active audio sessions through WASAPI. It is designed for low overhead and predictable behavior, with settings persisted in a local INI config file.
+The app runs quietly in the system tray, tracks the current foreground process, and applies muting rules to active audio sessions through WASAPI. It is designed for low overhead and predictable behavior, with settings persisted in a local JSON config file.
 
 ## Features
 
@@ -20,7 +20,6 @@ The app runs quietly in the system tray, tracks the current foreground process, 
 - Native system tray controls:
   - Enable or disable muting
   - Open the settings dialog
-  - Edit `config.ini` in the default text editor
   - Exit the application
 - Tray icon double-click shortcut to open settings
 - Native Win32 settings dialog with:
@@ -30,7 +29,7 @@ The app runs quietly in the system tray, tracks the current foreground process, 
   - Poll interval configuration (`100`-`2000` ms)
   - Start with Windows toggle
   - Start minimized toggle
-- Persistent configuration in `%APPDATA%\rust-bg-muter\config.ini`
+- Persistent configuration in `%APPDATA%\rust-bg-muter\config.json`
 - Automatic unmute cleanup for app-muted sessions on exit
 
 ## Installation
@@ -50,25 +49,22 @@ After downloading, run `bg-muter.exe`. No installer is required.
 
 ## Configuration
 
-Configuration is stored at `%APPDATA%\rust-bg-muter\config.ini`.
+Configuration is stored at `%APPDATA%\rust-bg-muter\config.json`.
 
 Example:
 
-```ini
-[general]
-muting_enabled=true
-poll_interval_ms=500
-start_minimized=false
-minimize_to_tray=true
-minimize_button_to_tray=true
-start_with_windows=false
-
-[excluded_apps]
-spotify.exe=1
-discord.exe=1
-
-[always_muted_apps]
-steam.exe=1
+```json
+{
+  "excluded_apps": ["spotify.exe", "discord.exe"],
+  "always_muted_apps": ["steam.exe"],
+  "muting_enabled": true,
+  "poll_interval_ms": 500,
+  "start_minimized": false,
+  "minimize_to_tray": true,
+  "minimize_button_to_tray": true,
+  "start_with_windows": false,
+  "window_state": null
+}
 ```
 
 ## Build from Source
@@ -93,7 +89,7 @@ src/
 ├── process.rs         # Foreground process detection
 ├── tray.rs            # Native tray menu and message pump integration
 ├── settings_dialog.rs # Native Win32 settings UI
-├── config.rs          # INI config persistence and defaults
+├── config.rs          # JSON config persistence and defaults
 └── startup.rs         # Windows startup registry integration
 ```
 

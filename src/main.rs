@@ -199,11 +199,6 @@ fn run_tray_loop(
                         }
                     }
                 }
-                TrayCommand::EditConfig => {
-                    if let Err(e) = Config::open_in_default_editor() {
-                        log::error!("Failed to open config.ini: {}", e);
-                    }
-                }
                 TrayCommand::Exit => {
                     should_exit.store(true, Ordering::SeqCst);
                     break;

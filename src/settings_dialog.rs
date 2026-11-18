@@ -11,12 +11,12 @@ use crate::config::Config;
 use crate::od_controls::{self, to_wide, Gdi};
 use crate::startup;
 use crate::theme::{apply_chrome, Dip, Palette};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -31,7 +31,6 @@ use windows::Win32::UI::Controls::{
     EM_SETCUEBANNER, ODS_FOCUS, ODS_SELECTED,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Control IDs
@@ -96,8 +95,6 @@ struct Ui {
     br_window: HBRUSH,
     br_card: HBRUSH,
     br_well: HBRUSH,
-    /// Small-icon cache keyed by exe path; icons are owned and destroyed here.
-    icons: HashMap<String, HICON>,
 }
 
 impl Ui {
@@ -112,7 +109,6 @@ impl Ui {
             br_window: CreateSolidBrush(COLORREF(palette.window)),
             br_card: CreateSolidBrush(COLORREF(palette.card)),
             br_well: CreateSolidBrush(COLORREF(palette.well)),
-            icons: HashMap::new(),
         }
     }
 }
@@ -120,9 +116,6 @@ impl Ui {
 impl Drop for Ui {
     fn drop(&mut self) {
         unsafe {
-            for (_, icon) in self.icons.drain() {
-                let _ = DestroyIcon(icon);
-            }
             let _ = DeleteObject(HGDIOBJ(self.font.0));
             let _ = DeleteObject(HGDIOBJ(self.font_small.0));
             let _ = DeleteObject(HGDIOBJ(self.br_window.0));
@@ -883,6 +876,11 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
     );
 }
 
+/// Small icons keyed by exe path, process-wide: extracted once per path and kept until
+/// exit, so reopening the dialog costs no shell work at all.
+/// Icons are handles, not pointers we dereference: kept as `isize` so the cache is `Send`.
+static ICONS: OnceLock<Mutex<HashMap<String, isize>>> = OnceLock::new();
+
 /// Small icon for a list row. `pid` is the real process (detected list); otherwise the
 /// text is a process name and the generic executable icon is used.
 unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
@@ -892,26 +890,26 @@ unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
         text.to_string()
     };
 
-    if let Some(icon) = with_ui(|u| u.icons.get(&path).copied()).flatten() {
-        return Some(icon);
+    let icons = ICONS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(icon) = icons.lock().get(&path) {
+        return Some(HICON(*icon as *mut c_void));
     }
 
-    // shortcut: ExtractIconEx only, SHGetFileInfoW costs ~7 MB of shell heap per dialog,
-    // measured; revisit if a per-extension icon (non-exe names) is needed.
-    let wide = to_wide(&path);
-    let mut large = HICON::default();
-    let mut small = HICON::default();
-    let count = ExtractIconExW(PCWSTR(wide.as_ptr()), 0, Some(&mut large), Some(&mut small), 1);
-    if !large.0.is_null() {
-        let _ = DestroyIcon(large);
+    // Small box only, so no large bitmap is built. Measured shell working set on first use:
+    // PrivateExtractIconsW 0.33 MB, ExtractIconExW 1.8 MB, SHGetFileInfoW 7 MB - hence this
+    // API for real exe paths and no SHGetFileInfoW fallback at all.
+    let mut file = [0u16; 260];
+    for (i, unit) in path.encode_utf16().take(259).enumerate() {
+        file[i] = unit;
     }
-    if count == 0 || small.0.is_null() {
+    let mut small = [HICON::default(); 1];
+    PrivateExtractIconsW(&file, 0, 16, 16, Some(&mut small), None, 0);
+    let icon = small[0];
+    if icon.0.is_null() {
         return None;
     }
-    with_ui_mut(|u| {
-        u.icons.insert(path, small);
-    });
-    Some(small)
+    icons.lock().insert(path, icon.0 as isize);
+    Some(icon)
 }
 
 /// Full exe path of a running process, capped so a dead PID costs one syscall.
@@ -1290,4 +1288,422 @@ unsafe fn save_settings(hwnd: HWND) {
             let _ = config.save();
         }
     });
+}
+
+/// TEMP probe hooks (measurement only; never committed - appended by .scratch/probe.py).
+pub mod probe_api {
+    use super::*;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS, GR_USEROBJECTS,
+    };
+
+    pub static TRACE: AtomicBool = AtomicBool::new(false);
+
+    pub fn gdi() -> (u32, u32) {
+        unsafe {
+            let h = HANDLE(GetCurrentProcess().0);
+            (GetGuiResources(h, GR_GDIOBJECTS), GetGuiResources(h, GR_USEROBJECTS))
+        }
+    }
+
+    unsafe extern "system" fn probe_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        DefWindowProcW(h, m, w, l)
+    }
+
+    /// Dialog window class with WM_CREATE work, built hidden (no WS_VISIBLE).
+    pub unsafe fn create_hidden() -> HWND {
+        build("BgMuterProbeDialog", Some(window_proc), true)
+    }
+
+    /// Same dialog, created at a real on-screen position (DWM gives it a redirection surface).
+    pub unsafe fn create_onscreen() -> HWND {
+        let class_name = to_wide("BgMuterProbeOnScreen");
+        let hmodule = GetModuleHandleW(None).unwrap_or_default();
+        init_common_controls();
+        od_controls::register_classes(hmodule.into());
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(window_proc),
+            hInstance: hmodule.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH::default(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..WNDCLASSEXW::default()
+        };
+        let _ = RegisterClassExW(&wc);
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR::null(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX | WS_CLIPCHILDREN,
+            100,
+            100,
+            920,
+            680,
+            None,
+            None,
+            hmodule,
+            None,
+        )
+        .expect("probe hwnd")
+    }
+
+    pub fn system_dpi() -> u32 {
+        unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }
+    }
+
+    /// Same window/class/style, no WM_CREATE work: isolates the dialog HWND itself.
+    pub unsafe fn create_bare() -> HWND {
+        build("BgMuterProbeBare", Some(probe_proc), false)
+    }
+
+    unsafe fn build(class: &str, proc_fn: WNDPROC, children: bool) -> HWND {
+        let class_name = to_wide(class);
+        let hmodule = GetModuleHandleW(None).unwrap_or_default();
+        if children {
+            init_common_controls();
+            od_controls::register_classes(hmodule.into());
+        }
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: proc_fn,
+            hInstance: hmodule.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH::default(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..WNDCLASSEXW::default()
+        };
+        let _ = RegisterClassExW(&wc);
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR::null(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX | WS_CLIPCHILDREN,
+            -2000,
+            -2000,
+            920,
+            680,
+            None,
+            None,
+            hmodule,
+            None,
+        )
+        .expect("probe hwnd")
+    }
+
+    pub unsafe fn destroy(hwnd: HWND) {
+        let _ = DestroyWindow(hwnd);
+    }
+
+    pub unsafe fn drop_ui() {
+        UI.with(|u| *u.borrow_mut() = None);
+    }
+
+    /// Fill the detected list; item data 0 makes row_icon treat the text as an exe path.
+    pub unsafe fn fill_paths(hwnd: HWND, paths: &[String]) {
+        let list = get_dlg_item(hwnd, ID_LIST_DETECTED);
+        SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+        for p in paths {
+            let wide = to_wide(p);
+            let idx = SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(wide.as_ptr() as isize));
+            SendMessageW(list, LB_SETITEMDATA, WPARAM(idx.0 as usize), LPARAM(0));
+        }
+    }
+
+    /// Every row of every list through the real owner-draw path (hidden windows get no WM_PAINT).
+    pub unsafe fn paint_lists(hwnd: HWND) {
+        use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+        let h = dip_of().px(24.0);
+        for id in [ID_LIST_DETECTED, ID_LIST_EXCLUDED, ID_LIST_ALWAYS_MUTED] {
+            let list = get_dlg_item(hwnd, id);
+            let count = SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0;
+            let hdc = GetDC(list);
+            for i in 0..count as usize {
+                let dis = DRAWITEMSTRUCT {
+                    CtlType: windows::Win32::UI::Controls::DRAWITEMSTRUCT_CTL_TYPE(0),
+                    CtlID: id as u32,
+                    itemID: i as u32,
+                    itemAction: windows::Win32::UI::Controls::ODA_FLAGS(0),
+                    itemState: windows::Win32::UI::Controls::ODS_FLAGS(0),
+                    hwndItem: list,
+                    hDC: hdc,
+                    rcItem: RECT {
+                        left: 0,
+                        top: (i as i32) * h,
+                        right: 900,
+                        bottom: (i as i32) * h + h,
+                    },
+                    itemData: 0,
+                };
+                draw_list_item(&dis);
+            }
+            ReleaseDC(list, hdc);
+        }
+    }
+
+    /// Cards, toggles, buttons, edits: their paints only happen on a shown window.
+    pub unsafe fn show_and_paint(hwnd: HWND) {
+        use windows::Win32::Graphics::Gdi::UpdateWindow;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, ShowWindow, TranslateMessage, PM_REMOVE, SW_SHOWNOACTIVATE,
+        };
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = UpdateWindow(hwnd);
+        let mut msg = MSG::default();
+        for _ in 0..4 {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            let _ = UpdateWindow(hwnd);
+        }
+    }
+
+    unsafe fn set_font_c(c: HWND) {
+        if !c.0.is_null() {
+            let f = with_ui(|u| u.font).unwrap_or_default();
+            SendMessageW(c, WM_SETFONT, WPARAM(f.0 as usize), LPARAM(1));
+        }
+    }
+
+    unsafe fn make(hwnd: HWND, class: &str, text: &str, id: i32, style: WINDOW_STYLE, rc: RECT) {
+        let hmodule = GetModuleHandleW(None).unwrap_or_default();
+        let c = to_wide(class);
+        let t = to_wide(text);
+        let _ = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(c.as_ptr()),
+            PCWSTR(t.as_ptr()),
+            style,
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
+            hwnd,
+            HMENU(id as *mut c_void),
+            hmodule,
+            None,
+        );
+    }
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> RECT {
+        RECT { left: x, top: y, right: x + w, bottom: y + h }
+    }
+
+    pub unsafe fn step_classes() {
+        let hmodule = GetModuleHandleW(None).unwrap_or_default();
+        init_common_controls();
+        od_controls::register_classes(hmodule.into());
+    }
+
+    pub unsafe fn step_ui(hwnd: HWND) {
+        UI.with(|u| *u.borrow_mut() = Some(Ui::new(hwnd)));
+    }
+
+    static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(500);
+
+    fn next_id() -> i32 {
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32
+    }
+
+    pub unsafe fn step_card(hwnd: HWND) {
+        let id = next_id();
+        make(hwnd, od_controls::CLASS_CARD, "caption", id,
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, rect(10, 10, 400, 110));
+    }
+
+    pub unsafe fn step_card_font(hwnd: HWND) {
+        let id = next_id();
+        make(hwnd, od_controls::CLASS_CARD, "caption", id,
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, rect(10, 10, 400, 110));
+        set_font_c(GetDlgItem(hwnd, id).unwrap_or_default());
+    }
+
+    pub unsafe fn step_static(hwnd: HWND) {
+        let id = next_id();
+        make(hwnd, "STATIC", "label", id, WS_CHILD | WS_VISIBLE, rect(10, 10, 200, 18));
+        set_font_c(GetDlgItem(hwnd, id).unwrap_or_default());
+    }
+
+    pub unsafe fn step_cards(hwnd: HWND) {
+        for (i, id) in [ID_GRP_DETECTED, ID_GRP_EXCLUDED, ID_GRP_ALWAYS_MUTED, ID_GROUP_SETTINGS]
+            .into_iter()
+            .enumerate()
+        {
+            make(hwnd, od_controls::CLASS_CARD, "caption", id,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, rect(10, 10 + 120 * i as i32, 400, 110));
+            set_font_c(GetDlgItem(hwnd, id).unwrap_or_default());
+        }
+    }
+
+    pub unsafe fn step_toggles(hwnd: HWND) {
+        for (i, id) in [ID_CHECK_ENABLED, ID_CHECK_START_MINIMIZED, ID_CHECK_START_WINDOWS]
+            .into_iter()
+            .enumerate()
+        {
+            make(hwnd, od_controls::CLASS_TOGGLE, "label", id,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS, rect(10, 10 + 24 * i as i32, 200, 22));
+            set_font_c(GetDlgItem(hwnd, id).unwrap_or_default());
+        }
+    }
+
+    pub unsafe fn step_buttons(hwnd: HWND) {
+        for (i, id) in [
+            ID_BTN_REFRESH, ID_BTN_ADD_EXCLUSION, ID_BTN_REMOVE_EXCLUSION, ID_BTN_ADD_ALWAYS_MUTED,
+            ID_BTN_REMOVE_ALWAYS_MUTED, ID_BTN_SAVE_ONLY, ID_BTN_SAVE_CLOSE, ID_BTN_CLOSE,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            make(hwnd, "BUTTON", "button", id,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                rect(10, 10 + 30 * i as i32, 150, 26));
+            od_controls::attach_hover(hwnd);
+        }
+    }
+
+    pub unsafe fn step_native(hwnd: HWND) {
+        for (i, id) in [ID_LABEL_SEARCH, ID_LABEL_POLL, ID_LABEL_MS, ID_LABEL_RANGE, ID_LABEL_CONFIG, ID_LABEL_PATH]
+            .into_iter()
+            .enumerate()
+        {
+            make(hwnd, "STATIC", "label", id, WS_CHILD | WS_VISIBLE, rect(10, 10 + 20 * i as i32, 120, 18));
+        }
+        for (i, id) in [ID_EDIT_SEARCH, ID_EDIT_POLL_INTERVAL].into_iter().enumerate() {
+            make(hwnd, "EDIT", "", id,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                rect(10, 10 + 24 * i as i32, 200, 24));
+        }
+    }
+
+    pub unsafe fn step_lists(hwnd: HWND) {
+        for (i, id) in [ID_LIST_DETECTED, ID_LIST_EXCLUDED, ID_LIST_ALWAYS_MUTED].into_iter().enumerate() {
+            make(hwnd, "LISTBOX", "", id,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | WS_BORDER
+                    | WINDOW_STYLE((LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32),
+                rect(10, 10 + 200 * i as i32, 300, 190));
+            od_controls::attach_hover(hwnd);
+        }
+    }
+
+    /// Streaming sample: called from create_controls in the instrumented tree only.
+    pub fn note(tag: &str, id: i32) {
+        use windows::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        unsafe {
+            let mut c = PROCESS_MEMORY_COUNTERS_EX::default();
+            let _ = GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            );
+            let (g, u) = gdi();
+            eprintln!("{:>6} id={:<4} {:>7}{:>7}{:>5}{:>5}", tag, id,
+                c.WorkingSetSize / 1024, c.PrivateUsage / 1024, g, u);
+        }
+    }
+
+    /// Which of the modules a first child window pulls in are loaded.
+    pub fn modules() -> Vec<(&'static str, bool)> {
+        let names = ["uxtheme.dll", "comctl32.dll", "comdlg32.dll", "msctf.dll", "imm32.dll", "ole32.dll", "oleaut32.dll", "shcore.dll", "combase.dll", "windows.storage.dll", "shell32.dll"];
+        names
+            .iter()
+            .map(|n| {
+                let w = to_wide(n);
+                let h = unsafe { GetModuleHandleW(PCWSTR(w.as_ptr())) };
+                (*n, h.is_ok())
+            })
+            .collect()
+    }
+
+    /// Pays the one-time per-process window/child-class cost so later deltas are per-open.
+    pub unsafe fn warmup() {
+        let h = build("BgMuterProbeWarm", Some(window_proc), false);
+        let mut rc = RECT { left: 0, top: 0, right: 200, bottom: 24 };
+        let _ = rc;
+        make(h, "STATIC", "x", 1, WS_CHILD | WS_VISIBLE, RECT { left: 0, top: 0, right: 100, bottom: 20 });
+        make(h, "EDIT", "", 2, WS_CHILD | WS_VISIBLE | WS_BORDER, RECT { left: 0, top: 20, right: 100, bottom: 44 });
+        make(h, "LISTBOX", "", 3, WS_CHILD | WS_VISIBLE | WS_VSCROLL, RECT { left: 0, top: 44, right: 100, bottom: 144 });
+        let _ = DestroyWindow(h);
+    }
+
+    /// One full WM_DRAWITEM pass over all buttons/toggles/cards (no window paint).
+    pub unsafe fn paint_banners(hwnd: HWND) {
+        use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+        let p = GetParent(hwnd).unwrap_or(hwnd);
+        let _ = p;
+        let hdc = GetDC(hwnd);
+        for id in [
+            ID_BTN_REFRESH, ID_BTN_ADD_EXCLUSION, ID_BTN_REMOVE_EXCLUSION, ID_BTN_ADD_ALWAYS_MUTED,
+            ID_BTN_REMOVE_ALWAYS_MUTED, ID_BTN_SAVE_ONLY, ID_BTN_SAVE_CLOSE, ID_BTN_CLOSE,
+        ] {
+            let c = get_dlg_item(hwnd, id);
+            let rc = RECT { left: 0, top: 0, right: 180, bottom: 26 };
+            let dis = DRAWITEMSTRUCT {
+                CtlType: windows::Win32::UI::Controls::DRAWITEMSTRUCT_CTL_TYPE(0),
+                CtlID: id as u32,
+                itemID: 0,
+                itemAction: windows::Win32::UI::Controls::ODA_FLAGS(0),
+                itemState: windows::Win32::UI::Controls::ODS_FLAGS(0),
+                hwndItem: c,
+                hDC: hdc,
+                rcItem: rc,
+                itemData: 0,
+            };
+            draw_item(LPARAM(&dis as *const _ as isize));
+        }
+        ReleaseDC(hwnd, hdc);
+    }
+
+    /// Paint a single detected-list row (i) into the list's DC.
+    pub unsafe fn paint_one(hwnd: HWND, i: usize) {
+        use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+        let list = get_dlg_item(hwnd, ID_LIST_DETECTED);
+        let h = dip_of().px(24.0);
+        let hdc = GetDC(list);
+        let dis = DRAWITEMSTRUCT {
+            CtlType: windows::Win32::UI::Controls::DRAWITEMSTRUCT_CTL_TYPE(0),
+            CtlID: ID_LIST_DETECTED as u32,
+            itemID: i as u32,
+            itemAction: windows::Win32::UI::Controls::ODA_FLAGS(0),
+            itemState: windows::Win32::UI::Controls::ODS_FLAGS(0),
+            hwndItem: list,
+            hDC: hdc,
+            rcItem: RECT { left: 0, top: 0, right: 900, bottom: h },
+            itemData: 0,
+        };
+        draw_list_item(&dis);
+        ReleaseDC(list, hdc);
+    }
+
+    pub static NO_ICONS: AtomicBool = AtomicBool::new(false);
+
+    /// Icons returned by PrivateExtractIconsW for the same paths (correctness check).
+    pub unsafe fn private_icons(paths: &[String]) -> usize {
+        let mut n = 0;
+        for p in paths {
+            let mut file = [0u16; 260];
+            for (i, c) in p.encode_utf16().take(259).enumerate() {
+                file[i] = c;
+            }
+            let mut icons = [HICON::default(); 1];
+            PrivateExtractIconsW(&file, 0, 16, 16, Some(&mut icons), None, 0);
+            if !icons[0].0.is_null() {
+                n += 1;
+                let _ = DestroyIcon(icons[0]);
+            }
+        }
+        n
+    }
+
+    /// Number of GDI objects Gdi created in this paint pass (before its Drop).
+    pub static PROBE_GDIS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub fn icon_count() -> usize {
+        super::ICONS.get().map_or(0, |m| m.lock().len())
+    }
 }

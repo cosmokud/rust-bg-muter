@@ -16,31 +16,31 @@ pub struct Config {
     /// List of apps that should always be muted (even when foreground)
     #[serde(default)]
     pub always_muted_apps: HashSet<String>,
-    
+
     /// Whether the muting functionality is enabled
     #[serde(default = "default_enabled")]
     pub muting_enabled: bool,
-    
+
     /// Polling interval in milliseconds for checking foreground changes
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
-    
+
     /// Whether to start minimized to system tray
     #[serde(default = "default_start_minimized")]
     pub start_minimized: bool,
-    
+
     /// Whether to minimize to tray instead of closing
     #[serde(default = "default_minimize_to_tray")]
     pub minimize_to_tray: bool,
-    
+
     /// Whether to minimize to tray when minimize button is clicked
     #[serde(default = "default_minimize_button_to_tray")]
     pub minimize_button_to_tray: bool,
-    
+
     /// Whether to start with Windows
     #[serde(default)]
     pub start_with_windows: bool,
-    
+
     /// Window position and size
     #[serde(default)]
     pub window_state: Option<WindowState>,
@@ -90,60 +90,101 @@ impl Default for Config {
     }
 }
 
+/// Points the config at a directory of one's own: a test run, a CI job or a portable copy.
+/// Set, it is the only place this module reads or writes, so the user's real config cannot be
+/// reached at all.
+pub const CONFIG_DIR_ENV: &str = "RUST_BG_MUTER_CONFIG_DIR";
+
 #[allow(dead_code)]
 impl Config {
     /// Gets the config file path
     pub fn config_path() -> PathBuf {
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("rust-bg-muter");
-        
-        if !config_dir.exists() {
-            let _ = fs::create_dir_all(&config_dir);
+        Self::config_dir().join("config.json")
+    }
+
+    /// The directory `config.json` lives in, in order of precedence:
+    /// the `RUST_BG_MUTER_CONFIG_DIR` override, then a throwaway directory for a test binary,
+    /// then the machine's per-user config directory.
+    ///
+    /// The test branch is what keeps a `cargo test` away from a real config: the dialog tests
+    /// drive the same handlers the app does, and one saving insert (`add_excluded_app` and its
+    /// kind) rewrote a user's exclusion list with the fixtures the test had just made.
+    pub fn config_dir() -> PathBuf {
+        if let Some(dir) = std::env::var_os(CONFIG_DIR_ENV).filter(|dir| !dir.is_empty()) {
+            let dir = PathBuf::from(dir);
+            let _ = fs::create_dir_all(&dir);
+            return dir;
         }
-        
-        config_dir.join("config.json")
+
+        let dir = if cfg!(test) {
+            std::env::temp_dir().join(format!("rust-bg-muter-test-{}", std::process::id()))
+        } else {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("rust-bg-muter")
+        };
+
+        if !dir.exists() {
+            let _ = fs::create_dir_all(&dir);
+        }
+
+        dir
     }
 
     /// Loads configuration from disk
+    ///
+    /// A file that exists but cannot be read or parsed is left exactly as it is and defaults are
+    /// used for this run: writing defaults over it would destroy a list the user configured (and
+    /// any hand edit they were in the middle of). The file is only created when it is missing.
     pub fn load() -> Self {
         let path = Self::config_path();
-        
+
         if path.exists() {
             match fs::read_to_string(&path) {
-                Ok(contents) => {
-                    match serde_json::from_str(&contents) {
-                        Ok(config) => return config,
-                        Err(e) => {
-                            log::error!("Failed to parse config: {}", e);
-                        }
+                Ok(contents) => match serde_json::from_str(&contents) {
+                    Ok(config) => return config,
+                    Err(e) => {
+                        log::error!(
+                            "Failed to parse {}, keeping it as it is: {}",
+                            path.display(),
+                            e
+                        );
                     }
-                }
+                },
                 Err(e) => {
-                    log::error!("Failed to read config: {}", e);
+                    log::error!(
+                        "Failed to read {}, keeping it as it is: {}",
+                        path.display(),
+                        e
+                    );
                 }
             }
+            return Self::default();
         }
-        
-        // Return default config if loading fails
+
         let default = Self::default();
         let _ = default.save();
         default
     }
 
     /// Saves configuration to disk
+    ///
+    /// Written beside the file and renamed over it, so an interrupted or failed write leaves the
+    /// previous config intact instead of a half-written one.
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let path = Self::config_path();
-        
+
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        
+
         let contents = serde_json::to_string_pretty(self)?;
-        fs::write(&path, contents)?;
-        
-        log::info!("Config saved to {:?}", path);
+        let staged = path.with_extension("json.tmp");
+        fs::write(&staged, contents)?;
+        fs::rename(&staged, &path)?;
+
+        log::info!("Config saved to {}", path.display());
         Ok(())
     }
 
@@ -153,8 +194,8 @@ impl Config {
         let _ = self.save();
     }
 
-    /// Adds an app to the exclusion list without touching the config file.
-    /// Tests use this: a saving insert writes the real user's config.json.
+    /// Adds an app to the exclusion list without touching the config file: the dialog keeps
+    /// every list edit in memory and the file is written once, by `save_settings`.
     pub fn insert_excluded_app(&mut self, app_name: &str) {
         self.excluded_apps.insert(app_name.to_lowercase());
     }
@@ -267,5 +308,68 @@ mod tests {
         config.insert_always_muted_app("always.exe");
         let after = std::fs::read(&path).ok();
         assert_eq!(before, after, "a pure insert wrote {path:?}");
+    }
+
+    /// The user's real config, resolved without going through `config_path`, so a bug in the
+    /// test isolation cannot hide behind the isolation it is testing.
+    fn real_config_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("rust-bg-muter")
+            .join("config.json")
+    }
+
+    /// The saving handlers must resolve somewhere throwaway, whatever else is set.
+    #[test]
+    fn a_test_run_never_resolves_the_users_config() {
+        let resolved = Config::config_path();
+        assert_ne!(
+            resolved,
+            real_config_path(),
+            "tests use the user's config file"
+        );
+        assert!(resolved.starts_with(std::env::temp_dir()), "{resolved:?}");
+    }
+
+    /// Any handler that saves, driven here directly, must leave the user's file byte for byte
+    /// as it was: this is the sequence that emptied a real exclusion list once.
+    #[test]
+    fn a_saving_handler_leaves_the_users_config_untouched() {
+        let real = real_config_path();
+        let before = std::fs::read(&real).ok();
+
+        let mut config = Config::default();
+        config.add_excluded_app("test-only.exe");
+        config.add_always_muted_app("test-only.exe");
+        config.remove_excluded_app("test-only.exe");
+        config.toggle_muting();
+        config.set_muting(true);
+
+        assert_eq!(before, std::fs::read(&real).ok(), "a test wrote {real:?}");
+    }
+
+    /// A file that cannot be parsed is a list to repair, not one to overwrite.
+    #[test]
+    fn load_keeps_a_file_it_cannot_parse() {
+        let dir = Config::config_dir().join("unparseable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let broken = b"{\"excluded_apps\": [\"spotify.exe\",}";
+        std::fs::write(&path, broken).unwrap();
+        std::env::set_var(CONFIG_DIR_ENV, &dir);
+
+        let loaded = Config::load();
+        std::env::remove_var(CONFIG_DIR_ENV);
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            broken,
+            "load rewrote the file"
+        );
+        assert!(
+            loaded.excluded_apps.is_empty(),
+            "defaults expected for this run"
+        );
     }
 }

@@ -89,11 +89,9 @@ const MIN_WINDOW_HEIGHT: f32 = 560.0;
 thread_local! {
     static DIALOG_STATE: RefCell<Option<DialogState>> = const { RefCell::new(None) };
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
-    // (window, client rect) the last layout pass ran for: a repeated WM_SIZE is a no-op.
-    static LAST_LAYOUT: Cell<(isize, i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, -1, -1)) };
-    // Control id -> card rect that holds it, derived from `layout()`, keyed on the same
+    // Control id -> card rect that holds it, derived from `layout()` and keyed on the
     // window + client rect. Structural, so a paint can never depend on where a control
-    // currently happens to be.
+    // currently happens to be, and one paint pass reuses it instead of re-deriving.
     static CARD_MAP: RefCell<((isize, i32, i32, i32, i32), Vec<(i32, Option<RECT>)>)> =
         const { RefCell::new(((0, 0, 0, -1, -1), Vec::new())) };
 }
@@ -1006,10 +1004,16 @@ unsafe fn paint_frame(hwnd: HWND, hdc: HDC, rc: &RECT) {
     let dip = dip_of();
     od_controls::fill(hdc, rc, p.window);
     let window_focused = GetFocus() == hwnd;
+    let ctls = layout(hwnd);
+    let cards: Vec<RECT> = ctls
+        .iter()
+        .filter(|c| c.kind == Kind::Card)
+        .map(|c| c.rect)
+        .collect();
     // Cards come first in `layout()`, so their children paint over them.
-    for ctl in layout(hwnd) {
+    for ctl in &ctls {
         match ctl.kind {
-            Kind::Card => draw_card(hdc, &ctl, &p, dip),
+            Kind::Card => draw_card(hdc, ctl, &p, dip),
             Kind::Label => od_controls::text(
                 hdc,
                 &ctl.rect,
@@ -1018,10 +1022,10 @@ unsafe fn paint_frame(hwnd: HWND, hdc: HDC, rc: &RECT) {
                 p.text,
                 DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
             ),
-            Kind::Button => draw_button(hwnd, hdc, &ctl, &p, dip, window_focused),
-            Kind::Toggle => draw_toggle(hwnd, hdc, &ctl, &p, dip, window_focused),
-            Kind::Edit => draw_field(hdc, &ctl, &p, dip, window_focused),
-            Kind::List => draw_list(hdc, &ctl, &p, dip, window_focused),
+            Kind::Button => draw_button(hdc, ctl, &p, dip, window_focused, &cards),
+            Kind::Toggle => draw_toggle(hdc, ctl, &p, dip, window_focused, &cards),
+            Kind::Edit => draw_field(hdc, ctl, &p, dip, window_focused),
+            Kind::List => draw_list(hdc, ctl, &p, dip, window_focused),
         }
     }
 }
@@ -1097,10 +1101,15 @@ fn card_of(parent: HWND, id: i32) -> Option<RECT> {
     })
 }
 
-/// Background surface behind control `id`: the card that holds it, else the window.
-fn surface_under(parent: HWND, id: i32) -> u32 {
+/// Background behind a control: the card its centre lands on, else the window. Both come
+/// from the one `layout()` the frame was drawn from, so a resize cannot mix geometries.
+fn surface_of(rc: RECT, cards: &[RECT]) -> u32 {
     let p = current_palette();
-    if card_of(parent, id).is_some() {
+    let (cx, cy) = ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
+    if cards
+        .iter()
+        .any(|r| cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom)
+    {
         p.card
     } else {
         p.window
@@ -1108,12 +1117,12 @@ fn surface_under(parent: HWND, id: i32) -> u32 {
 }
 
 unsafe fn draw_button(
-    hwnd: HWND,
     hdc: HDC,
     ctl: &Ctl,
     p: &Palette,
     dip: Dip,
     window_focused: bool,
+    cards: &[RECT],
 ) {
     let s = |v: f32| dip.px(v);
     let rc = ctl.rect;
@@ -1124,7 +1133,7 @@ unsafe fn draw_button(
     let focused = window_focused && matches!(focus(), Focus::Button(f) if f == id);
     let small = with_ui(|u| u.font_small).unwrap_or(HFONT(std::ptr::null_mut()));
 
-    od_controls::fill(hdc, &rc, surface_under(hwnd, id));
+    od_controls::fill(hdc, &rc, surface_of(rc, cards));
 
     let (fill, fg, border) = if primary {
         let f = if pressed {
@@ -1164,12 +1173,12 @@ unsafe fn draw_button(
 }
 
 unsafe fn draw_toggle(
-    hwnd: HWND,
     hdc: HDC,
     ctl: &Ctl,
     p: &Palette,
     dip: Dip,
     window_focused: bool,
+    cards: &[RECT],
 ) {
     let rc = ctl.rect;
     let on = toggle(ctl.id);
@@ -1177,7 +1186,7 @@ unsafe fn draw_toggle(
     let pressed = PRESSED.with(|p| p.get()) == ctl.id;
     let focused = window_focused && matches!(focus(), Focus::Toggle(f) if f == ctl.id);
     // Toggles sit on the settings card.
-    od_controls::fill(hdc, &rc, surface_under(hwnd, ctl.id));
+    od_controls::fill(hdc, &rc, surface_of(rc, cards));
 
     let pill_h = dip.px(18.0);
     let pill = RECT {
@@ -2651,9 +2660,9 @@ unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
         ui.font = HFONT(shared.font as *mut c_void);
         ui.font_small = HFONT(shared.font_small as *mut c_void);
     });
-    // The row height and every rect follow `dip_of()`, so the only cached geometry
-    // (the card map) is dropped and the next paint rebuilds it at the new scale.
-    LAST_LAYOUT.with(|l| l.set((0, 0, 0, -1, -1)));
+    // Row height and every rect follow `dip_of()`, so the cached card map is dropped and
+    // the next paint rebuilds it at the new scale.
+    CARD_MAP.with(|c| c.borrow_mut().0 = (0, 0, 0, -1, -1));
     // A caret created for the old DPI keeps its old size until recreated.
     if CARET_ON.with(|c| c.replace(false)) {
         let _ = DestroyCaret();

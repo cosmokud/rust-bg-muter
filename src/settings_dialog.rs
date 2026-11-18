@@ -249,58 +249,12 @@ pub fn open_settings_dialog(
     init_common_controls();
 
     unsafe {
-        let class_name = to_wide("BgMuterSettingsClass");
-        let hmodule = GetModuleHandleW(None).unwrap_or_default();
-
-        od_controls::register_classes(hmodule.into());
-
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: WNDCLASS_STYLES(0),
-            lpfnWndProc: Some(window_proc),
-            hInstance: hmodule.into(),
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            // Every pixel is painted by us; no system erase brush.
-            hbrBackground: HBRUSH::default(),
-            lpszClassName: PCWSTR(class_name.as_ptr()),
-            ..WNDCLASSEXW::default()
+        let Some(hwnd) = create_dialog_window() else {
+            DIALOG_STATE.with(|state| {
+                *state.borrow_mut() = None;
+            });
+            return;
         };
-        RegisterClassExW(&wc);
-
-        let (width, height, x, y) = initial_geometry();
-        let title = to_wide("Background Muter - Settings");
-
-        let hwnd_result = CreateWindowExW(
-            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-            PCWSTR(class_name.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            WS_OVERLAPPED
-                | WS_CAPTION
-                | WS_SYSMENU
-                | WS_VISIBLE
-                | WS_THICKFRAME
-                | WS_MINIMIZEBOX
-                | WS_MAXIMIZEBOX
-                | WS_CLIPCHILDREN,
-            x,
-            y,
-            width,
-            height,
-            None,
-            None,
-            hmodule,
-            None,
-        );
-
-        let hwnd = match hwnd_result {
-            Ok(h) => h,
-            Err(e) => {
-                log::error!("Failed to create settings window: {}", e);
-                return;
-            }
-        };
-
-        let _ = ShowWindow(hwnd, SW_SHOW);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -313,7 +267,11 @@ pub fn open_settings_dialog(
             }
         }
 
-        let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), hmodule);
+        let class_name = to_wide(SETTINGS_CLASS);
+        let _ = UnregisterClassW(
+            PCWSTR(class_name.as_ptr()),
+            GetModuleHandleW(None).unwrap_or_default(),
+        );
         UI.with(|u| *u.borrow_mut() = None);
     }
 
@@ -321,6 +279,66 @@ pub fn open_settings_dialog(
         *state.borrow_mut() = None;
     });
 }
+
+const SETTINGS_CLASS: &str = "BgMuterSettingsClass";
+
+/// Registers the dialog class and creates the window; the caller owns the message loop.
+unsafe fn create_dialog_window() -> Option<HWND> {
+    let class_name = to_wide(SETTINGS_CLASS);
+    let hmodule = GetModuleHandleW(None).unwrap_or_default();
+
+    od_controls::register_classes(hmodule.into());
+
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: WNDCLASS_STYLES(0),
+        lpfnWndProc: Some(window_proc),
+        hInstance: hmodule.into(),
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+        // Every pixel is painted by us; no system erase brush.
+        hbrBackground: HBRUSH::default(),
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..WNDCLASSEXW::default()
+    };
+    RegisterClassExW(&wc);
+
+    let (width, height, x, y) = initial_geometry();
+    let title = to_wide("Background Muter - Settings");
+
+    let hwnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPED
+            | WS_CAPTION
+            | WS_SYSMENU
+            | WS_VISIBLE
+            | WS_THICKFRAME
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX
+            | WS_CLIPCHILDREN,
+        x,
+        y,
+        width,
+        height,
+        None,
+        None,
+        hmodule,
+        None,
+    );
+
+    let hwnd = match hwnd {
+        Ok(h) => h,
+        Err(e) => {
+            log::error!("Failed to create settings window: {}", e);
+            return None;
+        }
+    };
+
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    Some(hwnd)
+}
+
 
 fn initial_geometry() -> (i32, i32, i32, i32) {
     unsafe {
@@ -493,6 +511,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let p = current_palette();
 
     let mut lists: Vec<HWND> = Vec::new();
+    let mut cards: Vec<HWND> = Vec::new();
 
     for ctl in layout(hwnd) {
         let (class, style) = match ctl.kind {
@@ -520,6 +539,7 @@ unsafe fn create_controls(hwnd: HWND) {
             ),
         };
 
+        let card = ctl.kind == Kind::Card;
         let mut style = style;
         if ctl.id == ID_EDIT_POLL_INTERVAL {
             style = WINDOW_STYLE(style.0 | ES_NUMBER as u32);
@@ -543,6 +563,9 @@ unsafe fn create_controls(hwnd: HWND) {
         );
 
         if let Ok(ctl_hwnd) = created {
+            if card {
+                cards.push(ctl_hwnd);
+            }
             set_font(ctl_hwnd, font);
             match ctl.kind {
                 Kind::Button => od_controls::attach_hover(ctl_hwnd),
@@ -568,6 +591,20 @@ unsafe fn create_controls(hwnd: HWND) {
                 _ => {}
             }
         }
+    }
+
+    // A card is created before the controls it backs and the newest sibling is topmost,
+    // so every card must end up below them or it swallows their clicks and focus.
+    for card in cards {
+        let _ = SetWindowPos(
+            card,
+            HWND_BOTTOM,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 
     // Cue banner on the search box (native EDIT supports it).
@@ -843,7 +880,8 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
 }
 
 unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
-    if dis.itemID as usize == usize::MAX {
+    // itemID is u32: the (UINT)-1 empty-row sentinel arrives as u32::MAX.
+    if dis.itemID == u32::MAX {
         // LB_SETITEMHEIGHT / empty list: paint the empty row so the well keeps its color.
         draw_item_bg(dis.hDC, dis.rcItem);
         return;
@@ -1321,4 +1359,169 @@ unsafe fn save_settings(hwnd: HWND) {
             let _ = config.save();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn lparam_of(x: i32, y: i32) -> isize {
+        (((y as u32) << 16) | (x as u32 & 0xFFFF)) as isize
+    }
+
+    /// WindowFromPoint answers for the whole desktop, so two dialog windows in one test
+    /// binary would hit each other's cards: the window tests take turns.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn make_dialog() -> HWND {
+        init_common_controls();
+        DIALOG_STATE.with(|state| {
+            *state.borrow_mut() = Some(DialogState {
+                config: Arc::new(RwLock::new(Config::default())),
+                muting_enabled: Arc::new(AtomicBool::new(true)),
+                // COM must answer on this thread for the session refresh inside WM_CREATE.
+                audio_manager: Arc::new(AudioManager::new().expect("audio manager")),
+                detected_apps: Vec::new(),
+                all_detected_apps: Vec::new(),
+                search_filter: String::new(),
+            });
+        });
+        unsafe { create_dialog_window().expect("settings window") }
+    }
+
+    fn teardown(hwnd: HWND) {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            let name = to_wide(SETTINGS_CLASS);
+            let _ = UnregisterClassW(
+                PCWSTR(name.as_ptr()),
+                GetModuleHandleW(None).unwrap_or_default(),
+            );
+        }
+        UI.with(|u| *u.borrow_mut() = None);
+        DIALOG_STATE.with(|s| *s.borrow_mut() = None);
+    }
+
+    fn enumerate(list: HWND) -> Vec<String> {
+        unsafe {
+            let count = SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0;
+            (0..count)
+                .map(|i| {
+                    let len = SendMessageW(list, LB_GETTEXTLEN, WPARAM(i as usize), LPARAM(0)).0;
+                    let mut buf: Vec<u16> = vec![0; len as usize + 1];
+                    SendMessageW(
+                        list,
+                        LB_GETTEXT,
+                        WPARAM(i as usize),
+                        LPARAM(buf.as_mut_ptr() as isize),
+                    );
+                    String::from_utf16_lossy(&buf[..len as usize])
+                })
+                .collect()
+        }
+    }
+
+    const CARDS: [i32; 4] = [
+        ID_GRP_DETECTED,
+        ID_GRP_EXCLUDED,
+        ID_GRP_ALWAYS_MUTED,
+        ID_GROUP_SETTINGS,
+    ];
+
+    /// No control may sit on another, or a click lands on the wrong window. A card
+    /// contains its children by design, so only pairs with exactly one card are exempt.
+    fn assert_no_overlaps(hwnd: HWND) {
+        let rects: Vec<(i32, RECT)> = layout(hwnd).into_iter().map(|c| (c.id, c.rect)).collect();
+        for (i, (id_a, a)) in rects.iter().enumerate() {
+            for (id_b, b) in rects.iter().skip(i + 1) {
+                let overlap =
+                    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+                let containment = CARDS.contains(id_a) != CARDS.contains(id_b);
+                assert!(
+                    !overlap || containment,
+                    "controls {id_a} and {id_b} overlap"
+                );
+            }
+        }
+    }
+
+    /// A card that covers its children takes the hit test, the focus and the clicks.
+    #[test]
+    fn detected_list_accepts_a_row_click() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            DIALOG_STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                let s = state.as_mut().unwrap();
+                s.all_detected_apps = vec![(1, "alpha.exe".into()), (2, "beta.exe".into())];
+            });
+            refresh_detected_apps(hwnd);
+
+            let list = get_dlg_item(hwnd, ID_LIST_DETECTED);
+            let mut rc = RECT::default();
+            SendMessageW(
+                list,
+                LB_GETITEMRECT,
+                WPARAM(1),
+                LPARAM(&mut rc as *mut RECT as isize),
+            );
+            let (x, y) = ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
+            let mut pt = windows::Win32::Foundation::POINT { x, y };
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(list, &mut pt);
+            // The topmost window under the row's own client coords must be the list itself.
+            let hit = WindowFromPoint(pt);
+            if hit != list {
+                let mut b = [0u16; 64];
+                let n = GetClassNameW(hit, &mut b);
+                let mut r = RECT::default();
+                let _ = GetWindowRect(hit, &mut r);
+                panic!(
+                    "covered by {} id={} parent={:?} rect=({},{},{},{}) pt=({},{})",
+                    String::from_utf16_lossy(&b[..n as usize]),
+                    GetDlgCtrlID(hit),
+                    GetParent(hit).unwrap_or_default(),
+                    r.left,
+                    r.top,
+                    r.right,
+                    r.bottom,
+                    pt.x,
+                    pt.y
+                );
+            }
+
+            SendMessageW(list, WM_LBUTTONDOWN, WPARAM(1), LPARAM(lparam_of(x, y)));
+            SendMessageW(list, WM_LBUTTONUP, WPARAM(0), LPARAM(lparam_of(x, y)));
+            assert_eq!(SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0, 1);
+
+            assert_no_overlaps(hwnd);
+            // The same grid at 150%: scale the client area with the DIP, as a DPI change does.
+            let (mut client, mut window) = (RECT::default(), RECT::default());
+            let _ = GetClientRect(hwnd, &mut client);
+            let _ = GetWindowRect(hwnd, &mut window);
+            let (frame_w, frame_h) = (
+                (window.right - window.left) - (client.right - client.left),
+                (window.bottom - window.top) - (client.bottom - client.top),
+            );
+            with_ui_mut(|ui| ui.dip = Dip::from_dpi(144));
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                client.right * 3 / 2 + frame_w,
+                client.bottom * 3 / 2 + frame_h,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            assert_no_overlaps(hwnd);
+            with_ui_mut(|ui| ui.dip = Dip::at(hwnd));
+        }
+        teardown(hwnd);
+    }
 }

@@ -1,7 +1,7 @@
 //! GDI paint helpers for the owner-drawn settings dialog.
 //!
 //! The dialog owns no child windows: it draws every control itself, so what is left
-//! here are the primitives (fill/round/stroke/dot/text) plus the flat/rounded shapes
+//! here are the primitives (fill/round/dot/text) plus the flat/rounded shapes
 //! and `mix` colour blending they share. All of it is pure GDI (CPU rasterized): the
 //! shapes select the DC brush and pen, so a paint pass allocates no GDI object.
 
@@ -9,7 +9,7 @@ use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     DrawTextW, Ellipse, FillRect, GetStockObject, RoundRect, SelectObject, SetBkMode,
     SetDCBrushColor, SetDCPenColor, SetTextColor, DC_BRUSH, DC_PEN, DRAW_TEXT_FORMAT, HBRUSH, HDC,
-    HFONT, HGDIOBJ, NULL_BRUSH, TRANSPARENT,
+    HFONT, HGDIOBJ, TRANSPARENT,
 };
 
 /// Selects DC_BRUSH and DC_PEN in `fill`/`pen`, draws, then restores the DC.
@@ -44,20 +44,6 @@ pub fn round(hdc: HDC, rc: &RECT, radius: i32, fill: u32, border: Option<u32>) {
         shaped(hdc, fill, edge, || {
             let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
         });
-    }
-}
-
-/// Outline only (1px), rounded.
-pub fn stroke(hdc: HDC, rc: &RECT, radius: i32, color: u32) {
-    unsafe {
-        let brush = GetStockObject(NULL_BRUSH);
-        let pen = GetStockObject(DC_PEN);
-        let old_brush = SelectObject(hdc, brush);
-        let old_pen = SelectObject(hdc, pen);
-        SetDCPenColor(hdc, COLORREF(color));
-        let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
     }
 }
 

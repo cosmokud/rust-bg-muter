@@ -2051,13 +2051,16 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
     }
 }
 
-/// Reset Mixer: the Windows Volume Mixer reset, both halves of the state Windows keeps.
+/// Reset Mixer: the Windows Volume Mixer reset - the per-app state Windows keeps, and
+/// nothing else.
 ///
 /// The stored half is the per-app preference subtree under `LowRegistry` - the part
-/// Windows' own reset deletes - and the live half puts every session and every default
-/// endpoint back to unmuted at full volume, so the result is visible now rather than at
-/// the next stream. The settings file is deliberately untouched: the exclusion and
-/// always-muted lists are this app's configuration, not mixer state.
+/// Windows' own reset deletes - and the live half puts every app session back to unmuted
+/// at full volume, so the result is visible now rather than at the next stream. The
+/// device endpoint is left alone on purpose: the speaker's own level and mute are the
+/// user's, and Windows' mixer reset does not touch them either. The settings file is
+/// deliberately untouched too: the exclusion and always-muted lists are this app's
+/// configuration, not mixer state.
 unsafe fn reset_mixer(hwnd: HWND) {
     let confirmed = crate::confirm_dialog::open_confirm(
         hwnd,

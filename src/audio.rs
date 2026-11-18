@@ -8,7 +8,6 @@ use std::os::windows::ffi::OsStringExt;
 use std::sync::Arc;
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, FALSE, TRUE};
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
     eCommunications, eConsole, eMultimedia, eRender, IAudioSessionControl2,
     IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
@@ -122,36 +121,23 @@ impl AudioManager {
         Ok(())
     }
 
-    /// Puts every live session and every default render endpoint back to the state a
-    /// fresh session starts in: unmuted, full volume.
+    /// Puts every live app session back to the state a fresh session starts in: unmuted,
+    /// full volume.
     ///
     /// This is the runtime half of the Volume Mixer reset - the stored per-app
     /// preferences are cleared separately - and it is what makes a reset visible now
     /// instead of at the next session start. A session that cannot be written is
     /// skipped rather than aborting the pass: one protected process must not leave the
-    /// rest of the mixer at its old level. Returns the number of targets updated.
+    /// rest of the mixer at its old level. Returns the number of sessions updated.
+    ///
+    /// The device endpoint is deliberately not touched. Windows' mixer reset resets
+    /// apps, not the speaker: the master level and master mute belong to the user's
+    /// hardware, and a reset that quietly turned the speakers to 100% (or unmuted them)
+    /// would be a different, louder action than what was asked for.
     pub fn reset_all(&self) -> usize {
-        let mut devices: Vec<IMMDevice> = Vec::new();
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            if let Ok(enumerator) =
-                CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            {
-                for role in [eConsole, eMultimedia, eCommunications] {
-                    if let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, role) {
-                        devices.push(device);
-                    }
-                }
-            }
-        }
-
-        // Endpoints first, sessions after: a session write is what the user sees in the
-        // mixer, so it must win over whatever the endpoint change propagated down.
-        let mut changed = 0;
-        for device in &devices {
-            changed += reset_device_endpoint(device);
-        }
-        changed += reset_sessions(&self.sessions);
+        // A session write is what the user sees in the mixer, and the endpoint above it
+        // is left alone, so the order a session is visited in does not matter.
+        let changed = reset_sessions(&self.sessions);
 
         // The cached session interfaces now describe a muted mixer; the muter repopulates
         // them on its next poll, and a stale entry here would be read as the old level.
@@ -174,26 +160,6 @@ impl AudioManager {
 impl Default for AudioManager {
     fn default() -> Self {
         Self::new().expect("Failed to create AudioManager")
-    }
-}
-
-/// Unmutes the default endpoint and sets it to full volume; 1 when both writes land.
-fn reset_device_endpoint(device: &IMMDevice) -> usize {
-    unsafe {
-        let Ok(endpoint) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) else {
-            return 0;
-        };
-        let mut done = 0;
-        if endpoint.SetMute(FALSE, std::ptr::null()).is_ok() {
-            done += 1;
-        }
-        if endpoint
-            .SetMasterVolumeLevelScalar(1.0, std::ptr::null())
-            .is_ok()
-        {
-            done += 1;
-        }
-        done
     }
 }
 

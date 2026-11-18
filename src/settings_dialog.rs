@@ -1293,14 +1293,16 @@ unsafe fn draw_toggle(
     ctl: &Ctl,
     p: &Palette,
     dip: Dip,
-    window_focused: bool,
+    _window_focused: bool,
     cards: &[RECT],
 ) {
     let rc = ctl.rect;
     let on = toggle(ctl.id);
     let hot = HOT.with(|h| h.get()) == ctl.id;
     let pressed = PRESSED.with(|p| p.get()) == ctl.id;
-    let focused = window_focused && matches!(focus(), Focus::Toggle(f) if f == ctl.id);
+    // A toggle shows no focus ring, so its state is only (on, hot, pressed): `focused` stays
+    // out of the supersample key, and a repaint of the same state reuses its bitmap.
+    let focused = false;
     // Toggles sit on the settings card.
     od_controls::fill(hdc, &rc, surface_of(rc, cards));
 
@@ -1315,6 +1317,9 @@ unsafe fn draw_toggle(
         right: rc.left + dip.px(1.0) + dip.px(36.0),
         bottom: pill_top + pill_h,
     };
+    // `RoundRect` takes the corner ellipse's *diameter*, not its radius, so the full pill
+    // height gives true semicircular ends: the roundest a pill this tall can be.
+    let pill_round = pill_h;
     let track = if on {
         if pressed {
             od_controls::mix(p.accent, p.text, 0.25)
@@ -1344,25 +1349,22 @@ unsafe fn draw_toggle(
         bottom: knob.top + pill_h - dip.px(4.0),
         ..knob
     };
-    let ring = RECT {
-        left: pill.left - dip.px(2.0),
-        top: pill.top - dip.px(2.0),
-        right: pill.right + dip.px(2.0),
-        bottom: pill.bottom + dip.px(2.0),
-    };
-    // The focus ring is stroked at 1x, so it is not part of the supersampled pass.
+    // A supersampled downscale rounds the corners of a plain rectangle too, so the pill
+    // needs the same treatment as its knob: rasterize at a corner radius well away from
+    // the half-height stadium the knob still follows. `radius` is the shape's own radius;
+    // the knob stays a circle.
     aa_shape(
         hwnd,
         hdc,
         ctl.id,
         &pill,
-        pill_h / 2,
+        pill_round,
         p,
         surface_of(rc, cards),
         (!on).then_some(p.hairline),
         (on, hot, pressed, focused),
         &[
-            (Shape::Round, pill, pill_h / 2, track),
+            (Shape::Round, pill, pill_round, track),
             (
                 Shape::Dot,
                 knob,
@@ -1371,9 +1373,8 @@ unsafe fn draw_toggle(
             ),
         ],
     );
-    if focused {
-        od_controls::stroke(hdc, &ring, pill_h / 2 + dip.px(2.0), p.accent);
-    }
+    // No focus ring: a toggle is activated with the mouse, and the accent outline that
+    // appeared after a click read as a leftover highlight, not as a focus cue.
 
     if !ctl.text.is_empty() {
         od_controls::text(
@@ -3318,7 +3319,7 @@ mod tests {
                 (c.0 & 0xFF) as u32 | (c.0 & 0xFF00) | (c.0 & 0xFF0000)
             };
             for ctl in layout(hwnd) {
-                let (cx, cy) = (
+                let (cx, _cy) = (
                     (ctl.rect.left + ctl.rect.right) / 2,
                     (ctl.rect.top + ctl.rect.bottom) / 2,
                 );
@@ -3442,6 +3443,69 @@ mod tests {
             SelectObject(mem, old);
             let _ = DeleteObject(HGDIOBJ(bmp.0));
             let _ = DeleteDC(mem);
+        }
+        teardown(hwnd);
+    }
+
+
+    /// A toggle must not draw a focus ring: the accent outline that appeared after a click
+    /// read as a leftover highlight. Painting onto the card colour, nothing but the pill and
+    /// its knob may change a pixel: the band just outside the pill stays card.
+    #[test]
+    fn toggle_draws_no_focus_ring() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            let ctls = layout(hwnd);
+            let ctl = ctls
+                .iter()
+                .find(|c| c.kind == Kind::Toggle)
+                .expect("a toggle");
+            let mut full = RECT::default();
+            let _ = GetClientRect(hwnd, &mut full);
+            let window_dc = GetDC(hwnd);
+            let dc = CreateCompatibleDC(window_dc);
+            let bmp = CreateCompatibleBitmap(window_dc, full.right, full.bottom);
+            let _ = ReleaseDC(hwnd, window_dc);
+            SelectObject(dc, bmp);
+            let p = current_palette();
+            let cards: Vec<RECT> = ctls
+                .iter()
+                .filter(|c| c.kind == Kind::Card)
+                .map(|c| c.rect)
+                .collect();
+            // Card colour everywhere: anything a stroke draws shows up as a changed pixel.
+            od_controls::fill(dc, &full, p.card);
+            // Give the toggle keyboard focus: that is what used to draw the ring.
+            set_focus_value(Focus::Toggle(ctl.id));
+            draw_toggle(hwnd, dc, &ctl, &p, dip_of(), true, &cards);
+
+            let s = |v: f32| dip_of().px(v);
+            let pill = RECT {
+                left: ctl.rect.left + s(1.0),
+                top: ctl.rect.top + ((ctl.rect.bottom - ctl.rect.top) - s(18.0)) / 2,
+                right: ctl.rect.left + s(1.0) + s(36.0),
+                bottom: 0,
+            };
+            let pill = RECT {
+                bottom: pill.top + s(18.0),
+                ..pill
+            };
+            let mid = (pill.top + pill.bottom) / 2;
+            let at = |x: i32, y: i32| {
+                let c = windows::Win32::Graphics::Gdi::GetPixel(dc, x, y).0;
+                (c & 0xFF) as u32 | (c & 0xFF00) | (c & 0xFF0000)
+            };
+            for (x, y) in [
+                (ctl.rect.left - 1, mid),
+                (ctl.rect.left, mid),
+                (pill.right + s(3.0), mid),
+                ((pill.left + pill.right) / 2 + s(18.0), pill.top - s(3.0)),
+            ] {
+                assert_eq!(at(x, y), p.card, "a ring was drawn at {x},{y}");
+            }
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(bmp);
         }
         teardown(hwnd);
     }

@@ -1,4 +1,4 @@
-//! Background Muter Library
+//! Rust Background Muter Library
 //!
 //! A lightweight crate for detecting and muting background
 //! applications on Windows with minimal resource usage.
@@ -9,6 +9,7 @@ pub mod muter;
 pub mod od_controls;
 pub mod process;
 pub mod settings_dialog;
+pub mod shell;
 pub mod startup;
 pub mod theme;
 pub mod tray;

@@ -1,4 +1,4 @@
-﻿//! Lightweight system tray module
+//! Lightweight system tray module
 //!
 //! Pure Win32-based tray icon with minimal resource usage.
 //! No dependency on eframe/egui - uses native Windows message pump.
@@ -12,6 +12,9 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+
+/// Product name shown by the tooltip and the window titles.
+pub const APP_NAME: &str = "Rust Background Muter";
 
 /// Stable label: the check mark, not the wording, shows the state.
 const TOGGLE_LABEL: &str = "Muting";
@@ -107,18 +110,12 @@ impl SystemTray {
         }));
 
         // Build tray icon
-        let tooltip = if muting_enabled {
-            "Background Muter - Active"
-        } else {
-            "Background Muter - Disabled"
-        };
-
         // Do NOT show menu on left click - only right click shows context menu
         let tray_icon = TrayIconBuilder::new()
-            .with_tooltip(tooltip)
+            .with_tooltip(tooltip_for(muting_enabled))
             .with_icon(icon)
             .with_menu(Box::new(menu))
-            .with_menu_on_left_click(false)  // Only right-click shows menu
+            .with_menu_on_left_click(false) // Only right-click shows menu
             .build()?;
 
         Ok(Self {
@@ -140,11 +137,7 @@ impl SystemTray {
         // Check mark carries the state; the label stays stable.
         self.menu_toggle.set_checked(muting_enabled);
 
-        let tooltip = if muting_enabled {
-            "Background Muter - Active"
-        } else {
-            "Background Muter - Disabled"
-        };
+        let tooltip = tooltip_for(muting_enabled);
         let _ = self._tray_icon.set_tooltip(Some(tooltip));
     }
 
@@ -169,12 +162,8 @@ impl SystemTray {
         unsafe {
             // Wait for messages with timeout (efficient - doesn't spin CPU)
             let timeout_ms = timeout.as_millis() as u32;
-            let _result = MsgWaitForMultipleObjectsEx(
-                None,
-                timeout_ms,
-                QS_ALLINPUT,
-                MWMO_INPUTAVAILABLE,
-            );
+            let _result =
+                MsgWaitForMultipleObjectsEx(None, timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 
             // Process all pending messages
             let mut msg = std::mem::zeroed();
@@ -194,6 +183,12 @@ impl Drop for SystemTray {
         MenuEvent::set_event_handler(Some(|_: MenuEvent| {}));
         TrayIconEvent::set_event_handler(Some(|_: TrayIconEvent| {}));
     }
+}
+
+/// Tray tooltip: the app name followed by the muting state.
+fn tooltip_for(muting_enabled: bool) -> String {
+    let state = if muting_enabled { "Active" } else { "Disabled" };
+    format!("{APP_NAME} - {state}")
 }
 
 /// Loads the tray icon from embedded PNG

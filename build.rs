@@ -1,4 +1,4 @@
-//! Build script for Background Muter
+//! Build script for Rust Background Muter
 //! Sets up Windows-specific resources like the application icon
 //! and embeds the visual styles manifest for modern Windows UI
 
@@ -15,7 +15,7 @@ const VISUAL_STYLES_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" sta
     name="BgMuter"
     type="win32"
   />
-  <description>Background Muter</description>
+  <description>Rust Background Muter</description>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity
@@ -98,7 +98,7 @@ fn main() {
     let mut res = winres::WindowsResource::new();
 
     // Application metadata
-    res.set("ProductName", "Background Muter");
+    res.set("ProductName", "Rust Background Muter");
     res.set("FileDescription", "Automatically mute background applications");
     res.set("LegalCopyright", "MIT License");
     res.set("ProductVersion", env!("CARGO_PKG_VERSION"));

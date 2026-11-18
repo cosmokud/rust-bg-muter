@@ -34,6 +34,10 @@ ${StrCase}
 ${StrLoc}
 
 !define MANUFACTURER "{{manufacturer}}"
+
+; The product was published under this name before it was renamed. That registration,
+; the previous installation's uninstall entry and its folder are migrated below.
+!define LEGACYPRODUCTNAME "Background Muter"
 !define PRODUCTNAME "{{product_name}}"
 !define VERSION "{{version}}"
 !define VERSIONWITHBUILD "{{version_with_build}}"
@@ -54,6 +58,9 @@ ${StrLoc}
 !define DISPLAYLANGUAGESELECTOR "{{display_language_selector}}"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}"
 !define MANUPRODUCTKEY "Software\${MANUFACTURER}\${PRODUCTNAME}"
+!define LEGACYUNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${LEGACYPRODUCTNAME}"
+!define LEGACYMANUPRODUCTKEY "Software\${MANUFACTURER}\${LEGACYPRODUCTNAME}"
+!define RUNKEY "Software\Microsoft\Windows\CurrentVersion\Run"
 !define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
 !define ESTIMATEDSIZE "{{estimated_size}}"
 
@@ -239,6 +246,16 @@ Function .onInit
   !insertmacro SetContext
 
   ${If} $INSTDIR == ""
+    ; Kept apart from RestorePreviousInstallLocation: a copy installed under the old
+    ; product name is updated in place instead of installed a second time beside it.
+    ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
+    ${If} $4 == ""
+      ReadRegStr $4 SHCTX "${LEGACYMANUPRODUCTKEY}" ""
+    ${EndIf}
+    ${If} $4 != ""
+      StrCpy $INSTDIR $4
+    ${EndIf}
+
     ; Set default install location
     !if "${INSTALLMODE}" == "perMachine"
       ${If} ${RunningX64}
@@ -327,6 +344,10 @@ Section Install
   ; A running copy is closed, and a previous installation of this product is
   ; removed, before anything is written.
   !insertmacro CheckIfAppIsRunning
+  ; The copy installed under the old product name goes first: its own uninstaller is
+  ; still registered under that name, and it deletes the exe this section is about to
+  ; write when the two installs share a folder.
+  Call UninstallLegacyInstallation
   Call UninstallPreviousInstallation
 
   SetOutPath $INSTDIR
@@ -526,6 +547,8 @@ SectionEnd
 ; uninstaller asks about application data on a page a silent run never shows, and
 ; the answer it defaults to is no.
 Function UninstallPreviousInstallation
+  ; Named after the previous release until migrated: the uninstall entry of a copy
+  ; installed under the old product name is what `_?=` below has to reuse.
   ReadRegStr $R0 SHCTX "${UNINSTKEY}" ""
   ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
   ${IfThen} "$R0$R1" == "" ${|} Return ${|}
@@ -547,6 +570,39 @@ Function UninstallPreviousInstallation
 
   Delete "$R1"
   RMDir "$4"
+FunctionEnd
+
+; The product was renamed. A copy installed under the old name is registered under a
+; name no installer of this one reads, so its uninstaller, its shortcuts and its login
+; command are cleared here: left alone, both names appear on the uninstall page and the
+; old copy starts a second instance at every login.
+Function UninstallLegacyInstallation
+  ReadRegStr $R0 SHCTX "${LEGACYUNINSTKEY}" ""
+  ReadRegStr $R1 SHCTX "${LEGACYUNINSTKEY}" "UninstallString"
+  ${If} "$R0$R1" != ""
+    ReadRegStr $4 SHCTX "${LEGACYMANUPRODUCTKEY}" ""
+    ${IfThen} $4 == "" ${|} StrCpy $4 $INSTDIR ${|}
+
+    StrCpy $0 $R1 1
+    ${IfThen} $0 == '"' ${|} StrCpy $R1 $R1 -1 1 ${|}
+    ExecWait '"$R1" /S _?=$4' $0
+
+    ${If} $0 <> 0
+    ${OrIf} ${FileExists} "$4\${MAINBINARYNAME}.exe"
+      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)"
+      Abort
+    ${EndIf}
+
+    Delete "$R1"
+    RMDir "$4"
+  ${EndIf}
+
+  ; Retired whether or not an uninstaller was registered, in case one left something.
+  Delete "$DESKTOP\${LEGACYPRODUCTNAME}.lnk"
+  Delete "$SMPROGRAMS\$AppStartMenuFolder\${LEGACYPRODUCTNAME}.lnk"
+  DeleteRegKey SHCTX "${LEGACYUNINSTKEY}"
+  DeleteRegKey SHCTX "${LEGACYMANUPRODUCTKEY}"
+  DeleteRegValue HKCU "${RUNKEY}" "${LEGACYPRODUCTNAME}"
 FunctionEnd
 
 Function RestorePreviousInstallLocation

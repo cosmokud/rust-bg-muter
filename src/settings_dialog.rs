@@ -63,6 +63,7 @@ const ID_LABEL_CONFIG: i32 = 124;
 const ID_LABEL_PATH: i32 = 125;
 const ID_EDIT_FILTER_EXCLUDED: i32 = 127;
 const ID_EDIT_FILTER_ALWAYS_MUTED: i32 = 128;
+const ID_BTN_EDIT_CONFIG: i32 = 129;
 
 const EN_CHANGE: u16 = 0x0300;
 
@@ -305,7 +306,7 @@ unsafe fn create_dialog_window() -> Option<HWND> {
     RegisterClassExW(&wc);
 
     let (width, height, x, y) = initial_geometry();
-    let title = to_wide("Background Muter - Settings");
+    let title = to_wide(&format!("{} - Settings", crate::tray::APP_NAME));
 
     let hwnd = CreateWindowExW(
         // WS_EX_COMPOSITED: the dialog and all of its children are painted bottom-up into
@@ -657,6 +658,15 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         s(18.0),
     );
 
+    push(
+        ID_BTN_EDIT_CONFIG,
+        Kind::Button,
+        "Edit Config",
+        width - s(438.0),
+        height - s(45.0),
+        s(100.0),
+        s(32.0),
+    );
     push(
         ID_BTN_SAVE_ONLY,
         Kind::Button,
@@ -1603,6 +1613,11 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
         ID_BTN_SAVE_ONLY => {
             save_settings(hwnd);
         }
+        ID_BTN_EDIT_CONFIG => {
+            // Save first so the file on disk matches the dialog the user is looking at.
+            save_settings(hwnd);
+            crate::shell::open_config_in_default_editor();
+        }
         ID_BTN_SAVE_CLOSE => {
             save_settings(hwnd);
             let _ = DestroyWindow(hwnd);
@@ -1865,6 +1880,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The dialog's own name, which the rename must not leave behind.
+    #[test]
+    fn window_title_uses_the_app_name() {
+        assert_eq!(
+            format!("{} - Settings", crate::tray::APP_NAME),
+            "Rust Background Muter - Settings"
+        );
     }
 
     /// A card that covers its children takes the hit test, the focus and the clicks.

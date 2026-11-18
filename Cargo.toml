@@ -2,7 +2,7 @@
 name = "rust-bg-muter"
 version = "0.1.2"
 edition = "2021"
-authors = ["Background Muter Team"]
+authors = ["Rust Background Muter Team"]
 description = "A lightweight Windows application to mute background applications"
 license = "MIT"
 repository = "https://github.com/username/rust-bg-muter"
@@ -72,13 +72,13 @@ path = "src/main.rs"
 
 [package.metadata.winres]
 OriginalFilename = "rust-bg-muter.exe"
-ProductName = "Background Muter"
+ProductName = "Rust Background Muter"
 FileDescription = "Mute background applications automatically"
 
 [package.metadata.packager]
-product-name = "Background Muter"
+product-name = "Rust Background Muter"
 identifier = "dev.rust-bg-muter.app"
-publisher = "Background Muter Team"
+publisher = "Rust Background Muter Team"
 description = "Automatically mute background applications while the active one stays audible"
 license-file = "LICENSE"
 icons = ["assets/icon.ico"]

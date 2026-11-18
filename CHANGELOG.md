@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- `Edit Config` button in the settings dialog, left of `Save`: saves the dialog and opens `config.json` in the default editor.
+- `Rust Background Muter` as the application name, shown in the tray tooltip (`- Active` / `- Disabled`), the settings window title, the login command, the executable's product metadata and the installer.
+
+### Changed
+
+- Installing over a copy published as `Background Muter` updates it in place: the old uninstall registration, shortcuts and login command are removed rather than left beside the new ones.
+
 ## [0.1.2] - 2026-05-19
 
 ### Added

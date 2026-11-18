@@ -2,7 +2,7 @@
 
 ![Rust](https://img.shields.io/badge/Rust-1.75+-orange?logo=rust) ![Platform](https://img.shields.io/badge/Platform-Windows-blue?logo=windows) ![License](https://img.shields.io/badge/License-MIT-green)
 
-Background Muter is a native Windows tray application written in Rust that automatically mutes audio from background applications while keeping the active app audible.
+Rust Background Muter is a native Windows tray application written in Rust that automatically mutes audio from background applications while keeping the active app audible.
 
 ![Showcase](https://github.com/user-attachments/assets/ee6017fe-11a3-4727-a5e1-9ac254e502ec)
 

@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, GetSystemMetrics, LoadImageW, SendMessageW, HICON, ICON_BIG, ICON_SMALL,
+    GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL,
     ICON_SMALL2, IMAGE_FLAGS, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, SM_CYICON,
     SM_CYSMICON, WM_SETICON,
 };
@@ -182,7 +182,10 @@ pub fn apply_app_icon(hwnd: HWND) {
                 WPARAM(slot as usize),
                 LPARAM(handle.0 as isize),
             );
-            let _ = DestroyIcon(HICON(handle.0));
+            // The window keeps the handle, not a copy: destroying it here would leave
+            // every slot pointing at a freed icon, which the shell then draws as a
+            // blank square in the caption and in the taskbar hover preview. The
+            // handle is released when the window is destroyed instead.
         }
     }
 }

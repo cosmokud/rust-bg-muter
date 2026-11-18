@@ -99,7 +99,7 @@ fn main() {
 
     // Application metadata
     res.set("ProductName", "Rust Background Muter");
-    res.set("FileDescription", "Automatically mute background applications");
+    res.set("FileDescription", "Rust Background Muter");
     res.set("LegalCopyright", "MIT License");
     res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
     res.set("FileVersion", env!("CARGO_PKG_VERSION"));

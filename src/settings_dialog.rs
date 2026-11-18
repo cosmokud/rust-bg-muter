@@ -20,10 +20,10 @@ use std::sync::{Arc, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
+    BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, FillRect, InvalidateRect,
     SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
     DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
@@ -86,7 +86,8 @@ struct DialogState {
     search_filter: String,
 }
 
-/// Per-dialog GDI resources; freed when the dialog closes.
+/// GDI resources for one dialog; freed when it closes. Fonts and brushes live in the
+/// process-wide `SHARED`, so a reopen neither creates nor deletes any GDI object.
 struct Ui {
     palette: Palette,
     dip: Dip,
@@ -97,31 +98,68 @@ struct Ui {
     br_well: HBRUSH,
 }
 
+/// Process-wide fonts and brushes, keyed by the palette/DPI they were built for.
+/// Re-parenting or a DPI change reuses the same handles instead of churning GDI objects.
+/// Handles are kept as `isize` so the cache is `Send`; they are handles, never dereferenced.
+struct Shared {
+    dip: u32,
+    dark: bool,
+    font: isize,
+    font_small: isize,
+    br_window: isize,
+    br_card: isize,
+    br_well: isize,
+}
+
+static SHARED: OnceLock<Mutex<Shared>> = OnceLock::new();
+
+impl Shared {
+    unsafe fn get(dip: u32, palette: &Palette) -> Shared {
+        let cache = SHARED.get_or_init(|| {
+            Mutex::new(Shared::build(Dip::from_dpi(dip), palette))
+        });
+        let mut cache = cache.lock();
+        if cache.dip != Dip::from_dpi(dip).dpi || cache.dark != palette.dark {
+            // The retired handles are never deleted: a control still selecting one would
+            // be left drawing with a freed object. A DPI change is rare; the leak is bounded.
+            *cache = Shared::build(Dip::from_dpi(dip), palette);
+        }
+        Shared { ..*cache }
+    }
+
+    unsafe fn build(dip: Dip, palette: &Palette) -> Self {
+        Self {
+            dip: dip.dpi,
+            dark: palette.dark,
+            font: make_font(dip, 13.0, FW_NORMAL.0 as i32).0 as isize,
+            font_small: make_font(dip, 11.0, FW_NORMAL.0 as i32).0 as isize,
+            br_window: CreateSolidBrush(COLORREF(palette.window)).0 as isize,
+            br_card: CreateSolidBrush(COLORREF(palette.card)).0 as isize,
+            br_well: CreateSolidBrush(COLORREF(palette.well)).0 as isize,
+        }
+    }
+}
+
 impl Ui {
     unsafe fn new(hwnd: HWND) -> Self {
         let dip = Dip::at(hwnd);
         let palette = Palette::system();
+        let shared = Shared::get(dip.dpi, &palette);
         Self {
             palette,
             dip,
-            font: make_font(dip, 13.0, FW_NORMAL.0 as i32),
-            font_small: make_font(dip, 11.0, FW_NORMAL.0 as i32),
-            br_window: CreateSolidBrush(COLORREF(palette.window)),
-            br_card: CreateSolidBrush(COLORREF(palette.card)),
-            br_well: CreateSolidBrush(COLORREF(palette.well)),
+            font: HFONT(shared.font as *mut c_void),
+            font_small: HFONT(shared.font_small as *mut c_void),
+            br_window: HBRUSH(shared.br_window as *mut c_void),
+            br_card: HBRUSH(shared.br_card as *mut c_void),
+            br_well: HBRUSH(shared.br_well as *mut c_void),
         }
     }
 }
 
 impl Drop for Ui {
     fn drop(&mut self) {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(self.font.0));
-            let _ = DeleteObject(HGDIOBJ(self.font_small.0));
-            let _ = DeleteObject(HGDIOBJ(self.br_window.0));
-            let _ = DeleteObject(HGDIOBJ(self.br_card.0));
-            let _ = DeleteObject(HGDIOBJ(self.br_well.0));
-        }
+        // Nothing to release: fonts and brushes are the process-wide `SHARED` handles.
     }
 }
 
@@ -697,11 +735,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
     with_ui_mut(|ui| {
         let dip = Dip::from_dpi(dpi);
-        let _ = DeleteObject(HGDIOBJ(ui.font.0));
-        let _ = DeleteObject(HGDIOBJ(ui.font_small.0));
+        let shared = Shared::get(dip.dpi, &ui.palette);
         ui.dip = dip;
-        ui.font = make_font(dip, 13.0, FW_NORMAL.0 as i32);
-        ui.font_small = make_font(dip, 11.0, FW_NORMAL.0 as i32);
+        ui.font = HFONT(shared.font as *mut c_void);
+        ui.font_small = HFONT(shared.font_small as *mut c_void);
     });
     let font = ui_font();
     for ctl in layout(hwnd) {

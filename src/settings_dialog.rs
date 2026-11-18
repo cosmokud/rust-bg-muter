@@ -411,9 +411,6 @@ unsafe fn create_dialog_window() -> Option<HWND> {
     let class_name = to_wide(SETTINGS_CLASS);
     let hmodule = GetModuleHandleW(None).unwrap_or_default();
 
-    // Still registered: `od_controls` answers hover/font queries and pads its painter,
-    // and the classes are process-wide (an existing registration is harmless).
-
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         // CS_HREDRAW | CS_VREDRAW: a size change invalidates the whole window, so a frame

@@ -34,15 +34,22 @@ The app runs quietly in the system tray, tracks the current foreground process, 
 
 ## Installation
 
-Download the latest Windows executable from the repository's GitHub Releases tab:
+Download the latest Windows build from the repository's GitHub Releases tab:
 
 - [GitHub Releases](../../releases)
 
-After downloading, run `bg-muter.exe`. This is a portable app. Copy or place the folder anywhere you like. No installer is required.
+Every release carries two files:
+
+- `rust-bg-muter_x.y.z_x64-setup.exe` — an installer that places the app in
+  `%LOCALAPPDATA%\rust-bg-muter`, adds Start menu and desktop shortcuts, and registers an
+  uninstaller. No administrator rights are needed.
+- `rust-bg-muter.exe` — the portable executable. Copy it anywhere you like and run it.
+
+Both write the same configuration, at `%APPDATA%\rust-bg-muter\config.json`.
 
 ## Usage
 
-1. Launch `bg-muter.exe`.
+1. Launch `rust-bg-muter.exe`.
 2. Right-click the tray icon to open the menu.
 3. Select **Enable/Disable Muting** as needed.
 4. Open **Settings...** to manage app rules and behavior.
@@ -77,7 +84,16 @@ cargo build --release
 
 Binary output:
 
-- `target/release/bg-muter.exe`
+- `target/release/rust-bg-muter.exe`
+
+Windows installer (NSIS, built with [cargo-packager](https://github.com/crabnebula-dev/cargo-packager);
+its template is `packaging/nsis/installer.nsi`):
+
+```powershell
+.\build-installers.ps1
+```
+
+Output: `target/packager/rust-bg-muter_<version>_x64-setup.exe`.
 
 ## Architecture
 

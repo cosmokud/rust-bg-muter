@@ -217,7 +217,16 @@ unsafe fn flip(hwnd: HWND) {
 unsafe fn paint_toggle(hwnd: HWND) {
     let p = current_palette();
     let dip = Dip::at(hwnd);
-    let font = control_font(hwnd);
+    // A custom class never receives `WM_SETFONT` unless the dialog sends it, and
+    // `WM_GETFONT` answers null until then: use the dialog's font in that case.
+    let font = {
+        let f = control_font(hwnd);
+        if f.0.is_null() {
+            crate::settings_dialog::ui_font()
+        } else {
+            f
+        }
+    };
     let focused = GetFocus() == hwnd;
     let (on, hot, pressed) = match toggle_of(hwnd).as_ref() {
         Some(t) => (t.on, t.hot, t.pressed),
@@ -391,7 +400,7 @@ unsafe extern "system" fn card_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_PAINT => {
             let p = current_palette();
             let dip = Dip::at(hwnd);
-            let font = control_font(hwnd);
+            let font = crate::settings_dialog::ui_font();
             paint_banner(hwnd, |hdc, rc| {
                 fill(hdc, rc, p.window);
                 let card = RECT {

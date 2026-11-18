@@ -149,16 +149,25 @@ impl Config {
 
     /// Adds an app to the exclusion list
     pub fn add_excluded_app(&mut self, app_name: &str) {
-        let normalized = app_name.to_lowercase();
-        self.excluded_apps.insert(normalized);
+        self.insert_excluded_app(app_name);
         let _ = self.save();
+    }
+
+    /// Adds an app to the exclusion list without touching the config file.
+    /// Tests use this: a saving insert writes the real user's config.json.
+    pub fn insert_excluded_app(&mut self, app_name: &str) {
+        self.excluded_apps.insert(app_name.to_lowercase());
     }
 
     /// Removes an app from the exclusion list
     pub fn remove_excluded_app(&mut self, app_name: &str) {
-        let normalized = app_name.to_lowercase();
-        self.excluded_apps.remove(&normalized);
+        self.remove_excluded_app_in_memory(app_name);
         let _ = self.save();
+    }
+
+    /// Removes an app from the exclusion list without touching the config file.
+    pub fn remove_excluded_app_in_memory(&mut self, app_name: &str) {
+        self.excluded_apps.remove(&app_name.to_lowercase());
     }
 
     /// Checks if an app is in the exclusion list
@@ -169,16 +178,24 @@ impl Config {
 
     /// Adds an app to the always-muted list
     pub fn add_always_muted_app(&mut self, app_name: &str) {
-        let normalized = app_name.to_lowercase();
-        self.always_muted_apps.insert(normalized);
+        self.insert_always_muted_app(app_name);
         let _ = self.save();
+    }
+
+    /// Adds an app to the always-muted list without touching the config file.
+    pub fn insert_always_muted_app(&mut self, app_name: &str) {
+        self.always_muted_apps.insert(app_name.to_lowercase());
     }
 
     /// Removes an app from the always-muted list
     pub fn remove_always_muted_app(&mut self, app_name: &str) {
-        let normalized = app_name.to_lowercase();
-        self.always_muted_apps.remove(&normalized);
+        self.remove_always_muted_app_in_memory(app_name);
         let _ = self.save();
+    }
+
+    /// Removes an app from the always-muted list without touching the config file.
+    pub fn remove_always_muted_app_in_memory(&mut self, app_name: &str) {
+        self.always_muted_apps.remove(&app_name.to_lowercase());
     }
 
     /// Checks if an app is in the always-muted list
@@ -217,25 +234,38 @@ mod tests {
     #[test]
     fn test_exclusion_list() {
         let mut config = Config::default();
-        
-        config.add_excluded_app("Spotify.exe");
+
+        config.insert_excluded_app("Spotify.exe");
         assert!(config.is_excluded("spotify.exe"));
         assert!(config.is_excluded("SPOTIFY.EXE"));
-        
-        config.remove_excluded_app("spotify.exe");
+
+        config.remove_excluded_app_in_memory("spotify.exe");
         assert!(!config.is_excluded("spotify.exe"));
     }
 
     #[test]
     fn test_serialization() {
         let mut config = Config::default();
-        config.add_excluded_app("test.exe");
-        config.add_always_muted_app("always.exe");
-        
+        config.insert_excluded_app("test.exe");
+        config.insert_always_muted_app("always.exe");
+
         let json = serde_json::to_string(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
-        
+
         assert!(loaded.is_excluded("test.exe"));
         assert!(loaded.is_always_muted("always.exe"));
+    }
+
+    /// The lists above must never reach the config file: an insert that saves wipes the
+    /// lists a user configured, which is how a run of the test suite emptied them once.
+    #[test]
+    fn test_inserts_do_not_write_the_config_file() {
+        let path = Config::config_path();
+        let before = std::fs::read(&path).ok();
+        let mut config = Config::default();
+        config.insert_excluded_app("test.exe");
+        config.insert_always_muted_app("always.exe");
+        let after = std::fs::read(&path).ok();
+        assert_eq!(before, after, "a pure insert wrote {path:?}");
     }
 }

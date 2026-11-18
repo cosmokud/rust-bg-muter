@@ -181,7 +181,10 @@ fn dip_of() -> Dip {
     with_ui(|u| u.dip).unwrap_or(Dip::from_dpi(96))
 }
 
-fn ui_font() -> HFONT {
+/// The dialog's UI font. Every child window is given this one (`create_controls` sends
+/// `WM_SETFONT`), and owner-drawn children that answer null from `WM_GETFONT` fall back
+/// to it, so the caption, the buttons and the list rows all draw in the same face.
+pub fn ui_font() -> HFONT {
     with_ui(|u| u.font).unwrap_or(HFONT(std::ptr::null_mut()))
 }
 

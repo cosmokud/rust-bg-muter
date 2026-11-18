@@ -979,8 +979,10 @@ thread_local! {
     static SS_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Draws `shapes` antialiased into `rc`, then strokes `border` at 1x on top: a downscaled
-/// 1px line softens into grey haze, so the outline must stay on the final 1x buffer.
+/// Draws `shapes` antialiased into `rc`. There is no outline: GDI cannot antialias a 1px
+/// stroke, so any border would sit as a hard staircase on top of the smooth fill and read
+/// as worse aliasing than the shape it outlines. The shape's own edge against `bg` defines
+/// it instead, averaged down with everything else.
 /// `bg` is the flat surface behind `rc`; the rounded corners show it through.
 /// `state` is (on, hot, pressed, focused) and only selects the cache slot.
 unsafe fn aa_shape(
@@ -988,10 +990,8 @@ unsafe fn aa_shape(
     hdc: HDC,
     id: i32,
     rc: &RECT,
-    radius: i32,
     p: &Palette,
     bg: u32,
-    border: Option<u32>,
     state: (bool, bool, bool, bool),
     shapes: Shapes,
 ) {
@@ -1025,9 +1025,6 @@ unsafe fn aa_shape(
             h * AA_SUPERSAMPLE,
             SRCCOPY,
         );
-    }
-    if let Some(color) = border {
-        od_controls::stroke(hdc, rc, radius, color);
     }
 }
 
@@ -1381,19 +1378,17 @@ unsafe fn draw_toggle(
         bottom: knob.top + pill_h - dip.px(4.0),
         ..knob
     };
-    // A supersampled downscale rounds the corners of a plain rectangle too, so the pill
-    // needs the same treatment as its knob: rasterize at a corner radius well away from
-    // the half-height stadium the knob still follows. `radius` is the shape's own radius;
-    // the knob stays a circle.
+    // No outline on the pill: an off pill is `p.well` against the card, which is a clear
+    // enough edge on its own, and a 1px stroke could only add the staircase this shape is
+    // drawn antialiased to avoid. A supersampled downscale rounds the corners of a plain
+    // rectangle too, so the pill gets the same treatment as its knob.
     aa_shape(
         hwnd,
         hdc,
         ctl.id,
         &pill,
-        pill_round,
         p,
         surface_of(rc, cards),
-        (!on).then_some(p.hairline),
         (on, hot, pressed, focused),
         &[
             (Shape::Round, pill, pill_round, track),

@@ -1,6 +1,6 @@
 [package]
 name = "rust-bg-muter"
-version = "1.2.0"
+version = "0.1.2"
 edition = "2021"
 authors = ["Background Muter Team"]
 description = "A lightweight Windows application to mute background applications"
@@ -73,3 +73,35 @@ path = "src/main.rs"
 OriginalFilename = "rust-bg-muter.exe"
 ProductName = "Background Muter"
 FileDescription = "Mute background applications automatically"
+
+[package.metadata.packager]
+product-name = "Background Muter"
+identifier = "dev.rust-bg-muter.app"
+publisher = "Background Muter Team"
+description = "Automatically mute background applications while the active one stays audible"
+license-file = "LICENSE"
+icons = ["assets/icon.ico"]
+formats = ["nsis"]
+out-dir = "target/packager"
+binaries-dir = "target/release"
+
+[[package.metadata.packager.binaries]]
+path = "rust-bg-muter"
+main = true
+
+[package.metadata.packager.nsis]
+installMode = "currentUser"
+template = "packaging/nsis/installer.nsi"
+installer-icon = "assets/icon.ico"
+appdata-paths = ["$APPDATA/rust-bg-muter"]
+preinstall-section = '''
+Section PreInstall
+  ; Keep the per-user install at AppData\Local\rust-bg-muter rather than at a folder
+  ; named after the display name. Only the default is moved: a directory picked on the
+  ; installer's own page is left where it was chosen.
+  !if "${INSTALLMODE}" == "currentUser"
+    StrCmp $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}" 0 +2
+    StrCpy $INSTDIR "$LOCALAPPDATA\rust-bg-muter"
+  !endif
+SectionEnd
+'''

@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.2] - 2026-05-19
+
+### Added
+
+- NSIS installer built with cargo-packager: per-user install under `%LOCALAPPDATA%\rust-bg-muter`, with an uninstaller that can remove the configuration in `%APPDATA%\rust-bg-muter`. A previous installation is closed and removed silently before anything is written, and the `v*.*.*` tag workflow publishes both the installer and the portable executable.
+- Application icon, in the executable's resources, the tray, and the installer and uninstaller.
+
+### Changed
+
+- Settings dialog modernized: a themed Win32 dialog whose caption and control fonts share one face.
+- Dialog opens reuse the engine's audio manager instead of rebuilding it, and fonts, brushes, and small process icons are shared process-wide.
+- Painting uses the stock `DC_BRUSH`/`DC_PEN`, so no per-item GDI objects are created.
+- Small process icons are extracted at small size only and cached per executable path.
+- The tray menu shows the muting state as a check mark, and carries a mute-all entry.
+- Release builds link with `rust-lld`, target `x86-64-v2`, use a shared target dir, and stamp the commit into the executable.
+
+### Fixed
+
+- Tests no longer write the user's configuration file.
+
 ## [0.1.1] - 2026-03-03
 
 ### Added

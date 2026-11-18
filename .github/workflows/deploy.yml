@@ -6,38 +6,156 @@ on:
       - "v*.*.*"
 
 jobs:
-  deploy:
+  windows-installers:
     runs-on: windows-latest
     permissions:
       contents: write
+    # SECURITY: Ensure this job strictly runs on tags
+    if: startsWith(github.ref, 'refs/tags/')
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # IDEMPOTENCY: Only run this strict check on the very first attempt.
+      # If you click "Re-run failed jobs", this skips so you can finish the release.
+      - name: Fail if release already exists for tag
+        if: github.run_attempt == '1'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_url="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
+          status=$(curl -sS -o release.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${api_url}")
+          if [[ "${status}" == "200" ]]; then
+            echo "release already exists for tag ${TAG}; refusing to overwrite"
+            cat release.json
+            exit 1
+          fi
+          if [[ "${status}" != "404" ]]; then
+            echo "unexpected API status while checking tag ${TAG}: ${status}"
+            cat release.json || true
+            exit 1
+          fi
 
+      # SECURITY: Every action is pinned to the commit the tag it is written against
+      # pointed at, not to the tag itself: a tag is its publisher's to move, and these run
+      # with a token that can publish a release. The comment beside each pin names the
+      # release it is, for the bump that moves it.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The path-leak guard reads the history of this branch, not only its tree: a
+          # path in a commit message reaches every clone the way a path in a fixture does,
+          # and the default checkout is one commit deep, which leaves it nothing to read.
+          fetch-depth: 0
+
+      # The two things a release must not get wrong, checked before anything is built: the
+      # installer is named for the manifest's version, and a release whose notes are
+      # generated instead of taken from the changelog is one that cannot say what changed.
+      - name: The tag and the manifest agree
+        id: version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::${TAG} names '${VERSION}': a release is X.Y.Z, or X.Y.Z-rc.1"
+            exit 1
+          fi
+
+          manifest=$(grep -m1 -E '^version = "' Cargo.toml | cut -d'"' -f2)
+          if [[ "$manifest" != "$VERSION" ]]; then
+            echo "::error::Cargo.toml in this tag says '${manifest}' and the tag says '${VERSION}': the installer is built under one version and asked for under the other"
+            exit 1
+          fi
+
+          if ! grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section: the release would carry the generated notes instead of it"
+            exit 1
+          fi
+
+          echo "the tag and the manifest agree on ${VERSION}"
+
+          # A pre-release is published as one, so `releases/latest` stays where it is.
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "${VERSION} is a pre-release: published as one"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Pinned to a commit in master's history, with the toolchain named in the input:
+      # this action reads its ref as the toolchain otherwise, and a pin outside master
+      # is one that gets garbage-collected.
       - name: Install Rust (MSVC)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable-x86_64-pc-windows-msvc
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (2.9.2)
 
-      - name: Build (release)
+      # A path written into a fixture is in every clone of this tag from the moment the
+      # release exists, and an immutable release is one that cannot be taken back - so this
+      # runs before anything is built and before the release is created.
+      - name: Path leaks
+        run: cargo test --test no_path_leaks
+
+      - name: Install cargo-packager
         shell: pwsh
-        run: cargo build --release
+        run: cargo install cargo-packager --locked --version 0.11.8
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Build Windows installer
+        shell: pwsh
+        run: .\build-installers.ps1
+
+      # What a release carries is the installer the packager built, under the name it gave
+      # that file, and the portable exe beside it: one installer rather than two copies of
+      # the same bytes.
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: rust-bg-muter-${{ github.ref_name }}
-          path: target/release/rust-bg-muter.exe
+          name: rust-bg-muter-installers-${{ github.ref_name }}
+          path: |
+            target/packager/rust-bg-muter_*-setup.exe
+            target/release/rust-bg-muter.exe
+          if-no-files-found: error
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - name: Extract Changelog
+        shell: bash
+        env:
+          # SECURITY: the tag goes through the environment and is never written into the
+          # script: a ref name may hold `$(…)`, which a shell would run.
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+
+          # Extract changelog section for the current version
+          awk -v heading="## [$VERSION]" 'index($0, heading) == 1 {flag=1; next} /^## \[/{flag=0} flag' CHANGELOG.md > release_notes.md
+
+          if [[ ! -s release_notes.md ]]; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section: the release would publish empty notes"
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          prerelease: false
+          body_path: release_notes.md
+          # Set by the check above: a version carrying a suffix goes out as a pre-release, so
+          # `releases/latest` stays where it is.
+          prerelease: ${{ steps.version.outputs.prerelease }}
           generate_release_notes: true
-          files: target/release/rust-bg-muter.exe
+          fail_on_unmatched_files: true
+          files: |
+            target/packager/rust-bg-muter_*-setup.exe
+            target/release/rust-bg-muter.exe

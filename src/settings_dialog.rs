@@ -2191,6 +2191,19 @@ unsafe fn flip_toggle(hwnd: HWND, id: i32) {
 
 unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM) {
     let (x, y) = point_of(lparam);
+    // Dragging out of a field after pressing in it extends the selection.
+    let pressed = PRESSED.with(|p| p.get());
+    if let Focus::Field(id) = focus() {
+        if pressed == id {
+            if let Some(ctl) = ctl_of(hwnd, id) {
+                let caret = caret_from_x(hwnd, &ctl, x);
+                with_field(id, |f| f.caret = caret);
+                repaint(hwnd);
+                update_caret(hwnd);
+            }
+            return;
+        }
+    }
     let ctls = layout(hwnd);
     let hit = hit_test(&ctls, x, y);
     let hot_id = HOT.with(|h| h.get());

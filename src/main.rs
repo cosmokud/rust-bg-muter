@@ -198,10 +198,14 @@ fn run_tray_loop(
                     log::info!("Mute-all requested from tray");
                 }
                 TrayCommand::OpenSettings => {
+                    // Clone the Arc out before opening: dialog blocks the tray loop while
+                    // muting thread try_writes every poll; never hold the engine lock here.
+                    let audio_manager = engine.read().audio_manager();
                     // Open native Win32 settings dialog
                     settings_dialog::open_settings_dialog(
                         config.clone(),
                         muting_enabled.clone(),
+                        audio_manager,
                     );
                     
                     // Sync muting state after dialog closes (user may have changed it)

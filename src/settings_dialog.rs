@@ -227,15 +227,11 @@ fn invalidate(hwnd: HWND) {
 }
 
 /// Opens the settings dialog (blocks until closed)
-pub fn open_settings_dialog(config: Arc<RwLock<Config>>, muting_enabled: Arc<AtomicBool>) {
-    let audio_manager = match AudioManager::new() {
-        Ok(am) => Arc::new(am),
-        Err(e) => {
-            log::error!("Failed to create audio manager for settings: {}", e);
-            return;
-        }
-    };
-
+pub fn open_settings_dialog(
+    config: Arc<RwLock<Config>>,
+    muting_enabled: Arc<AtomicBool>,
+    audio_manager: Arc<AudioManager>,
+) {
     DIALOG_STATE.with(|state| {
         *state.borrow_mut() = Some(DialogState {
             config,

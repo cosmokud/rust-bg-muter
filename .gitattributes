@@ -5,3 +5,8 @@
 # end is not a shebang: a Windows clone carrying `core.autocrlf` would rewrite these to
 # CRLF and every hook would fail with `bad interpreter` before running a line.
 .githooks/* text eol=lf
+
+# Rust sources are checked out as LF wherever the clone happens, whatever
+# `core.autocrlf` the machine that clones carries: rustfmt writes LF, git stores LF,
+# and a worktree whose files disagree with that is one `cargo fmt` rewrites on sight.
+*.rs text eol=lf

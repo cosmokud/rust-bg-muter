@@ -3,8 +3,13 @@
 //! GDI only (CPU rasterized) - zero GPU/VRAM. All layout numbers are DIPs scaled by
 //! GetDpiForWindow, so per-monitor DPI v2 keeps the 4px grid intact.
 //!
-//! Control IDs and WM_COMMAND branches are unchanged from the pre-owner-draw dialog:
-//! toggles answer BM_SETCHECK/BM_GETCHECK and emit BN_CLICKED.
+//! One window, no children: every control in `layout()` is painted by `paint()` from a
+//! thread-local memory bitmap and blitted in one `BitBlt` per frame. Native children paint
+//! on their own schedule, and Windows repaints only the exposed bands during a live resize,
+//! so children ghost and trail structurally - no invalidation scheme can fix that. With one
+//! surface, every WM_SIZE ends on exactly one complete frame.
+//! WS_EX_COMPOSITED is deliberately absent: DWM compositing a single already-double-buffered
+//! window buys nothing and costs a full extra copy per frame.
 
 use crate::audio::AudioManager;
 use crate::config::Config;
@@ -18,21 +23,28 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::SIZE;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, FillRect, InvalidateRect, RedrawWindow,
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, SetBkColor,
-    SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, DeleteDC,
+    DeleteObject, EndPaint, GetDC, GetTextExtentPoint32W, IntersectClipRect, InvalidateRect,
+    ReleaseDC, RestoreDC, SaveDC, SelectObject, UpdateWindow, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, HBITMAP, HBRUSH, HDC, HFONT,
+    HGDIOBJ, OUT_TT_PRECIS, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE as CONTROLS_MOUSELEAVE;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, SetWindowTheme, DRAWITEMSTRUCT, EM_SETCUEBANNER, ICC_STANDARD_CLASSES,
-    INITCOMMONCONTROLSEX, ODS_FOCUS, ODS_SELECTED,
+    InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Control IDs
@@ -74,9 +86,6 @@ const WINDOW_HEIGHT: f32 = 680.0;
 const MIN_WINDOW_WIDTH: f32 = 780.0;
 const MIN_WINDOW_HEIGHT: f32 = 560.0;
 
-const BST_CHECKED: usize = 1;
-const BST_UNCHECKED: usize = 0;
-
 thread_local! {
     static DIALOG_STATE: RefCell<Option<DialogState>> = const { RefCell::new(None) };
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
@@ -101,6 +110,129 @@ struct DialogState {
     filter_always_muted: String,
 }
 
+/// One editable field: text plus a selection. `caret`/`anchor` are char indices, not
+/// bytes, so editing never splits a surrogate pair.
+#[derive(Clone, Default)]
+struct Field {
+    text: String,
+    caret: usize,
+    anchor: usize,
+}
+
+impl Field {
+    /// Selection as (start, end), caret-first order.
+    fn selection(&self) -> (usize, usize) {
+        (self.caret.min(self.anchor), self.caret.max(self.anchor))
+    }
+}
+
+#[derive(Clone, Default, PartialEq)]
+struct Row {
+    text: String,
+    /// PID in the detected list, 0 in the named lists: what the icon lookup keys on.
+    data: isize,
+}
+
+/// Scroll/selection of one list; `rows` is the whole content, `top` the first visible row.
+#[derive(Default)]
+struct ListView {
+    rows: Vec<Row>,
+    top: usize,
+    sel: Option<usize>,
+    hot: Option<usize>,
+}
+
+impl ListView {
+    fn selected_text(&self) -> Option<String> {
+        self.sel
+            .and_then(|i| self.rows.get(i))
+            .map(|r| r.text.clone())
+    }
+
+    /// Replace rows, keeping the selection when the same text survives; clamp scroll.
+    fn set_rows(&mut self, rows: Vec<Row>, visible: usize) {
+        let keep = self.selected_text();
+        self.rows = rows;
+        self.sel = keep.and_then(|t| self.rows.iter().position(|r| r.text == t));
+        self.hot = self.hot.filter(|i| *i < self.rows.len());
+        self.clamp(visible);
+    }
+
+    fn clamp(&mut self, visible: usize) {
+        let max_top = self.rows.len().saturating_sub(visible.max(1));
+        self.top = self.top.min(max_top);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Focus {
+    #[default]
+    None,
+    Field(i32),
+    List(i32),
+    Button(i32),
+    Toggle(i32),
+}
+
+thread_local! {
+    static FIELDS: RefCell<HashMap<i32, Field>> = RefCell::new(HashMap::new());
+    static LISTS: RefCell<HashMap<i32, ListView>> = RefCell::new(HashMap::new());
+    static TOGGLES: RefCell<HashMap<i32, bool>> = RefCell::new(HashMap::new());
+    // Hot control id, 0 = none; the hot row of a list lives in that list's `ListView`.
+    static HOT: Cell<i32> = const { Cell::new(0) };
+    // Button/toggle held down by the current mouse drag, 0 = none.
+    static PRESSED: Cell<i32> = const { Cell::new(0) };
+    static FOCUS: Cell<Focus> = const { Cell::new(Focus::None) };
+    static CARET_ON: Cell<bool> = const { Cell::new(false) };
+}
+
+fn with_field<R>(id: i32, f: impl FnOnce(&mut Field) -> R) -> R {
+    FIELDS.with(|fields| {
+        let mut fields = fields.borrow_mut();
+        f(fields.entry(id).or_default())
+    })
+}
+
+fn field_text(id: i32) -> String {
+    with_field(id, |f| f.text.clone())
+}
+
+/// Replace field text, caret at the end, selection collapsed.
+fn set_field(id: i32, text: String) {
+    with_field(id, |f| {
+        f.text = text;
+        f.caret = f.text.chars().count();
+        f.anchor = f.caret;
+    });
+}
+
+fn with_list<R>(id: i32, f: impl FnOnce(&mut ListView) -> R) -> R {
+    LISTS.with(|lists| {
+        let mut lists = lists.borrow_mut();
+        f(lists.entry(id).or_default())
+    })
+}
+
+fn list_sel(id: i32) -> Option<usize> {
+    with_list(id, |l| l.sel)
+}
+
+fn toggle(id: i32) -> bool {
+    TOGGLES.with(|t| t.borrow().get(&id).copied().unwrap_or(false))
+}
+
+fn set_toggle(id: i32, on: bool) {
+    TOGGLES.with(|t| t.borrow_mut().insert(id, on));
+}
+
+fn focus() -> Focus {
+    FOCUS.with(|f| f.get())
+}
+
+fn set_focus_value(focus: Focus) {
+    FOCUS.with(|f| f.set(focus));
+}
+
 /// GDI resources for one dialog; freed when it closes. Fonts and brushes live in the
 /// process-wide `SHARED`, so a reopen neither creates nor deletes any GDI object.
 struct Ui {
@@ -108,9 +240,6 @@ struct Ui {
     dip: Dip,
     font: HFONT,
     font_small: HFONT,
-    br_window: HBRUSH,
-    br_card: HBRUSH,
-    br_well: HBRUSH,
 }
 
 /// Process-wide fonts and brushes, keyed by the palette/DPI they were built for.
@@ -121,9 +250,6 @@ struct Shared {
     dark: bool,
     font: isize,
     font_small: isize,
-    br_window: isize,
-    br_card: isize,
-    br_well: isize,
 }
 
 static SHARED: OnceLock<Mutex<Shared>> = OnceLock::new();
@@ -146,9 +272,6 @@ impl Shared {
             dark: palette.dark,
             font: make_font(dip, 13.0, FW_NORMAL.0 as i32).0 as isize,
             font_small: make_font(dip, 11.0, FW_NORMAL.0 as i32).0 as isize,
-            br_window: CreateSolidBrush(COLORREF(palette.window)).0 as isize,
-            br_card: CreateSolidBrush(COLORREF(palette.card)).0 as isize,
-            br_well: CreateSolidBrush(COLORREF(palette.well)).0 as isize,
         }
     }
 }
@@ -163,9 +286,6 @@ impl Ui {
             dip,
             font: HFONT(shared.font as *mut c_void),
             font_small: HFONT(shared.font_small as *mut c_void),
-            br_window: HBRUSH(shared.br_window as *mut c_void),
-            br_card: HBRUSH(shared.br_card as *mut c_void),
-            br_well: HBRUSH(shared.br_well as *mut c_void),
         }
     }
 }
@@ -194,9 +314,8 @@ fn dip_of() -> Dip {
     with_ui(|u| u.dip).unwrap_or(Dip::from_dpi(96))
 }
 
-/// The dialog's UI font. Every child window is given this one (`create_controls` sends
-/// `WM_SETFONT`), and owner-drawn children that answer null from `WM_GETFONT` fall back
-/// to it, so the caption, the buttons and the list rows all draw in the same face.
+/// The dialog's UI font: the caption, the buttons, field text and list rows all draw in
+/// it, and `od_controls` picks it up when a control answers null from `WM_GETFONT`.
 pub fn ui_font() -> HFONT {
     with_ui(|u| u.font).unwrap_or(HFONT(std::ptr::null_mut()))
 }
@@ -232,10 +351,6 @@ fn init_common_controls() {
     }
 }
 
-unsafe fn get_dlg_item(hwnd: HWND, id: i32) -> HWND {
-    GetDlgItem(hwnd, id).unwrap_or_default()
-}
-
 /// Opens the settings dialog (blocks until closed)
 pub fn open_settings_dialog(
     config: Arc<RwLock<Config>>,
@@ -265,12 +380,12 @@ pub fn open_settings_dialog(
             return;
         };
 
+        // No IsDialogMessageW: with no children there is no dialog navigation to steal,
+        // and the window proc does Tab/Space/Enter itself.
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if !IsDialogMessageW(hwnd, &msg).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
             if !IsWindow(hwnd).as_bool() {
                 break;
             }
@@ -296,12 +411,13 @@ unsafe fn create_dialog_window() -> Option<HWND> {
     let class_name = to_wide(SETTINGS_CLASS);
     let hmodule = GetModuleHandleW(None).unwrap_or_default();
 
-    od_controls::register_classes(hmodule.into());
+    // Still registered: `od_controls` answers hover/font queries and pads its painter,
+    // and the classes are process-wide (an existing registration is harmless).
 
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        // CS_HREDRAW | CS_VREDRAW: a size change invalidates the whole class window, so
-        // a control that grew or shrank can never keep pixels from its previous size.
+        // CS_HREDRAW | CS_VREDRAW: a size change invalidates the whole window, so a frame
+        // can never keep pixels that belong to the previous size.
         style: WNDCLASS_STYLES(CS_HREDRAW.0 | CS_VREDRAW.0),
         lpfnWndProc: Some(window_proc),
         hInstance: hmodule.into(),
@@ -317,12 +433,11 @@ unsafe fn create_dialog_window() -> Option<HWND> {
     let title = to_wide(&format!("{} - Settings", crate::tray::APP_NAME));
 
     let hwnd = CreateWindowExW(
-        // WS_EX_COMPOSITED: the dialog + children paint into one off-screen buffer that
-        // flips as one frame, so a resize can never expose a half-moved control or stale
-        // band. WS_CLIPCHILDREN + WM_ERASEBKGND=1 remain, but only COMPOSITED makes the
-        // forced RDW_UPDATENOW in resize_controls land as a single complete frame.
+        // No WS_EX_COMPOSITED: with one window painting one complete frame per size
+        // message, DWM has nothing left to compose and the extra copy per frame is pure
+        // overhead. No WS_CLIPCHILDREN either: there are no children to clip.
         // No WS_EX_TOPMOST: the main window stays behind other apps like a normal window.
-        WS_EX_DLGMODALFRAME | WS_EX_COMPOSITED,
+        WS_EX_DLGMODALFRAME,
         PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
         WS_OVERLAPPED
@@ -331,8 +446,7 @@ unsafe fn create_dialog_window() -> Option<HWND> {
             | WS_VISIBLE
             | WS_THICKFRAME
             | WS_MINIMIZEBOX
-            | WS_MAXIMIZEBOX
-            | WS_CLIPCHILDREN,
+            | WS_MAXIMIZEBOX,
         x,
         y,
         width,
@@ -434,7 +548,8 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         });
     };
 
-    // Cards first, then their children: `create_controls` sinks every card below them.
+    // Cards first, then their children: the paint pass draws in this order, so a card
+    // never covers a control on top of it, and `hit_test` reverses it for the same reason.
     push(
         ID_GRP_DETECTED,
         Kind::Card,
@@ -709,624 +824,6 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
     out
 }
 
-unsafe fn create_controls(hwnd: HWND) {
-    let hmodule = GetModuleHandleW(None).unwrap_or_default();
-    let font = ui_font();
-    let p = current_palette();
-
-    let mut lists: Vec<HWND> = Vec::new();
-    let mut cards: Vec<HWND> = Vec::new();
-
-    for ctl in layout(hwnd) {
-        let (class, style) = match ctl.kind {
-            Kind::Card => (
-                od_controls::CLASS_CARD,
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-            ),
-            Kind::Toggle => (
-                od_controls::CLASS_TOGGLE,
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS,
-            ),
-            Kind::Button => (
-                "BUTTON",
-                WS_CHILD
-                    | WS_VISIBLE
-                    | WS_TABSTOP
-                    | WS_CLIPSIBLINGS
-                    | WINDOW_STYLE(BS_OWNERDRAW as u32),
-            ),
-            // WS_CLIPSIBLINGS on every child: without it a sibling that repaints
-            // during a resize paints over its neighbours (trails, torn borders).
-            Kind::Label => ("STATIC", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS),
-            Kind::Edit => (
-                "EDIT",
-                WS_CHILD
-                    | WS_VISIBLE
-                    | WS_TABSTOP
-                    | WS_CLIPSIBLINGS
-                    | WS_BORDER
-                    | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-            ),
-            Kind::List => (
-                "LISTBOX",
-                WS_CHILD
-                    | WS_VISIBLE
-                    | WS_TABSTOP
-                    | WS_CLIPSIBLINGS
-                    | WS_VSCROLL
-                    | WS_BORDER
-                    | WINDOW_STYLE((LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32),
-            ),
-        };
-
-        let card = ctl.kind == Kind::Card;
-        let mut style = style;
-        if ctl.id == ID_EDIT_POLL_INTERVAL {
-            style = WINDOW_STYLE(style.0 | ES_NUMBER as u32);
-        }
-
-        let class_w = to_wide(class);
-        let text_w = to_wide(&ctl.text);
-        let created = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            PCWSTR(class_w.as_ptr()),
-            PCWSTR(text_w.as_ptr()),
-            style,
-            ctl.rect.left,
-            ctl.rect.top,
-            ctl.rect.right - ctl.rect.left,
-            ctl.rect.bottom - ctl.rect.top,
-            hwnd,
-            HMENU(ctl.id as *mut c_void),
-            hmodule,
-            None,
-        );
-
-        if let Ok(ctl_hwnd) = created {
-            if card {
-                cards.push(ctl_hwnd);
-            }
-            set_font(ctl_hwnd, font);
-            match ctl.kind {
-                Kind::Button => od_controls::attach_hover(ctl_hwnd),
-                Kind::List => {
-                    lists.push(ctl_hwnd);
-                    attach_list_resize_repaint(ctl_hwnd);
-                    let _ = SendMessageW(
-                        ctl_hwnd,
-                        LB_SETITEMHEIGHT,
-                        WPARAM(0),
-                        LPARAM(dip_of().px(24.0) as isize),
-                    );
-                    let _ = SendMessageW(
-                        ctl_hwnd,
-                        LB_SETHORIZONTALEXTENT,
-                        WPARAM(dip_of().px(600.0) as usize),
-                        LPARAM(0),
-                    );
-                }
-                Kind::Toggle => {
-                    // The toggle draws its own background, so it needs no parent erase.
-                    let _ = InvalidateRect(ctl_hwnd, None, false);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // A card is created before the controls it backs and the newest sibling is topmost,
-    // so every card must end up below them or it swallows their clicks and focus.
-    for card in cards {
-        let _ = SetWindowPos(
-            card,
-            HWND_BOTTOM,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-    }
-
-    // Cue banners: a native EDIT draws them until the user types.
-    for (id, cue) in [
-        (ID_EDIT_SEARCH, "Filter by process name"),
-        (ID_EDIT_FILTER_EXCLUDED, "Filter exclusions"),
-        (ID_EDIT_FILTER_ALWAYS_MUTED, "Filter always muted"),
-    ] {
-        let edit = get_dlg_item(hwnd, id);
-        if !edit.0.is_null() {
-            let cue = to_wide(cue);
-            let _ = SendMessageW(
-                edit,
-                EM_SETCUEBANNER,
-                WPARAM(1),
-                LPARAM(cue.as_ptr() as isize),
-            );
-        }
-    }
-
-    // Dark scrollbars: documented uxtheme class name; ignored if unavailable.
-    if p.dark {
-        let dark = to_wide("DarkMode_Explorer");
-        for list in lists {
-            let _ = SetWindowTheme(list, PCWSTR(dark.as_ptr()), PCWSTR::null());
-        }
-    }
-}
-
-unsafe fn resize_controls(hwnd: HWND) {
-    let mut rc = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rc);
-    if rc.right < 100 || rc.bottom < 100 {
-        return; // minimized
-    }
-    // Live resize sends far more WM_SIZE than there are display frames; a repeated size
-    // must not re-run the batch or the invalidate.
-    let key = (hwnd.0 as isize, rc.left, rc.top, rc.right, rc.bottom);
-    if LAST_LAYOUT.with(|l| l.get()) == key {
-        return;
-    }
-    LAST_LAYOUT.with(|l| l.set(key));
-    let ctls = layout(hwnd);
-    // One deferred batch instead of a SetWindowPos per control: the move is applied in a
-    // single pass, so no frame shows half the controls at the old size and half at the new.
-    let mut batch = BeginDeferWindowPos(ctls.len() as i32).ok();
-    for ctl in &ctls {
-        let ctrl = get_dlg_item(hwnd, ctl.id);
-        if ctrl.0.is_null() {
-            continue;
-        }
-        let (x, y) = (ctl.rect.left, ctl.rect.top);
-        let (w, h) = (ctl.rect.right - ctl.rect.left, ctl.rect.bottom - ctl.rect.top);
-        let moved = match batch {
-            Some(hdwp) => match DeferWindowPos(
-                hdwp,
-                ctrl,
-                None,
-                x,
-                y,
-                w,
-                h,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            ) {
-                Ok(next) => {
-                    batch = Some(next);
-                    true
-                }
-                Err(_) => false,
-            },
-            None => false,
-        };
-        if !moved {
-            // The batch failed (out of memory): move this control directly and keep going.
-            batch = None;
-            let _ = SetWindowPos(ctrl, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    }
-    if let Some(hdwp) = batch {
-        let _ = EndDeferWindowPos(hdwp);
-    }
-    // Controls that grew keep stale pixels on the strip they just gained, and controls
-    // that moved leave their old pixels on the parent, so the final state must be painted
-    // before this WM_SIZE returns. RDW_UPDATENOW is affordable here *because* the batch
-    // above is one pass and the LAST_LAYOUT/CARD_MAP/icon caches keep the paint cheap;
-    // with COMPOSITED it ends each WM_SIZE on one complete buffer instead of leaving the
-    // previous geometry on screen.
-    let _ = RedrawWindow(
-        hwnd,
-        None,
-        None,
-        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-    );
-}
-
-unsafe fn set_font(hwnd: HWND, font: HFONT) {
-    SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-}
-
-// Per-list subclass ids, offset so they never collide with od_controls' hover id.
-const LIST_RESIZE_SUBCLASS_ID: usize = 0x100;
-
-/// A listbox clips its client to whole owner-draw rows, so after a resize the
-/// partial-row strip can keep pixels from the pre-resize layout. DefSubclassProc runs
-/// first so the new geometry exists, then the whole list is invalidated.
-unsafe extern "system" fn list_resize_subclass(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _id: usize,
-    _refdata: usize,
-) -> LRESULT {
-    let result = DefSubclassProc(hwnd, msg, wparam, lparam);
-    match msg {
-        WM_SIZE => {
-            let _ = InvalidateRect(hwnd, None, false);
-            result
-        }
-        WM_NCDESTROY => {
-            let _ = RemoveWindowSubclass(hwnd, Some(list_resize_subclass), LIST_RESIZE_SUBCLASS_ID);
-            result
-        }
-        _ => result,
-    }
-}
-
-unsafe fn attach_list_resize_repaint(hwnd: HWND) {
-    let _ = SetWindowSubclass(
-        hwnd,
-        Some(list_resize_subclass),
-        LIST_RESIZE_SUBCLASS_ID,
-        0,
-    );
-}
-
-/// Window background. A memory DC was measured at ~2.5 MB resident for the full
-/// client area, and WS_CLIPCHILDREN + WM_ERASEBKGND=1 already keeps child paints from
-/// flickering, so the flat fill is drawn straight to the window DC.
-unsafe fn paint(hwnd: HWND) {
-    let mut ps = PAINTSTRUCT::default();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    let mut rc = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rc);
-    if rc.right > 0 && rc.bottom > 0 {
-        FillRect(
-            hdc,
-            &ps.rcPaint,
-            HBRUSH(with_ui(|u| u.br_window).unwrap_or_default().0),
-        );
-    }
-    let _ = EndPaint(hwnd, &ps);
-}
-
-unsafe extern "system" fn window_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_CREATE => {
-            UI.with(|u| *u.borrow_mut() = Some(Ui::new(hwnd)));
-            with_ui(|u| apply_chrome(hwnd, u.palette.dark));
-            create_controls(hwnd);
-            refresh_detected_apps(hwnd);
-            load_settings_to_controls(hwnd);
-            LRESULT(0)
-        }
-        WM_SHOWWINDOW => {
-            if wparam.0 != 0 {
-                refresh_detected_apps(hwnd);
-            }
-            LRESULT(0)
-        }
-        WM_ACTIVATE => {
-            let state = (wparam.0 & 0xFFFF) as u32;
-            if state != WA_INACTIVE {
-                refresh_detected_apps(hwnd);
-            }
-            LRESULT(0)
-        }
-        WM_COMMAND => {
-            let control_id = (wparam.0 & 0xFFFF) as i32;
-            let notification = ((wparam.0 >> 16) & 0xFFFF) as u16;
-            handle_command(hwnd, control_id, notification);
-            LRESULT(0)
-        }
-        WM_SIZE => {
-            resize_controls(hwnd);
-            LRESULT(0)
-        }
-        WM_DPICHANGED => {
-            let new_dpi = (wparam.0 & 0xFFFF) as u32;
-            if let Some(suggested) = (lparam.0 as *const RECT).as_ref() {
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    suggested.left,
-                    suggested.top,
-                    suggested.right - suggested.left,
-                    suggested.bottom - suggested.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-            reinit_for_dpi(hwnd, new_dpi);
-            LRESULT(0)
-        }
-        WM_ERASEBKGND => LRESULT(1), // fully painted in WM_PAINT
-        WM_PAINT => {
-            paint(hwnd);
-            LRESULT(0)
-        }
-        WM_CTLCOLORSTATIC => {
-            let p = current_palette();
-            let hdc = HDC(wparam.0 as *mut c_void);
-            SetTextColor(hdc, COLORREF(p.text));
-            SetBkMode(hdc, TRANSPARENT);
-            // Only labels inside a card own the card colour; the rest sit on the window.
-            let brush = if card_of(hwnd, GetDlgCtrlID(HWND(lparam.0 as *mut c_void))).is_some() {
-                with_ui(|u| u.br_card)
-            } else {
-                with_ui(|u| u.br_window)
-            };
-            LRESULT(brush.unwrap_or_default().0 as isize)
-        }
-        WM_CTLCOLOREDIT => {
-            let p = current_palette();
-            let hdc = HDC(wparam.0 as *mut c_void);
-            SetTextColor(hdc, COLORREF(p.text));
-            SetBkColor(hdc, COLORREF(p.well));
-            LRESULT(with_ui(|u| u.br_well).unwrap_or_default().0 as isize)
-        }
-
-        WM_CTLCOLORLISTBOX => {
-            let p = current_palette();
-            SetBkColor(HDC(wparam.0 as *mut c_void), COLORREF(p.well));
-            LRESULT(with_ui(|u| u.br_well).unwrap_or_default().0 as isize)
-        }
-        WM_DRAWITEM => {
-            draw_item(lparam);
-            LRESULT(1)
-        }
-        WM_GETMINMAXINFO => {
-            let mmi = lparam.0 as *mut MINMAXINFO;
-            if !mmi.is_null() {
-                let dip = dip_of();
-                (*mmi).ptMinTrackSize.x = dip.px(MIN_WINDOW_WIDTH);
-                (*mmi).ptMinTrackSize.y = dip.px(MIN_WINDOW_HEIGHT);
-            }
-            LRESULT(0)
-        }
-        WM_CLOSE => {
-            let _ = DestroyWindow(hwnd);
-            LRESULT(0)
-        }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            LRESULT(0)
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
-    with_ui_mut(|ui| {
-        let dip = Dip::from_dpi(dpi);
-        let shared = Shared::get(dip.dpi, &ui.palette);
-        ui.dip = dip;
-        ui.font = HFONT(shared.font as *mut c_void);
-        ui.font_small = HFONT(shared.font_small as *mut c_void);
-    });
-    let font = ui_font();
-    for ctl in layout(hwnd) {
-        let ctrl = get_dlg_item(hwnd, ctl.id);
-        if !ctrl.0.is_null() {
-            set_font(ctrl, font);
-            if ctl.kind == Kind::List {
-                let _ = SendMessageW(
-                    ctrl,
-                    LB_SETITEMHEIGHT,
-                    WPARAM(0),
-                    LPARAM(dip_of().px(24.0) as isize),
-                );
-            }
-        }
-    }
-    resize_controls(hwnd);
-}
-
-unsafe fn draw_item_bg(hdc: HDC, rc: RECT) {
-    let p = current_palette();
-    od_controls::fill(hdc, &rc, p.well);
-}
-
-unsafe fn draw_item(lparam: LPARAM) {
-    let dis = lparam.0 as *const DRAWITEMSTRUCT;
-    let Some(dis) = dis.as_ref() else { return };
-    if dis.CtlID == 0 {
-        return;
-    }
-    match dis.CtlID as i32 {
-        ID_LIST_DETECTED | ID_LIST_EXCLUDED | ID_LIST_ALWAYS_MUTED => draw_list_item(dis),
-        _ => draw_button(dis),
-    }
-}
-
-/// Card that holds control `id`, according to `layout()` for the current client rect.
-/// A control's backdrop must come from the layout, never from the rect it currently
-/// occupies: during a live resize the window rects lag the layout, so a rect- or
-/// pixel-based answer flips a button between the card and the window colour mid-drag.
-/// The map is derived from `layout()` (never a second copy of the grid) and rebuilt only
-/// when the client rect changes, so a paint costs one map lookup and one GetClientRect.
-fn card_of(parent: HWND, id: i32) -> Option<RECT> {
-    let mut rc = RECT::default();
-    unsafe {
-        let _ = GetClientRect(parent, &mut rc);
-    }
-    let key = (parent.0 as isize, rc.left, rc.top, rc.right, rc.bottom);
-    CARD_MAP.with(|c| {
-        if c.borrow().0 != key {
-            let ctls = layout(parent);
-            let cards: Vec<RECT> = ctls
-                .iter()
-                .filter(|x| x.kind == Kind::Card)
-                .map(|x| x.rect)
-                .collect();
-            let map: Vec<(i32, Option<RECT>)> = ctls
-                .iter()
-                .map(|x| {
-                    let cx = (x.rect.left + x.rect.right) / 2;
-                    let cy = (x.rect.top + x.rect.bottom) / 2;
-                    let hit = cards
-                        .iter()
-                        .copied()
-                        .find(|r| cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom);
-                    (x.id, hit)
-                })
-                .collect();
-            *c.borrow_mut() = (key, map);
-        }
-        c.borrow()
-            .1
-            .iter()
-            .find(|(cid, _)| *cid == id)
-            .and_then(|(_, r)| *r)
-    })
-}
-
-/// Background surface behind control `id`: the card that holds it, else the window.
-fn surface_under(parent: HWND, id: i32) -> u32 {
-    let p = current_palette();
-    if card_of(parent, id).is_some() {
-        p.card
-    } else {
-        p.window
-    }
-}
-
-unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
-    let p = current_palette();
-    let dip = dip_of();
-    let s = |v: f32| dip.px(v);
-    let rc = dis.rcItem;
-    let label = od_controls::window_text(dis.hwndItem);
-    let primary = dis.CtlID as i32 == ID_BTN_SAVE_CLOSE;
-    let hot = od_controls::is_hot(dis.hwndItem);
-    let pressed = (dis.itemState.0 & ODS_SELECTED.0) != 0;
-    let focused = (dis.itemState.0 & ODS_FOCUS.0) != 0 || GetFocus() == dis.hwndItem;
-    let small = with_ui(|u| u.font_small).unwrap_or(HFONT(std::ptr::null_mut()));
-
-    let parent = GetParent(dis.hwndItem).unwrap_or_default();
-    od_controls::fill(dis.hDC, &rc, surface_under(parent, dis.CtlID as i32));
-
-    let (fill, fg, border) = if primary {
-        let f = if pressed {
-            od_controls::mix(p.accent, 0x000000, 0.25)
-        } else if hot {
-            od_controls::mix(p.accent, p.text, 0.12)
-        } else {
-            p.accent
-        };
-        (f, p.on_accent, None)
-    } else {
-        let f = if pressed {
-            p.pressed
-        } else if hot {
-            p.hover
-        } else {
-            p.card
-        };
-        (f, p.text, Some(if focused { p.accent } else { p.hairline }))
-    };
-
-    let inner = RECT {
-        left: rc.left + s(2.0),
-        top: rc.top + s(3.0),
-        right: rc.right - s(2.0),
-        bottom: rc.bottom - s(3.0),
-    };
-    od_controls::round(dis.hDC, &inner, s(6.0), fill, border);
-    od_controls::text(
-        dis.hDC,
-        &inner,
-        &label,
-        small,
-        fg,
-        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS,
-    );
-}
-
-unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
-    // itemID is u32: the (UINT)-1 empty-row sentinel arrives as u32::MAX.
-    if dis.itemID == u32::MAX {
-        // LB_SETITEMHEIGHT / empty list: paint the empty row so the well keeps its color.
-        draw_item_bg(dis.hDC, dis.rcItem);
-        return;
-    }
-    let p = current_palette();
-    let dip = dip_of();
-    let s = |v: f32| dip.px(v);
-    let rc = dis.rcItem;
-    let selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
-    let focused = selected && ((dis.itemState.0 & ODS_FOCUS.0) != 0 || GetFocus() == dis.hwndItem);
-
-    let bg = if selected {
-        od_controls::mix(p.well, p.accent, 0.30)
-    } else if od_controls::hot_item(dis.hwndItem) == dis.itemID as isize {
-        p.hover
-    } else {
-        p.well
-    };
-    od_controls::fill(dis.hDC, &rc, bg);
-    if focused {
-        od_controls::round(dis.hDC, &rc, s(4.0), bg, Some(p.accent));
-    }
-
-    let len = SendMessageW(
-        dis.hwndItem,
-        LB_GETTEXTLEN,
-        WPARAM(dis.itemID as usize),
-        LPARAM(0),
-    )
-    .0 as usize;
-    if len == 0 {
-        return;
-    }
-    let mut buf: Vec<u16> = vec![0; len + 1];
-    SendMessageW(
-        dis.hwndItem,
-        LB_GETTEXT,
-        WPARAM(dis.itemID as usize),
-        LPARAM(buf.as_mut_ptr() as isize),
-    );
-    let text = String::from_utf16_lossy(&buf[..len]);
-
-    let icon_size = s(16.0);
-    let pid = SendMessageW(
-        dis.hwndItem,
-        LB_GETITEMDATA,
-        WPARAM(dis.itemID as usize),
-        LPARAM(0),
-    )
-    .0;
-    let icon = row_icon(pid.max(0) as u32, &text);
-
-    let text_left;
-    if let Some(icon) = icon {
-        let y = rc.top + ((rc.bottom - rc.top) - icon_size) / 2;
-        let _ = DrawIconEx(
-            dis.hDC,
-            rc.left + s(6.0),
-            y,
-            icon,
-            icon_size,
-            icon_size,
-            0,
-            HBRUSH::default(),
-            DI_NORMAL,
-        );
-        text_left = rc.left + s(6.0) + icon_size + s(8.0);
-    } else {
-        text_left = rc.left + s(8.0);
-    }
-
-    let text_rc = RECT {
-        left: text_left,
-        top: rc.top,
-        right: rc.right - s(4.0),
-        bottom: rc.bottom,
-    };
-    od_controls::text(
-        dis.hDC,
-        &text_rc,
-        &text,
-        ui_font(),
-        p.text,
-        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
-    );
-}
-
 /// Small icons keyed by exe path, process-wide: extracted once per path and kept until
 /// exit, so reopening the dialog costs no shell work at all.
 /// Icons are handles, not pointers we dereference: kept as `isize` so the cache is `Send`.
@@ -1428,6 +925,686 @@ unsafe fn process_image_path(pid: u32) -> Option<String> {
     let _ = windows::Win32::Foundation::CloseHandle(process);
     (ok && size > 0).then(|| String::from_utf16_lossy(&buf[..size as usize]))
 }
+// ------------------------------------------------------------------- painting
+
+thread_local! {
+    // One off-screen surface per window, rebuilt only when the client size changes.
+    static BACK: RefCell<HashMap<isize, (HDC, HBITMAP, i32, i32)>> = RefCell::new(HashMap::new());
+}
+
+/// Memory DC for `hwnd` sized to the client area, created once per size.
+unsafe fn back_buffer(hwnd: HWND, w: i32, h: i32) -> Option<HDC> {
+    BACK.with(|back| {
+        let mut back = back.borrow_mut();
+        let key = hwnd.0 as isize;
+        if let Some((dc, _, bw, bh)) = back.get(&key) {
+            if *bw == w && *bh == h {
+                return Some(*dc);
+            }
+        }
+        if let Some((dc, bmp, _, _)) = back.remove(&key) {
+            // DC first: destroying it deselects the bitmap, which is what makes deleting
+            // the bitmap legal.
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(bmp);
+        }
+        let window_dc = GetDC(hwnd);
+        let dc = CreateCompatibleDC(window_dc);
+        let bmp = CreateCompatibleBitmap(window_dc, w, h);
+        let _ = ReleaseDC(hwnd, window_dc);
+        if dc.0.is_null() || bmp.0.is_null() {
+            if !dc.0.is_null() {
+                let _ = DeleteDC(dc);
+            }
+            if !bmp.0.is_null() {
+                let _ = DeleteObject(bmp);
+            }
+            return None;
+        }
+        SelectObject(dc, bmp);
+        back.insert(key, (dc, bmp, w, h));
+        Some(dc)
+    })
+}
+
+unsafe fn free_back_buffer(hwnd: HWND) {
+    BACK.with(|back| {
+        if let Some((dc, bmp, _, _)) = back.borrow_mut().remove(&(hwnd.0 as isize)) {
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(bmp);
+        }
+    });
+}
+
+/// One complete frame: every pixel is written to a memory DC, then blitted once.
+/// Nothing is drawn straight to the window DC unless the buffer could not be created.
+unsafe fn paint(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    if w > 0 && h > 0 {
+        let source = match back_buffer(hwnd, w, h) {
+            Some(mem) => {
+                paint_frame(hwnd, mem, &rc);
+                mem
+            }
+            None => hdc,
+        };
+        let _ = BitBlt(hdc, 0, 0, w, h, source, 0, 0, SRCCOPY);
+    }
+    let _ = EndPaint(hwnd, &ps);
+}
+
+/// Invalidates and completes the frame before returning: one WM_SIZE, one blit, no
+/// half-painted state left on screen for the next message to expose.
+unsafe fn repaint(hwnd: HWND) {
+    let _ = InvalidateRect(hwnd, None, true);
+    let _ = UpdateWindow(hwnd);
+}
+
+unsafe fn paint_frame(hwnd: HWND, hdc: HDC, rc: &RECT) {
+    let p = current_palette();
+    let dip = dip_of();
+    od_controls::fill(hdc, rc, p.window);
+    let window_focused = GetFocus() == hwnd;
+    // Cards come first in `layout()`, so their children paint over them.
+    for ctl in layout(hwnd) {
+        match ctl.kind {
+            Kind::Card => draw_card(hdc, &ctl, &p, dip),
+            Kind::Label => od_controls::text(
+                hdc,
+                &ctl.rect,
+                &ctl.text,
+                ui_font(),
+                p.text,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
+            ),
+            Kind::Button => draw_button(hwnd, hdc, &ctl, &p, dip, window_focused),
+            Kind::Toggle => draw_toggle(hwnd, hdc, &ctl, &p, dip, window_focused),
+            Kind::Edit => draw_field(hdc, &ctl, &p, dip, window_focused),
+            Kind::List => draw_list(hdc, &ctl, &p, dip, window_focused),
+        }
+    }
+}
+
+fn inset(rc: RECT, dx: i32, dy: i32) -> RECT {
+    RECT {
+        left: rc.left + dx,
+        top: rc.top + dy,
+        right: rc.right - dx,
+        bottom: rc.bottom - dy,
+    }
+}
+
+unsafe fn draw_card(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip) {
+    let rc = inset(ctl.rect, dip.px(1.0), dip.px(1.0));
+    od_controls::round(hdc, &rc, dip.px(8.0), p.card, Some(p.hairline));
+    if !ctl.text.is_empty() {
+        let caption = RECT {
+            left: rc.left + dip.px(12.0),
+            right: rc.right - dip.px(12.0),
+            top: rc.top + dip.px(6.0),
+            bottom: rc.top + dip.px(6.0) + dip.px(20.0),
+        };
+        od_controls::text(
+            hdc,
+            &caption,
+            &ctl.text,
+            ui_font(),
+            p.secondary,
+            DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS,
+        );
+    }
+}
+
+/// Card that holds control `id`, according to `layout()` for the current client rect.
+/// A control's backdrop must come from the layout, never from the rect it currently
+/// occupies: during a live resize the window rects lag the layout, so a rect- or
+/// pixel-based answer flips a button between the card and the window colour mid-drag.
+/// The map is derived from `layout()` (never a second copy of the grid) and rebuilt only
+/// when the client rect changes, so a paint costs one map lookup and one GetClientRect.
+fn card_of(parent: HWND, id: i32) -> Option<RECT> {
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(parent, &mut rc);
+    }
+    let key = (parent.0 as isize, rc.left, rc.top, rc.right, rc.bottom);
+    CARD_MAP.with(|c| {
+        if c.borrow().0 != key {
+            let ctls = layout(parent);
+            let cards: Vec<RECT> = ctls
+                .iter()
+                .filter(|x| x.kind == Kind::Card)
+                .map(|x| x.rect)
+                .collect();
+            let map: Vec<(i32, Option<RECT>)> =
+                ctls.iter()
+                    .map(|x| {
+                        let cx = (x.rect.left + x.rect.right) / 2;
+                        let cy = (x.rect.top + x.rect.bottom) / 2;
+                        let hit = cards.iter().copied().find(|r| {
+                            cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom
+                        });
+                        (x.id, hit)
+                    })
+                    .collect();
+            *c.borrow_mut() = (key, map);
+        }
+        c.borrow()
+            .1
+            .iter()
+            .find(|(cid, _)| *cid == id)
+            .and_then(|(_, r)| *r)
+    })
+}
+
+/// Background surface behind control `id`: the card that holds it, else the window.
+fn surface_under(parent: HWND, id: i32) -> u32 {
+    let p = current_palette();
+    if card_of(parent, id).is_some() {
+        p.card
+    } else {
+        p.window
+    }
+}
+
+unsafe fn draw_button(
+    hwnd: HWND,
+    hdc: HDC,
+    ctl: &Ctl,
+    p: &Palette,
+    dip: Dip,
+    window_focused: bool,
+) {
+    let s = |v: f32| dip.px(v);
+    let rc = ctl.rect;
+    let id = ctl.id;
+    let primary = id == ID_BTN_SAVE_CLOSE;
+    let hot = HOT.with(|h| h.get()) == id;
+    let pressed = PRESSED.with(|p| p.get()) == id;
+    let focused = window_focused && matches!(focus(), Focus::Button(f) if f == id);
+    let small = with_ui(|u| u.font_small).unwrap_or(HFONT(std::ptr::null_mut()));
+
+    od_controls::fill(hdc, &rc, surface_under(hwnd, id));
+
+    let (fill, fg, border) = if primary {
+        let f = if pressed {
+            od_controls::mix(p.accent, 0x000000, 0.25)
+        } else if hot {
+            od_controls::mix(p.accent, p.text, 0.12)
+        } else {
+            p.accent
+        };
+        (f, p.on_accent, None)
+    } else {
+        let f = if pressed {
+            p.pressed
+        } else if hot {
+            p.hover
+        } else {
+            p.card
+        };
+        (f, p.text, Some(if focused { p.accent } else { p.hairline }))
+    };
+
+    let inner = RECT {
+        left: rc.left + s(2.0),
+        top: rc.top + s(3.0),
+        right: rc.right - s(2.0),
+        bottom: rc.bottom - s(3.0),
+    };
+    od_controls::round(hdc, &inner, s(6.0), fill, border);
+    od_controls::text(
+        hdc,
+        &inner,
+        &ctl.text,
+        small,
+        fg,
+        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS,
+    );
+}
+
+unsafe fn draw_toggle(
+    hwnd: HWND,
+    hdc: HDC,
+    ctl: &Ctl,
+    p: &Palette,
+    dip: Dip,
+    window_focused: bool,
+) {
+    let rc = ctl.rect;
+    let on = toggle(ctl.id);
+    let hot = HOT.with(|h| h.get()) == ctl.id;
+    let pressed = PRESSED.with(|p| p.get()) == ctl.id;
+    let focused = window_focused && matches!(focus(), Focus::Toggle(f) if f == ctl.id);
+    // Toggles sit on the settings card.
+    od_controls::fill(hdc, &rc, surface_under(hwnd, ctl.id));
+
+    let pill_h = dip.px(18.0);
+    let pill = RECT {
+        left: rc.left + dip.px(1.0),
+        top: (rc.bottom - pill_h) / 2,
+        right: rc.left + dip.px(1.0) + dip.px(36.0),
+        bottom: (rc.bottom - pill_h) / 2 + pill_h,
+    };
+    let track = if on {
+        if pressed {
+            od_controls::mix(p.accent, p.text, 0.25)
+        } else if hot {
+            od_controls::mix(p.accent, p.text, 0.12)
+        } else {
+            p.accent
+        }
+    } else if pressed {
+        p.pressed
+    } else if hot {
+        p.hover
+    } else {
+        p.well
+    };
+    od_controls::round(hdc, &pill, pill_h / 2, track, (!on).then_some(p.hairline));
+
+    let knob_d = pill_h - dip.px(4.0);
+    let knob_x = if on {
+        pill.right - dip.px(2.0) - knob_d
+    } else {
+        pill.left + dip.px(2.0)
+    };
+    od_controls::dot(
+        hdc,
+        &RECT {
+            left: knob_x,
+            top: pill.top + dip.px(2.0),
+            right: knob_x + knob_d,
+            bottom: pill.top + dip.px(2.0) + knob_d,
+        },
+        if on { p.on_accent } else { p.secondary },
+    );
+
+    if focused {
+        od_controls::stroke(
+            hdc,
+            &RECT {
+                left: pill.left - dip.px(2.0),
+                top: pill.top - dip.px(2.0),
+                right: pill.right + dip.px(2.0),
+                bottom: pill.bottom + dip.px(2.0),
+            },
+            pill_h / 2 + dip.px(2.0),
+            p.accent,
+        );
+    }
+
+    if !ctl.text.is_empty() {
+        od_controls::text(
+            hdc,
+            &RECT {
+                left: pill.right + dip.px(10.0),
+                right: rc.right,
+                ..rc
+            },
+            &ctl.text,
+            ui_font(),
+            p.text,
+            DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS,
+        );
+    }
+}
+
+/// Cue shown while a field is empty and unfocused, as the native EDIT's cue banner did.
+fn cue_text(id: i32) -> &'static str {
+    match id {
+        ID_EDIT_SEARCH => "Filter by process name",
+        ID_EDIT_FILTER_EXCLUDED => "Filter exclusions",
+        ID_EDIT_FILTER_ALWAYS_MUTED => "Filter always muted",
+        _ => "",
+    }
+}
+
+unsafe fn text_width(hdc: HDC, s: &str, font: HFONT) -> i32 {
+    let wide: Vec<u16> = s.encode_utf16().collect();
+    if wide.is_empty() {
+        return 0;
+    }
+    let old = SelectObject(hdc, HGDIOBJ(font.0));
+    let mut size = SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+    SelectObject(hdc, old);
+    size.cx
+}
+
+/// Horizontal scroll of a field: 0 unless the caret would leave the text area.
+fn field_scroll(inner: &RECT, caret_rel: i32) -> i32 {
+    let width = inner.right - inner.left;
+    (caret_rel + 2 - width).max(0)
+}
+
+/// Where the caret sits and how far the text is scrolled, in client coordinates.
+/// Paint and SetCaretPos share this, so the drawn caret can never disagree with the
+/// measured text.
+unsafe fn field_caret(hwnd: HWND, ctl: &Ctl) -> (i32, i32) {
+    let dip = dip_of();
+    let inner = inset(ctl.rect, dip.px(6.0), dip.px(2.0));
+    let hdc = GetDC(hwnd);
+    let font = ui_font();
+    let (scroll, x) = with_field(ctl.id, |f| {
+        let prefix: String = f.text.chars().take(f.caret).collect();
+        let rel = text_width(hdc, &prefix, font);
+        (field_scroll(&inner, rel), inner.left + rel)
+    });
+    let _ = ReleaseDC(hwnd, hdc);
+    (x - scroll, inner.top)
+}
+
+unsafe fn draw_field(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip, window_focused: bool) {
+    let focused = window_focused && matches!(focus(), Focus::Field(f) if f == ctl.id);
+    od_controls::round(
+        hdc,
+        &ctl.rect,
+        dip.px(4.0),
+        p.well,
+        Some(if focused { p.accent } else { p.hairline }),
+    );
+    let inner = inset(ctl.rect, dip.px(6.0), dip.px(2.0));
+    let font = ui_font();
+    let (text, selection) = with_field(ctl.id, |f| (f.text.clone(), f.selection()));
+    if text.is_empty() {
+        let cue = cue_text(ctl.id);
+        if !focused && !cue.is_empty() {
+            od_controls::text(
+                hdc,
+                &inner,
+                cue,
+                font,
+                p.secondary,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS,
+            );
+        }
+        return;
+    }
+
+    let scroll = with_field(ctl.id, |f| {
+        let prefix: String = f.text.chars().take(f.caret).collect();
+        field_scroll(&inner, text_width(hdc, &prefix, font))
+    });
+    let saved = SaveDC(hdc);
+    let _ = IntersectClipRect(hdc, inner.left, inner.top, inner.right, inner.bottom);
+    if selection.0 != selection.1 {
+        let at = |idx: usize| {
+            let prefix: String = text.chars().take(idx).collect();
+            inner.left + text_width(hdc, &prefix, font) - scroll
+        };
+        let (a, b) = (at(selection.0), at(selection.1));
+        let band = RECT {
+            left: a.max(inner.left),
+            top: inner.top,
+            right: b.min(inner.right),
+            bottom: inner.bottom,
+        };
+        if band.right > band.left {
+            od_controls::fill(hdc, &band, od_controls::mix(p.well, p.accent, 0.30));
+        }
+    }
+    od_controls::text(
+        hdc,
+        &RECT {
+            left: inner.left - scroll,
+            ..inner
+        },
+        &text,
+        font,
+        p.text,
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
+    );
+    let _ = RestoreDC(hdc, saved);
+}
+
+fn row_height() -> i32 {
+    dip_of().px(24.0)
+}
+
+/// Rows that fit in a list rect; a list always reports at least one.
+fn visible_rows(rc: RECT) -> usize {
+    ((rc.bottom - rc.top).max(0) / row_height()).max(1) as usize
+}
+
+/// Custom scrollbar band width, reserved inside the list rect when rows overflow.
+fn scrollbar_width() -> i32 {
+    dip_of().px(10.0)
+}
+
+unsafe fn draw_list(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip, window_focused: bool) {
+    let rc = ctl.rect;
+    od_controls::fill(hdc, &rc, p.well);
+    let visible = visible_rows(rc);
+    let rh = row_height();
+    let focused = window_focused && matches!(focus(), Focus::List(l) if l == ctl.id);
+    let saved = SaveDC(hdc);
+    let _ = IntersectClipRect(hdc, rc.left, rc.top, rc.right, rc.bottom);
+
+    LISTS.with(|lists| {
+        let lists = lists.borrow();
+        let Some(lv) = lists.get(&ctl.id) else { return };
+        let overflow = lv.rows.len() > visible;
+        let right = if overflow {
+            rc.right - scrollbar_width()
+        } else {
+            rc.right
+        };
+        for idx in lv.top..(lv.top + visible).min(lv.rows.len()) {
+            let row = &lv.rows[idx];
+            let row_rc = RECT {
+                left: rc.left,
+                top: rc.top + (idx - lv.top) as i32 * rh,
+                right,
+                bottom: rc.top + (idx - lv.top + 1) as i32 * rh,
+            };
+            let selected = lv.sel == Some(idx);
+            let bg = if selected {
+                od_controls::mix(p.well, p.accent, 0.30)
+            } else if lv.hot == Some(idx) {
+                p.hover
+            } else {
+                p.well
+            };
+            od_controls::fill(hdc, &row_rc, bg);
+            if selected && focused {
+                od_controls::round(hdc, &row_rc, dip.px(4.0), bg, Some(p.accent));
+            }
+
+            let icon_size = dip.px(16.0);
+            let icon = row_icon(row.data.max(0) as u32, &row.text);
+            let text_left = match icon {
+                Some(icon) => {
+                    let y = row_rc.top + ((row_rc.bottom - row_rc.top) - icon_size) / 2;
+                    let _ = DrawIconEx(
+                        hdc,
+                        row_rc.left + dip.px(6.0),
+                        y,
+                        icon,
+                        icon_size,
+                        icon_size,
+                        0,
+                        HBRUSH::default(),
+                        DI_NORMAL,
+                    );
+                    row_rc.left + dip.px(6.0) + icon_size + dip.px(8.0)
+                }
+                None => row_rc.left + dip.px(8.0),
+            };
+            od_controls::text(
+                hdc,
+                &RECT {
+                    left: text_left,
+                    right: row_rc.right - dip.px(4.0),
+                    ..row_rc
+                },
+                &row.text,
+                ui_font(),
+                p.text,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        }
+
+        if overflow {
+            let track = RECT {
+                left: rc.right - scrollbar_width(),
+                top: rc.top + dip.px(2.0),
+                right: rc.right - dip.px(2.0),
+                bottom: rc.bottom - dip.px(2.0),
+            };
+            od_controls::fill(hdc, &track, p.hairline);
+            let track_h = (track.bottom - track.top).max(1);
+            let thumb_h = ((visible as f32 / lv.rows.len() as f32) * track_h as f32)
+                .max(dip.px(12.0) as f32) as i32;
+            let max_top = lv.rows.len().saturating_sub(visible);
+            let offset = if max_top == 0 {
+                0
+            } else {
+                (track_h - thumb_h) * lv.top as i32 / max_top as i32
+            };
+            od_controls::fill(
+                hdc,
+                &RECT {
+                    top: track.top + offset,
+                    bottom: track.top + offset + thumb_h,
+                    ..track
+                },
+                p.secondary,
+            );
+        }
+    });
+    let _ = RestoreDC(hdc, saved);
+}
+
+// ----------------------------------------------------------------- interaction
+
+/// Topmost control at client point (x, y), 0 when the point hits the bare window.
+/// Cards are the first entries in `layout()`, so reverse iteration makes them the
+/// last-resort match: a card never swallows a click meant for something on top of it.
+fn hit_test(ctls: &[Ctl], x: i32, y: i32) -> i32 {
+    ctls.iter()
+        .rev()
+        .find(|c| {
+            c.kind != Kind::Card
+                && x >= c.rect.left
+                && x < c.rect.right
+                && y >= c.rect.top
+                && y < c.rect.bottom
+        })
+        .map_or(0, |c| c.id)
+}
+
+fn point_of(lparam: LPARAM) -> (i32, i32) {
+    let x = (lparam.0 & 0xFFFF) as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+    (x, y)
+}
+
+fn ctl_of(hwnd: HWND, id: i32) -> Option<Ctl> {
+    layout(hwnd).into_iter().find(|c| c.id == id)
+}
+
+fn kind_of(hwnd: HWND, id: i32) -> Option<Kind> {
+    ctl_of(hwnd, id).map(|c| c.kind)
+}
+
+/// Row index under a client point in a list, or None outside the rows.
+fn row_at(rc: RECT, y: i32, top: usize, rows: usize) -> Option<usize> {
+    if y < rc.top || y >= rc.bottom {
+        return None;
+    }
+    let idx = top + ((y - rc.top) / row_height()) as usize;
+    (idx < rows).then_some(idx)
+}
+
+/// Scroll so row `idx` is on screen; `visible` rows fit.
+fn reveal(id: i32, idx: usize, visible: usize) {
+    with_list(id, |l| {
+        if idx < l.top {
+            l.top = idx;
+        } else if idx >= l.top + visible {
+            l.top = idx + 1 - visible;
+        }
+        l.clamp(visible);
+    });
+}
+
+fn select_row(hwnd: HWND, id: i32, idx: usize) {
+    let Some(ctl) = ctl_of(hwnd, id) else { return };
+    let visible = visible_rows(ctl.rect);
+    with_list(id, |l| l.sel = Some(idx));
+    reveal(id, idx, visible);
+}
+
+/// Field caret from a client x: nearest char boundary, measured through the same
+/// horizontal scroll the paint uses.
+unsafe fn caret_from_x(hwnd: HWND, ctl: &Ctl, x: i32) -> usize {
+    let dip = dip_of();
+    let inner = inset(ctl.rect, dip.px(6.0), dip.px(2.0));
+    let (text, caret) = with_field(ctl.id, |f| (f.text.clone(), f.caret));
+    let prefix_len = caret;
+    let font = ui_font();
+    let hdc = GetDC(hwnd);
+    let prefix: String = text.chars().take(prefix_len).collect();
+    let scroll = field_scroll(&inner, text_width(hdc, &prefix, font));
+    let target = x - inner.left + scroll;
+    let count = text.chars().count();
+    let mut best = count;
+    let mut prev = 0;
+    for idx in 0..=count {
+        let head: String = text.chars().take(idx).collect();
+        let at = text_width(hdc, &head, font);
+        if at >= target {
+            best = if at - target <= (target - prev) {
+                idx
+            } else {
+                idx.saturating_sub(1)
+            };
+            break;
+        }
+        prev = at;
+    }
+    let _ = ReleaseDC(hwnd, hdc);
+    best.min(count)
+}
+
+/// Caret bar: created once per focused field, sized to the DIP line height.
+unsafe fn update_caret(hwnd: HWND) {
+    let Focus::Field(id) = focus() else {
+        hide_caret(hwnd);
+        return;
+    };
+    let Some(ctl) = ctl_of(hwnd, id) else {
+        hide_caret(hwnd);
+        return;
+    };
+    let dip = dip_of();
+    let line = (ctl.rect.bottom - ctl.rect.top - dip.px(4.0)).max(1);
+    if !CARET_ON.with(|c| c.get()) {
+        let _ = CreateCaret(hwnd, HBITMAP::default(), dip.px(1.0).max(1), line);
+        CARET_ON.with(|c| c.set(true));
+    }
+    let (x, top) = field_caret(hwnd, &ctl);
+    let _ = SetCaretPos(x, top);
+    let _ = ShowCaret(hwnd);
+}
+
+unsafe fn hide_caret(hwnd: HWND) {
+    let _ = HideCaret(hwnd);
+    // DestroyCaret is thread-global, so the flag, not the window, decides.
+    if CARET_ON.with(|c| c.replace(false)) {
+        let _ = DestroyCaret();
+    }
+}
+
+/// Focus moved: repaint the rings and move (or drop) the caret in one step.
+unsafe fn refocus(hwnd: HWND) {
+    repaint(hwnd);
+    update_caret(hwnd);
+}
 
 /// Exe path for a process named `name` that is no longer running (it was excluded or
 /// always-muted earlier). One toolhelp snapshot per miss, cached per name.
@@ -1465,7 +1642,7 @@ unsafe fn path_for_name(name: &str) -> Option<String> {
         let _ = windows::Win32::Foundation::CloseHandle(snapshot);
     }
 
-    let path = found.and_then(|pid| process_image_path(pid));
+    let path = found.and_then(|process| process_image_path(process));
     if path.is_none() {
         // Not running: remember the miss so a repaint never walks the process list again.
         MISSING_PATHS
@@ -1476,59 +1653,7 @@ unsafe fn path_for_name(name: &str) -> Option<String> {
     path
 }
 
-/// Text of a list row by index; `None` for an empty or invalid row.
-unsafe fn list_text_at(list: HWND, idx: i32) -> Option<String> {
-    if idx < 0 {
-        return None;
-    }
-    let len = SendMessageW(list, LB_GETTEXTLEN, WPARAM(idx as usize), LPARAM(0)).0;
-    if len <= 0 {
-        return None;
-    }
-    let mut buf: Vec<u16> = vec![0; len as usize + 1];
-    SendMessageW(
-        list,
-        LB_GETTEXT,
-        WPARAM(idx as usize),
-        LPARAM(buf.as_mut_ptr() as isize),
-    );
-    Some(String::from_utf16_lossy(&buf[..len as usize]))
-}
-
-/// Text of the selected row, so a refill can restore the selection when the row survives.
-unsafe fn selected_text(list: HWND) -> Option<String> {
-    let idx = SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
-    list_text_at(list, idx)
-}
-
-unsafe fn select_text(list: HWND, text: &str) {
-    let wide = to_wide(text);
-    let idx = SendMessageW(
-        list,
-        LB_FINDSTRINGEXACT,
-        WPARAM(usize::MAX),
-        LPARAM(wide.as_ptr() as isize),
-    )
-    .0;
-    if idx >= 0 {
-        SendMessageW(list, LB_SETCURSEL, WPARAM(idx as usize), LPARAM(0));
-    }
-}
-
-unsafe fn add_row(list: HWND, text: &str, data: isize) -> isize {
-    let wide = to_wide(text);
-    let idx = SendMessageW(
-        list,
-        LB_ADDSTRING,
-        WPARAM(0),
-        LPARAM(wide.as_ptr() as isize),
-    )
-    .0;
-    if idx >= 0 && data != 0 {
-        SendMessageW(list, LB_SETITEMDATA, WPARAM(idx as usize), LPARAM(data));
-    }
-    idx
-}
+// ------------------------------------------------------------- list content
 
 /// Detected rows visible under `filter_detected`; `detected_apps` mirrors the list so a
 /// selected row index maps back to its pid.
@@ -1552,27 +1677,28 @@ fn filtered_detected() -> Vec<(u32, String)> {
 }
 
 unsafe fn refill_detected_list(hwnd: HWND) {
-    let list = get_dlg_item(hwnd, ID_LIST_DETECTED);
-    let keep = selected_text(list);
-    SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-    for (pid, name) in filtered_detected() {
-        // Item data = PID, so the owner-draw can resolve the real icon.
-        add_row(list, &format!("{} (PID: {})", name, pid), pid as isize);
-    }
-    if let Some(text) = keep {
-        select_text(list, &text);
-    }
+    let visible = ctl_of(hwnd, ID_LIST_DETECTED).map_or(1, |c| visible_rows(c.rect));
+    let rows: Vec<Row> = filtered_detected()
+        .into_iter()
+        // Row data = PID, so a repaint can resolve the real icon.
+        .map(|(pid, name)| Row {
+            text: format!("{} (PID: {})", name, pid),
+            data: pid as isize,
+        })
+        .collect();
+    with_list(ID_LIST_DETECTED, |l| l.set_rows(rows, visible));
 }
 
-unsafe fn refill_named_list(list: HWND, names: &[String]) {
-    let keep = selected_text(list);
-    SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-    for name in names {
-        add_row(list, name, 0);
-    }
-    if let Some(text) = keep {
-        select_text(list, &text);
-    }
+unsafe fn refill_named_list(hwnd: HWND, id: i32, names: &[String]) {
+    let visible = ctl_of(hwnd, id).map_or(1, |c| visible_rows(c.rect));
+    let rows: Vec<Row> = names
+        .iter()
+        .map(|n| Row {
+            text: n.clone(),
+            data: 0,
+        })
+        .collect();
+    with_list(id, |l| l.set_rows(rows, visible));
 }
 
 unsafe fn refresh_detected_apps(hwnd: HWND) {
@@ -1612,6 +1738,7 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
     refill_detected_list(hwnd);
     refresh_excluded_list(hwnd);
     refresh_always_muted_list(hwnd);
+    repaint(hwnd);
 }
 
 unsafe fn refresh_excluded_list(hwnd: HWND) {
@@ -1634,7 +1761,7 @@ unsafe fn refresh_excluded_list(hwnd: HWND) {
         .into_iter()
         .filter(|n| filter.is_empty() || n.to_lowercase().contains(&filter))
         .collect();
-    refill_named_list(get_dlg_item(hwnd, ID_LIST_EXCLUDED), &names);
+    refill_named_list(hwnd, ID_LIST_EXCLUDED, &names);
 }
 
 unsafe fn refresh_always_muted_list(hwnd: HWND) {
@@ -1657,46 +1784,28 @@ unsafe fn refresh_always_muted_list(hwnd: HWND) {
         .into_iter()
         .filter(|n| filter.is_empty() || n.to_lowercase().contains(&filter))
         .collect();
-    refill_named_list(get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED), &names);
+    refill_named_list(hwnd, ID_LIST_ALWAYS_MUTED, &names);
 }
 
-unsafe fn load_settings_to_controls(hwnd: HWND) {
+unsafe fn load_settings_to_field(hwnd: HWND) {
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
             let config = s.config.read();
             let muting_enabled = s.muting_enabled.load(Ordering::Relaxed);
 
-            set_check(hwnd, ID_CHECK_ENABLED, muting_enabled);
-            set_check(hwnd, ID_CHECK_START_MINIMIZED, config.start_minimized);
-            set_check(hwnd, ID_CHECK_START_WINDOWS, config.start_with_windows);
-
-            let poll_str = to_wide(&config.poll_interval_ms.to_string());
-            let _ = SetWindowTextW(
-                get_dlg_item(hwnd, ID_EDIT_POLL_INTERVAL),
-                PCWSTR(poll_str.as_ptr()),
-            );
+            set_toggle(ID_CHECK_ENABLED, muting_enabled);
+            set_toggle(ID_CHECK_START_MINIMIZED, config.start_minimized);
+            set_toggle(ID_CHECK_START_WINDOWS, config.start_with_windows);
+            set_field(ID_EDIT_POLL_INTERVAL, config.poll_interval_ms.to_string());
         }
     });
+    repaint(hwnd);
 }
 
-unsafe fn set_check(hwnd: HWND, id: i32, on: bool) {
-    SendMessageW(
-        get_dlg_item(hwnd, id),
-        BM_SETCHECK,
-        WPARAM(if on { BST_CHECKED } else { BST_UNCHECKED }),
-        LPARAM(0),
-    );
-}
-
-unsafe fn get_check(hwnd: HWND, id: i32) -> bool {
-    SendMessageW(get_dlg_item(hwnd, id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0
-        == BST_CHECKED as isize
-}
-
-/// One filter edit changed: store the needle lowercased and refill only its own list,
+/// One filter field changed: store the needle lowercased and refill only its own list,
 /// so the other two lists keep their selection.
 unsafe fn apply_edit_filter(hwnd: HWND, id: i32) {
-    let needle = od_controls::window_text(get_dlg_item(hwnd, id)).to_lowercase();
+    let needle = field_text(id).to_lowercase();
     DIALOG_STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
             match id {
@@ -1713,21 +1822,13 @@ unsafe fn apply_edit_filter(hwnd: HWND, id: i32) {
     }
 }
 
+/// Command dispatch for a button, a toggle flip and a list double-click; the ids and
+/// branches are the ones the WM_COMMAND plumbing used to carry.
 unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
     match control_id {
-        ID_EDIT_SEARCH => {
+        ID_EDIT_SEARCH | ID_EDIT_FILTER_EXCLUDED | ID_EDIT_FILTER_ALWAYS_MUTED => {
             if notification == EN_CHANGE {
-                apply_edit_filter(hwnd, ID_EDIT_SEARCH);
-            }
-        }
-        ID_EDIT_FILTER_EXCLUDED => {
-            if notification == EN_CHANGE {
-                apply_edit_filter(hwnd, ID_EDIT_FILTER_EXCLUDED);
-            }
-        }
-        ID_EDIT_FILTER_ALWAYS_MUTED => {
-            if notification == EN_CHANGE {
-                apply_edit_filter(hwnd, ID_EDIT_FILTER_ALWAYS_MUTED);
+                apply_edit_filter(hwnd, control_id);
             }
         }
         ID_BTN_REFRESH => {
@@ -1776,95 +1877,76 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
 }
 
 unsafe fn add_selected_to_exclusions(hwnd: HWND) {
-    let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
-    let sel_idx = SendMessageW(list_detected, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
-
-    if sel_idx < 0 {
-        return; // Nothing selected
-    }
-
+    let Some(sel_idx) = list_sel(ID_LIST_DETECTED) else {
+        return;
+    };
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
-            if let Some((_, name)) = s.detected_apps.get(sel_idx as usize) {
+            if let Some((_, name)) = s.detected_apps.get(sel_idx) {
                 let mut config = s.config.write();
                 config.add_excluded_app(name);
             }
         }
     });
-
     refresh_detected_apps(hwnd);
 }
 
 unsafe fn remove_selected_exclusion(hwnd: HWND) {
-    let list_excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
-    let sel_idx = SendMessageW(list_excluded, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
-
-    let Some(app_name) = list_text_at(list_excluded, sel_idx) else {
-        return; // Nothing selected
+    let Some(app_name) = with_list(ID_LIST_EXCLUDED, |l| l.selected_text()) else {
+        return;
     };
-
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
             let mut config = s.config.write();
             config.remove_excluded_app(&app_name);
         }
     });
-
     refresh_detected_apps(hwnd);
 }
 
 unsafe fn add_selected_to_always_muted(hwnd: HWND) {
-    let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
-    let sel_idx = SendMessageW(list_detected, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
-
-    if sel_idx < 0 {
-        return; // Nothing selected
-    }
-
+    let Some(sel_idx) = list_sel(ID_LIST_DETECTED) else {
+        return;
+    };
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
-            if let Some((_, name)) = s.detected_apps.get(sel_idx as usize) {
+            if let Some((_, name)) = s.detected_apps.get(sel_idx) {
                 let mut config = s.config.write();
                 config.add_always_muted_app(name);
             }
         }
     });
-
     refresh_detected_apps(hwnd);
 }
 
 unsafe fn remove_selected_always_muted(hwnd: HWND) {
-    let list_always_muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
-    let sel_idx = SendMessageW(list_always_muted, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
-
-    let Some(app_name) = list_text_at(list_always_muted, sel_idx) else {
-        return; // Nothing selected
+    let Some(app_name) = with_list(ID_LIST_ALWAYS_MUTED, |l| l.selected_text()) else {
+        return;
     };
-
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
             let mut config = s.config.write();
             config.remove_always_muted_app(&app_name);
         }
     });
-
     refresh_detected_apps(hwnd);
 }
 
 unsafe fn save_settings(hwnd: HWND) {
+    let _ = hwnd;
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
             let mut config = s.config.write();
 
-            let muting_checked = get_check(hwnd, ID_CHECK_ENABLED);
-            let start_minimized_checked = get_check(hwnd, ID_CHECK_START_MINIMIZED);
-            let start_windows_checked = get_check(hwnd, ID_CHECK_START_WINDOWS);
+            let muting_checked = toggle(ID_CHECK_ENABLED);
+            let start_minimized_checked = toggle(ID_CHECK_START_MINIMIZED);
+            let start_windows_checked = toggle(ID_CHECK_START_WINDOWS);
 
-            let mut buffer: [u16; 32] = [0; 32];
-            GetWindowTextW(get_dlg_item(hwnd, ID_EDIT_POLL_INTERVAL), &mut buffer);
-            let poll_str = String::from_utf16_lossy(&buffer);
-            let poll_str = poll_str.trim_matches('\0').trim();
-            let poll_interval: u64 = poll_str.parse().unwrap_or(500).clamp(100, 2000);
+            let poll_interval: u64 = field_text(ID_EDIT_POLL_INTERVAL)
+                .trim()
+                .parse()
+                .unwrap_or(500)
+                .clamp(100, 2000);
 
             config.muting_enabled = muting_checked;
             config.start_minimized = start_minimized_checked;
@@ -1883,6 +1965,714 @@ unsafe fn save_settings(hwnd: HWND) {
     });
 }
 
+// ---------------------------------------------------------------- text editing
+
+/// Numeric field: digits only, so `parse` in save never sees a stray character.
+fn numeric_field(id: i32) -> bool {
+    id == ID_EDIT_POLL_INTERVAL
+}
+
+fn byte_index(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map_or(text.len(), |(i, _)| i)
+}
+
+/// Replace the selection (or, collapsed, insert at the caret) with `insert`.
+fn insert_at_caret(id: i32, insert: &str) {
+    with_field(id, |f| {
+        let (start, end) = f.selection();
+        let (a, b) = (byte_index(&f.text, start), byte_index(&f.text, end));
+        let mut next = f.text.clone();
+        next.replace_range(a..b, insert);
+        f.text = next;
+        f.caret = start + insert.chars().count();
+        f.anchor = f.caret;
+    })
+}
+
+fn delete_selection(id: i32) -> bool {
+    with_field(id, |f| {
+        let (start, end) = f.selection();
+        if start == end {
+            return false;
+        }
+        let (a, b) = (byte_index(&f.text, start), byte_index(&f.text, end));
+        f.text.replace_range(a..b, "");
+        f.caret = start;
+        f.anchor = start;
+        true
+    })
+}
+
+fn backspace(id: i32) -> bool {
+    with_field(id, |f| {
+        if delete_selection(id) {
+            return true;
+        }
+        let caret = f.caret;
+        if caret == 0 {
+            return false;
+        }
+        let a = byte_index(&f.text, caret - 1);
+        let b = byte_index(&f.text, caret);
+        f.text.replace_range(a..b, "");
+        f.caret = caret - 1;
+        f.anchor = f.caret;
+        true
+    })
+}
+
+fn delete_forward(id: i32) -> bool {
+    with_field(id, |f| {
+        if delete_selection(id) {
+            return true;
+        }
+        let caret = f.caret;
+        if caret >= f.text.chars().count() {
+            return false;
+        }
+        let a = byte_index(&f.text, caret);
+        let b = byte_index(&f.text, caret + 1);
+        f.text.replace_range(a..b, "");
+        f.anchor = f.caret;
+        true
+    })
+}
+
+fn select_all(id: i32) {
+    with_field(id, |f| {
+        f.anchor = 0;
+        f.caret = f.text.chars().count();
+    });
+}
+
+fn selected_slice(id: i32) -> Option<String> {
+    with_field(id, |f| {
+        let (start, end) = f.selection();
+        (start != end).then(|| f.text.chars().skip(start).take(end - start).collect())
+    })
+}
+
+unsafe fn clipboard_open(hwnd: HWND) -> bool {
+    use windows::Win32::System::DataExchange::OpenClipboard;
+    OpenClipboard(hwnd).is_ok()
+}
+
+unsafe fn clipboard_copy(hwnd: HWND, id: i32) {
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, SetClipboardData};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    let Some(text) = selected_slice(id) else {
+        return;
+    };
+    if !clipboard_open(hwnd) {
+        return;
+    }
+    let _ = EmptyClipboard();
+    let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // GMEM_MOVEABLE is what SetClipboardData requires; the clipboard owns the block.
+    if let Ok(block) = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2) {
+        let dst = GlobalLock(block) as *mut u16;
+        if !dst.is_null() {
+            std::ptr::copy_nonoverlapping(units.as_ptr(), dst, units.len());
+            let _ = GlobalUnlock(block);
+            let _ = SetClipboardData(
+                CF_UNICODETEXT.0 as u32,
+                windows::Win32::Foundation::HANDLE(block.0),
+            );
+        }
+    }
+    let _ = CloseClipboard();
+}
+
+unsafe fn clipboard_cut(hwnd: HWND, id: i32) {
+    clipboard_copy(hwnd, id);
+    if delete_selection(id) {
+        after_field_edit(hwnd, id);
+    }
+}
+
+unsafe fn clipboard_paste(hwnd: HWND, id: i32) {
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    if !clipboard_open(hwnd) {
+        return;
+    }
+    let text = GetClipboardData(CF_UNICODETEXT.0 as u32)
+        .ok()
+        .and_then(|handle| {
+            let ptr = GlobalLock(windows::Win32::Foundation::HGLOBAL(handle.0)) as *const u16;
+            if ptr.is_null() {
+                return None;
+            }
+            let mut len = 0;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(ptr, len);
+            let _ = GlobalUnlock(windows::Win32::Foundation::HGLOBAL(handle.0));
+            Some(String::from_utf16_lossy(slice))
+        });
+    let _ = CloseClipboard();
+    if let Some(text) = text {
+        insert_at_caret(id, &text);
+        after_field_edit(hwnd, id);
+    }
+}
+
+/// A field's text changed by an edit key: run the filter command it used to report as
+/// EN_CHANGE, then repaint with the caret in its new place.
+unsafe fn after_field_edit(hwnd: HWND, id: i32) {
+    handle_command(hwnd, id, EN_CHANGE);
+    repaint(hwnd);
+    update_caret(hwnd);
+}
+
+// -------------------------------------------------------------------- input
+
+fn focus_target(kind: Kind, id: i32) -> Focus {
+    match kind {
+        Kind::Button => Focus::Button(id),
+        Kind::Toggle => Focus::Toggle(id),
+        Kind::Edit => Focus::Field(id),
+        _ => Focus::List(id),
+    }
+}
+
+/// Keyboard focus order: buttons, toggles, fields and lists in the order `layout()`
+/// lists them, which is the order a user reads the dialog in.
+fn tab_order(hwnd: HWND) -> Vec<Focus> {
+    layout(hwnd)
+        .into_iter()
+        .filter_map(|c| match c.kind {
+            Kind::Button | Kind::Toggle | Kind::Edit | Kind::List => {
+                Some(focus_target(c.kind, c.id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+unsafe fn cycle_focus(hwnd: HWND, backwards: bool) {
+    let order = tab_order(hwnd);
+    if order.is_empty() {
+        return;
+    }
+    let current = order.iter().position(|f| *f == focus());
+    let next = match (current, backwards) {
+        (Some(0), true) => order.len() - 1,
+        (Some(i), true) => i - 1,
+        (Some(i), false) => (i + 1) % order.len(),
+        (None, true) => order.len() - 1,
+        (None, false) => 0,
+    };
+    set_focus_value(order[next]);
+    refocus(hwnd);
+}
+
+unsafe fn activate_button(hwnd: HWND, id: i32) {
+    handle_command(hwnd, id, BN_CLICKED as u16);
+    if IsWindow(hwnd).as_bool() {
+        repaint(hwnd);
+    }
+}
+
+unsafe fn flip_toggle(hwnd: HWND, id: i32) {
+    set_toggle(id, !toggle(id));
+    handle_command(hwnd, id, BN_CLICKED as u16);
+    repaint(hwnd);
+}
+
+unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM) {
+    let (x, y) = point_of(lparam);
+    let ctls = layout(hwnd);
+    let hit = hit_test(&ctls, x, y);
+    let hot_id = HOT.with(|h| h.get());
+    let mut changed = false;
+    if hit != hot_id {
+        HOT.with(|h| h.set(hit));
+        changed = true;
+    }
+    // Hovered row of a list.
+    if let Some(ctl) = ctls.iter().find(|c| c.id == hit && c.kind == Kind::List) {
+        let index = with_list(ctl.id, |l| row_at(ctl.rect, y, l.top, l.rows.len()));
+        changed |= with_list(ctl.id, |l| {
+            let before = l.hot;
+            l.hot = index;
+            before != l.hot
+        });
+    }
+    for ctl in ctls.iter().filter(|c| c.kind == Kind::List && c.id != hit) {
+        changed |= with_list(ctl.id, |l| std::mem::take(&mut l.hot).is_some());
+    }
+    if changed {
+        repaint(hwnd);
+    }
+
+    let cursor = if hit != 0 && kind_of(hwnd, hit) == Some(Kind::Edit) {
+        IDC_IBEAM
+    } else {
+        IDC_ARROW
+    };
+    let load = |name: PCWSTR| LoadCursorW(None, name).unwrap_or_default();
+    SetCursor(load(cursor));
+
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    let _ = TrackMouseEvent(&mut tme);
+}
+
+unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM) {
+    let (x, y) = point_of(lparam);
+    let hit = hit_test(&layout(hwnd), x, y);
+    PRESSED.with(|p| p.set(hit));
+    HOT.with(|h| h.set(hit));
+    match kind_of(hwnd, hit) {
+        Some(Kind::Edit) => {
+            set_focus_value(Focus::Field(hit));
+            if let Some(ctl) = ctl_of(hwnd, hit) {
+                let caret = caret_from_x(hwnd, &ctl, x);
+                with_field(hit, |f| {
+                    f.caret = caret;
+                    f.anchor = caret;
+                });
+            }
+            SetCapture(hwnd);
+            refocus(hwnd);
+        }
+        Some(Kind::List) => {
+            set_focus_value(Focus::List(hit));
+            let Some(ctl) = ctl_of(hwnd, hit) else { return };
+            let index = with_list(hit, |l| row_at(ctl.rect, y, l.top, l.rows.len()));
+            if let Some(idx) = index {
+                with_list(hit, |l| l.sel = Some(idx));
+                select_row(hwnd, hit, idx);
+            }
+            SetCapture(hwnd);
+            refocus(hwnd);
+            click_list_row(hwnd, hit, x, y, index);
+        }
+        Some(Kind::Button) => {
+            set_focus_value(Focus::Button(hit));
+            SetCapture(hwnd);
+            refocus(hwnd);
+        }
+        Some(Kind::Toggle) => {
+            set_focus_value(Focus::Toggle(hit));
+            SetCapture(hwnd);
+            refocus(hwnd);
+        }
+        _ => {
+            set_focus_value(Focus::None);
+            refocus(hwnd);
+        }
+    }
+}
+
+/// Button or toggle released inside itself: run its command, then repaint the result.
+unsafe fn mouse_up(hwnd: HWND, lparam: LPARAM) {
+    let (x, y) = point_of(lparam);
+    let pressed = PRESSED.with(|p| p.replace(0));
+    let _ = ReleaseCapture();
+    let released_on = hit_test(&layout(hwnd), x, y);
+    if pressed != 0 && released_on == pressed {
+        match kind_of(hwnd, pressed) {
+            Some(Kind::Button) => activate_button(hwnd, pressed),
+            Some(Kind::Toggle) => flip_toggle(hwnd, pressed),
+            _ => {}
+        }
+    }
+    if IsWindow(hwnd).as_bool() {
+        repaint(hwnd);
+    }
+}
+
+// Last list click: (tick, x, y, list id, row) - a second click inside the double-click
+// time on the same row is what the list's LBN_DBLCLK used to report.
+thread_local! {
+    static LAST_CLICK: Cell<(u32, i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0, 0)) };
+}
+
+// The class carries no CS_DBLCLKS, so the dialog decides a double click itself: the
+// second press on the same row within the system double-click time moves the row.
+unsafe fn click_list_row(hwnd: HWND, id: i32, x: i32, y: i32, index: Option<usize>) {
+    let now = GetTickCount();
+    let previous = LAST_CLICK.with(|c| c.get());
+    LAST_CLICK.with(|c| c.set((now, x, y, id, index.map_or(-1, |i| i as i32))));
+    let Some(index) = index else { return };
+    let within_time = windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime();
+    let near = (x - previous.1).abs() <= GetSystemMetrics(SM_CXDOUBLECLK)
+        && (y - previous.2).abs() <= GetSystemMetrics(SM_CYDOUBLECLK);
+    if previous.3 == id
+        && previous.4 == index as i32
+        && near
+        && now.saturating_sub(previous.0) <= within_time
+    {
+        handle_command(hwnd, id, LBN_DBLCLK as u16);
+    }
+}
+
+/// Wheel scrolls the list under the cursor by three rows, clamped to its content.
+unsafe fn mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    let mut pt = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    };
+    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+    let Some(ctl) = layout(hwnd).into_iter().find(|c| {
+        c.kind == Kind::List
+            && pt.x >= c.rect.left
+            && pt.x < c.rect.right
+            && pt.y >= c.rect.top
+            && pt.y < c.rect.bottom
+    }) else {
+        return;
+    };
+    let visible = visible_rows(ctl.rect);
+    let backwards = (wparam.0 as i16) < 0;
+    with_list(ctl.id, |l| {
+        l.top = if backwards {
+            l.top.saturating_add(3)
+        } else {
+            l.top.saturating_sub(3)
+        };
+        l.clamp(visible);
+    });
+    repaint(hwnd);
+}
+
+/// Arrows/Home/End/PageUp/PageDown move a list selection; the scroll follows it.
+unsafe fn key_list(hwnd: HWND, id: i32, vk: u16) -> bool {
+    let Some(ctl) = ctl_of(hwnd, id) else {
+        return false;
+    };
+    let visible = visible_rows(ctl.rect);
+    let page = visible.saturating_sub(1).max(1);
+    let selected = with_list(id, |l| {
+        let len = l.rows.len();
+        if len == 0 {
+            return None;
+        }
+        let cur = l.sel;
+        let next = match vk {
+            v if v == VK_DOWN.0 => cur.map_or(0, |i| (i + 1).min(len - 1)),
+            v if v == VK_UP.0 => cur.map_or(0, |i| i.saturating_sub(1)),
+            v if v == VK_NEXT.0 => cur.map_or(0, |i| (i + page).min(len - 1)),
+            v if v == VK_PRIOR.0 => cur.map_or(0, |i| i.saturating_sub(page)),
+            v if v == VK_HOME.0 => 0,
+            v if v == VK_END.0 => len - 1,
+            _ => return None,
+        };
+        l.sel = Some(next);
+        Some(next)
+    });
+    if let Some(idx) = selected {
+        reveal(id, idx, visible);
+    }
+    selected.is_some()
+}
+
+/// Caret/selection keys inside a field.
+unsafe fn key_field(hwnd: HWND, id: i32, vk: u16, shift: bool, ctrl: bool) -> bool {
+    let len = field_text(id).chars().count();
+    let mut edited = false;
+    let mut moved = false;
+    with_field(id, |f| {
+        let caret = f.caret;
+        match vk {
+            v if v == VK_LEFT.0 => {
+                f.caret = if ctrl { 0 } else { caret.saturating_sub(1) };
+                moved = true;
+            }
+            v if v == VK_RIGHT.0 => {
+                f.caret = if ctrl { len } else { (caret + 1).min(len) };
+                moved = true;
+            }
+            v if v == VK_HOME.0 => {
+                f.caret = 0;
+                moved = true;
+            }
+            v if v == VK_END.0 => {
+                f.caret = len;
+                moved = true;
+            }
+            _ => {}
+        }
+        if moved && !shift {
+            f.anchor = f.caret;
+        }
+    });
+    match vk {
+        v if v == VK_BACK.0 => edited = backspace(id),
+        v if v == VK_DELETE.0 => edited = delete_forward(id),
+        _ => {}
+    }
+    if edited {
+        after_field_edit(hwnd, id);
+    } else if moved {
+        if let Some(ctl) = ctl_of(hwnd, id) {
+            // Scrolling the caret into view changed the text origin.
+            let Focus::Field(_) = focus() else {
+                repaint(hwnd);
+                return true;
+            };
+            let (x, top) = field_caret(hwnd, &ctl);
+            let _ = SetCaretPos(x, top);
+            repaint(hwnd);
+            update_caret(hwnd);
+        }
+    }
+    true
+}
+
+unsafe fn key_down(hwnd: HWND, vk: u16) {
+    let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+    match focus() {
+        Focus::Field(id) => {
+            if ctrl && vk == 'A' as u16 {
+                select_all(id);
+                repaint(hwnd);
+                return;
+            }
+            if ctrl && vk == 'C' as u16 {
+                clipboard_copy(hwnd, id);
+                return;
+            }
+            if ctrl && vk == 'X' as u16 {
+                clipboard_cut(hwnd, id);
+                return;
+            }
+            if ctrl && vk == 'V' as u16 {
+                clipboard_paste(hwnd, id);
+                return;
+            }
+            // Enter/Ctrl+Enter on a field is the dialog's default action.
+            if vk == VK_RETURN.0 {
+                activate_button(hwnd, ID_BTN_SAVE_CLOSE);
+                return;
+            }
+            if vk == VK_TAB.0 {
+                cycle_focus(hwnd, shift);
+                return;
+            }
+            if key_field(hwnd, id, vk, shift, ctrl) {
+                return;
+            }
+        }
+        Focus::List(id) => {
+            if vk == VK_TAB.0 {
+                cycle_focus(hwnd, shift);
+            } else if key_list(hwnd, id, vk) {
+                repaint(hwnd);
+            }
+        }
+        Focus::Button(id) => {
+            if vk == VK_TAB.0 {
+                cycle_focus(hwnd, shift);
+            } else if vk == VK_SPACE.0 || vk == VK_RETURN.0 {
+                activate_button(hwnd, id);
+            }
+        }
+        Focus::Toggle(id) => {
+            if vk == VK_TAB.0 {
+                cycle_focus(hwnd, shift);
+            } else if vk == VK_SPACE.0 || vk == VK_RETURN.0 {
+                flip_toggle(hwnd, id);
+            }
+        }
+        // Nothing focused yet: Tab picks the first control, and no other key acts, so a
+        // stray Enter before any click cannot save and close the dialog.
+        Focus::None => {
+            if vk == VK_TAB.0 {
+                cycle_focus(hwnd, shift);
+            }
+        }
+    }
+}
+
+/// Printable input into the focused field, then the filter command it used to report.
+unsafe fn char_input(hwnd: HWND, wparam: WPARAM) {
+    let Focus::Field(id) = focus() else { return };
+    let ch = wparam.0 as u32;
+    // Control characters arrive here too (Enter, Tab, Ctrl+A after TranslateMessage).
+    if ch < 0x20 || ch == 0x7F {
+        return;
+    }
+    let Some(ch) = char::from_u32(ch) else { return };
+    if numeric_field(id) && !ch.is_ascii_digit() {
+        return;
+    }
+    insert_at_caret(id, &ch.to_string());
+    after_field_edit(hwnd, id);
+}
+
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            UI.with(|u| *u.borrow_mut() = Some(Ui::new(hwnd)));
+            with_ui(|u| apply_chrome(hwnd, u.palette.dark));
+            refresh_detected_apps(hwnd);
+            load_settings_to_field(hwnd);
+            LRESULT(0)
+        }
+        WM_SHOWWINDOW => {
+            if wparam.0 != 0 {
+                refresh_detected_apps(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            let state = (wparam.0 & 0xFFFF) as u32;
+            if state != WA_INACTIVE {
+                refresh_detected_apps(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            // Nothing to move: the geometry is derived at paint time. The whole client is
+            // repainted before this message returns, so a live resize can never expose a
+            // band painted for the previous size.
+            repaint(hwnd);
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            let new_dpi = (wparam.0 & 0xFFFF) as u32;
+            if let Some(suggested) = (lparam.0 as *const RECT).as_ref() {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            reinit_for_dpi(hwnd, new_dpi);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1), // fully painted in WM_PAINT
+        WM_PAINT => {
+            paint(hwnd);
+            update_caret(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            mouse_move(hwnd, lparam);
+            LRESULT(0)
+        }
+        msg if msg == CONTROLS_MOUSELEAVE => {
+            HOT.with(|h| h.set(0));
+            LISTS.with(|l| {
+                for list in l.borrow_mut().values_mut() {
+                    list.hot = None;
+                }
+            });
+            repaint(hwnd);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            mouse_down(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            mouse_up(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            mouse_wheel(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            key_down(hwnd, wparam.0 as u16);
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            char_input(hwnd, wparam);
+            LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            // Over a field the I-beam must survive every mouse move, not just the ones
+            // that changed the hot control. DefWindowProc sets the class arrow otherwise.
+            if GetFocus() == hwnd {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+                let hit = hit_test(&layout(hwnd), pt.x, pt.y);
+                if kind_of(hwnd, hit) == Some(Kind::Edit) {
+                    let cursor = LoadCursorW(None, IDC_IBEAM).unwrap_or_default();
+                    SetCursor(cursor);
+                    return LRESULT(1);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_GETMINMAXINFO => {
+            let mmi = lparam.0 as *mut MINMAXINFO;
+            if !mmi.is_null() {
+                let dip = dip_of();
+                (*mmi).ptMinTrackSize.x = dip.px(MIN_WINDOW_WIDTH);
+                (*mmi).ptMinTrackSize.y = dip.px(MIN_WINDOW_HEIGHT);
+            }
+            LRESULT(0)
+        }
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            if msg == WM_KILLFOCUS {
+                hide_caret(hwnd);
+            }
+            repaint(hwnd);
+            if msg == WM_SETFOCUS {
+                update_caret(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            free_back_buffer(hwnd);
+            // Still DefWindowProc: it is what clears the thread's last-active-popup state.
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_DESTROY => {
+            hide_caret(hwnd);
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
+    with_ui_mut(|ui| {
+        let dip = Dip::from_dpi(dpi);
+        let shared = Shared::get(dip.dpi, &ui.palette);
+        ui.dip = dip;
+        ui.font = HFONT(shared.font as *mut c_void);
+        ui.font_small = HFONT(shared.font_small as *mut c_void);
+    });
+    // The row height and every rect follow `dip_of()`, so the only cached geometry
+    // (the card map) is dropped and the next paint rebuilds it at the new scale.
+    LAST_LAYOUT.with(|l| l.set((0, 0, 0, -1, -1)));
+    // A caret created for the old DPI keeps its old size until recreated.
+    if CARET_ON.with(|c| c.replace(false)) {
+        let _ = DestroyCaret();
+    }
+    repaint(hwnd);
+    update_caret(hwnd);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1892,8 +2682,8 @@ mod tests {
         (((y as u32) << 16) | (x as u32 & 0xFFFF)) as isize
     }
 
-    /// WindowFromPoint answers for the whole desktop, so two dialog windows in one test
-    /// binary would hit each other's cards: the window tests take turns.
+    /// Two dialogs in one test binary would share the thread-local field/list state and
+    /// fight over the foreground window: the window tests take turns.
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -1903,6 +2693,7 @@ mod tests {
 
     fn make_dialog() -> HWND {
         init_common_controls();
+        reset_controls();
         DIALOG_STATE.with(|state| {
             *state.borrow_mut() = Some(DialogState {
                 config: Arc::new(RwLock::new(Config::default())),
@@ -1916,26 +2707,11 @@ mod tests {
                 filter_always_muted: String::new(),
             });
         });
-        let hwnd = unsafe { create_dialog_window().expect("settings window") };
-        // Hit tests answer for the whole desktop: raise the dialog like ShowWindow would,
-        // or any other top-level window can sit over it and own WindowFromPoint.
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
-        hwnd
+        unsafe { create_dialog_window().expect("settings window") }
     }
 
     fn teardown(hwnd: HWND) {
         unsafe {
-            let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             let _ = DestroyWindow(hwnd);
             let name = to_wide(SETTINGS_CLASS);
             let _ = UnregisterClassW(
@@ -1945,25 +2721,20 @@ mod tests {
         }
         UI.with(|u| *u.borrow_mut() = None);
         DIALOG_STATE.with(|s| *s.borrow_mut() = None);
+        reset_controls();
     }
 
-    fn enumerate(list: HWND) -> Vec<String> {
-        unsafe {
-            let count = SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0;
-            (0..count)
-                .map(|i| {
-                    let len = SendMessageW(list, LB_GETTEXTLEN, WPARAM(i as usize), LPARAM(0)).0;
-                    let mut buf: Vec<u16> = vec![0; len as usize + 1];
-                    SendMessageW(
-                        list,
-                        LB_GETTEXT,
-                        WPARAM(i as usize),
-                        LPARAM(buf.as_mut_ptr() as isize),
-                    );
-                    String::from_utf16_lossy(&buf[..len as usize])
-                })
-                .collect()
-        }
+    /// Control state is thread-local, so a test must not inherit the state of the dialog
+    /// it just closed.
+    fn reset_controls() {
+        FIELDS.with(|f| f.borrow_mut().clear());
+        LISTS.with(|l| l.borrow_mut().clear());
+        TOGGLES.with(|t| t.borrow_mut().clear());
+        BACK.with(|b| b.borrow_mut().clear());
+        HOT.with(|h| h.set(0));
+        PRESSED.with(|p| p.set(0));
+        set_focus_value(Focus::None);
+        LAST_CLICK.with(|c| c.set((0, 0, 0, 0, 0)));
     }
 
     const CARDS: [i32; 4] = [
@@ -1973,8 +2744,8 @@ mod tests {
         ID_GROUP_SETTINGS,
     ];
 
-    /// No control may sit on another, or a click lands on the wrong window. A card
-    /// contains its children by design, so only pairs with exactly one card are exempt.
+    /// No control may sit on another, or a click lands on the wrong one. A card contains
+    /// its children by design, so only pairs with exactly one card are exempt.
     fn assert_no_overlaps(hwnd: HWND) {
         let rects: Vec<(i32, RECT)> = layout(hwnd).into_iter().map(|c| (c.id, c.rect)).collect();
         for (i, (id_a, a)) in rects.iter().enumerate() {
@@ -1990,46 +2761,20 @@ mod tests {
         }
     }
 
-    /// The resize path must land every control on its layout rect: a control that keeps its
-    /// pre-resize geometry is what the user sees as ghosts and staggered borders. A list box
-    /// is exempt from the exact height, which Windows snaps to whole owner-draw item rows.
-    fn assert_controls_follow_the_layout(hwnd: HWND) {
-        unsafe {
-            for ctl in layout(hwnd) {
-                let ctrl = get_dlg_item(hwnd, ctl.id);
-                assert!(!ctrl.0.is_null(), "control {} is missing", ctl.id);
-                let mut rc = RECT::default();
-                let _ = GetWindowRect(ctrl, &mut rc);
-                let mut origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
-                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut origin);
-                let got = (
-                    rc.left - origin.x,
-                    rc.top - origin.y,
-                    rc.right - rc.left,
-                    rc.bottom - rc.top,
-                );
-                let want = (
-                    ctl.rect.left,
-                    ctl.rect.top,
-                    ctl.rect.right - ctl.rect.left,
-                    ctl.rect.bottom - ctl.rect.top,
-                );
-                if ctl.kind == Kind::List {
-                    assert_eq!((got.0, got.1), (want.0, want.1), "list {} moved", ctl.id);
-                    assert_eq!(got.2, want.2, "list {} has the wrong width", ctl.id);
-                    // Snapped down to whole rows, never up past the layout rect.
-                    assert!(
-                        got.3 <= want.3 && want.3 - got.3 < dip_of().px(48.0),
-                        "list {} height {} left the layout height {}",
-                        ctl.id,
-                        got.3,
-                        want.3
-                    );
-                } else {
-                    assert_eq!(got, want, "control {} sits at the wrong rect after a resize", ctl.id);
-                }
-            }
-        }
+    fn center(rc: RECT) -> (i32, i32) {
+        ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2)
+    }
+
+    fn select_text_row(id: i32, text: &str) {
+        with_list(id, |l| l.sel = l.rows.iter().position(|r| r.text == text));
+    }
+
+    fn rows_of(id: i32) -> Vec<String> {
+        with_list(id, |l| l.rows.iter().map(|r| r.text.clone()).collect())
+    }
+
+    fn config_of_dialog() -> Arc<RwLock<Config>> {
+        DIALOG_STATE.with(|state| state.borrow().as_ref().unwrap().config.clone())
     }
 
     /// The dialog's own name, which the rename must not leave behind.
@@ -2041,11 +2786,11 @@ mod tests {
         );
     }
 
-    /// A button's backdrop is decided by the layout, so it cannot flip between the card and
-    /// the window colour while a resize is still in flight. Every control on a card must
-    /// answer the card, and every control outside one the window.
+    /// A button's backdrop is decided by the layout, so it cannot flip between the card
+    /// and the window colour while a resize is still in flight. Every control on a card
+    /// must answer the card, and every control outside one the window.
     #[test]
-    fn control_surfaces_follow_the_layout_not_the_window_rects() {
+    fn control_surfaces_follow_the_layout() {
         let _serial = serial();
         let hwnd = make_dialog();
         let ctls = layout(hwnd);
@@ -2058,8 +2803,7 @@ mod tests {
             if ctl.kind == Kind::Card {
                 continue;
             }
-            let cx = (ctl.rect.left + ctl.rect.right) / 2;
-            let cy = (ctl.rect.top + ctl.rect.bottom) / 2;
+            let (cx, cy) = center(ctl.rect);
             let on_card = cards
                 .iter()
                 .any(|r| cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom);
@@ -2073,83 +2817,29 @@ mod tests {
         teardown(hwnd);
     }
 
-    /// A card that covers its children takes the hit test, the focus and the clicks.
+    /// A card that covered its children would take their clicks: every control's own
+    /// centre must hit-test back to it, and a corner of the window to nothing.
     #[test]
-    fn detected_list_accepts_a_row_click() {
+    fn hit_test_lands_on_the_control_a_point_is_over() {
         let _serial = serial();
         let hwnd = make_dialog();
-        unsafe {
-            DIALOG_STATE.with(|state| {
-                let mut state = state.borrow_mut();
-                let s = state.as_mut().unwrap();
-                s.all_detected_apps = vec![(1, "alpha.exe".into()), (2, "beta.exe".into())];
-            });
-            refill_detected_list(hwnd);
-
-            let list = get_dlg_item(hwnd, ID_LIST_DETECTED);
-            let mut rc = RECT::default();
-            SendMessageW(
-                list,
-                LB_GETITEMRECT,
-                WPARAM(1),
-                LPARAM(&mut rc as *mut RECT as isize),
+        let ctls = layout(hwnd);
+        for ctl in ctls.iter().filter(|c| c.kind != Kind::Card) {
+            let (x, y) = center(ctl.rect);
+            assert_eq!(
+                hit_test(&ctls, x, y),
+                ctl.id,
+                "centre of control {} hits another control",
+                ctl.id
             );
-            let (x, y) = ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
-            let mut pt = windows::Win32::Foundation::POINT { x, y };
-            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(list, &mut pt);
-            // The topmost window under the row's own client coords must be the list itself.
-            let hit = WindowFromPoint(pt);
-            if hit != list {
-                let mut b = [0u16; 64];
-                let n = GetClassNameW(hit, &mut b);
-                let mut r = RECT::default();
-                let _ = GetWindowRect(hit, &mut r);
-                panic!(
-                    "covered by {} id={} parent={:?} rect=({},{},{},{}) pt=({},{})",
-                    String::from_utf16_lossy(&b[..n as usize]),
-                    GetDlgCtrlID(hit),
-                    GetParent(hit).unwrap_or_default(),
-                    r.left,
-                    r.top,
-                    r.right,
-                    r.bottom,
-                    pt.x,
-                    pt.y
-                );
-            }
-
-            SendMessageW(list, WM_LBUTTONDOWN, WPARAM(1), LPARAM(lparam_of(x, y)));
-            SendMessageW(list, WM_LBUTTONUP, WPARAM(0), LPARAM(lparam_of(x, y)));
-            assert_eq!(SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0, 1);
-
-            assert_no_overlaps(hwnd);
-            // The same grid at 150%: scale the client area with the DIP, as a DPI change does.
-            let (mut client, mut window) = (RECT::default(), RECT::default());
-            let _ = GetClientRect(hwnd, &mut client);
-            let _ = GetWindowRect(hwnd, &mut window);
-            let (frame_w, frame_h) = (
-                (window.right - window.left) - (client.right - client.left),
-                (window.bottom - window.top) - (client.bottom - client.top),
-            );
-            with_ui_mut(|ui| ui.dip = Dip::from_dpi(144));
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                0,
-                0,
-                client.right * 3 / 2 + frame_w,
-                client.bottom * 3 / 2 + frame_h,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            assert_no_overlaps(hwnd);
-            assert_controls_follow_the_layout(hwnd);
-            with_ui_mut(|ui| ui.dip = Dip::at(hwnd));
         }
+        assert_eq!(hit_test(&ctls, 0, 0), 0, "bare window hit a control");
+        assert_no_overlaps(hwnd);
         teardown(hwnd);
     }
 
-    /// A window with no icon shows a blank or generic square in the caption, in the
-    /// taskbar hover preview and in Alt+Tab, where the shell reads this app's icon from.
+    /// A window with no icon shows a blank or generic square in the caption and in the
+    /// taskbar hover preview, where the shell reads this app's icon from.
     #[test]
     fn dialog_carries_the_app_icon_in_every_slot() {
         let _serial = serial();
@@ -2158,50 +2848,30 @@ mod tests {
             use windows::Win32::UI::WindowsAndMessaging::{ICON_BIG, ICON_SMALL, WM_GETICON};
             for slot in [ICON_BIG, ICON_SMALL] {
                 let icon = SendMessageW(hwnd, WM_GETICON, WPARAM(slot as usize), LPARAM(0)).0;
-                assert!(icon != 0, "icon slot {slot} is empty on the settings window");
+                assert!(
+                    icon != 0,
+                    "icon slot {slot} is empty on the settings window"
+                );
             }
         }
         teardown(hwnd);
     }
 
-    /// The filter edits must process input: disabled or covered, WM_CHAR is dropped.
+    /// Typing goes to the dialog, which owns the field text; a filter field must refill
+    /// its own list and leave the other panels alone.
     #[test]
-    fn filter_edits_accept_typing_and_filter_their_lists() {
+    fn fields_accept_typing_and_filter_their_lists() {
         let _serial = serial();
         let hwnd = make_dialog();
         unsafe {
-            use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
-
-            let search = get_dlg_item(hwnd, ID_EDIT_SEARCH);
-            let excluded_edit = get_dlg_item(hwnd, ID_EDIT_FILTER_EXCLUDED);
-            let muted_edit = get_dlg_item(hwnd, ID_EDIT_FILTER_ALWAYS_MUTED);
-            for edit in [search, excluded_edit, muted_edit] {
-                assert!(IsWindowEnabled(edit).as_bool(), "filter edit is disabled");
-                let style = GetWindowLongW(edit, GWL_STYLE);
-                assert_eq!(
-                    style & (WS_TABSTOP.0 as i32),
-                    WS_TABSTOP.0 as i32,
-                    "filter edit lost WS_TABSTOP"
-                );
-                let mut rc = RECT::default();
-                let _ = GetClientRect(edit, &mut rc);
-                let mut pt = windows::Win32::Foundation::POINT {
-                    x: rc.right / 2,
-                    y: rc.bottom / 2,
-                };
-                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(edit, &mut pt);
-                assert_eq!(
-                    WindowFromPoint(pt),
-                    edit,
-                    "a sibling window covers a filter edit"
-                );
+            set_focus_value(Focus::Field(ID_EDIT_SEARCH));
+            for ch in ['a', 'l', 'p'] {
+                SendMessageW(hwnd, WM_CHAR, WPARAM(ch as usize), LPARAM(0));
             }
-
-            SendMessageW(search, WM_CHAR, WPARAM('a' as usize), LPARAM(0));
             assert_eq!(
-                od_controls::window_text(search),
-                "a",
-                "search edit dropped a keystroke"
+                field_text(ID_EDIT_SEARCH),
+                "alp",
+                "search field dropped a keystroke"
             );
 
             // In-memory config only: the saving variants would rewrite the user's file.
@@ -2218,35 +2888,143 @@ mod tests {
             refresh_excluded_list(hwnd);
             refresh_always_muted_list(hwnd);
 
-            let excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
-            let muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
-            // Typing goes through WM_CHAR, so the EN_CHANGE branch refills the list.
-            SendMessageW(excluded_edit, WM_CHAR, WPARAM('g' as usize), LPARAM(0));
-            assert_eq!(enumerate(excluded), vec!["gamma.exe".to_string()]);
+            set_focus_value(Focus::Field(ID_EDIT_FILTER_EXCLUDED));
+            SendMessageW(hwnd, WM_CHAR, WPARAM('g' as usize), LPARAM(0));
+            assert_eq!(rows_of(ID_LIST_EXCLUDED), vec!["gamma.exe".to_string()]);
             assert_eq!(
-                enumerate(muted).len(),
+                rows_of(ID_LIST_ALWAYS_MUTED).len(),
                 2,
                 "filtering one list refilled another"
             );
 
-            SendMessageW(muted_edit, WM_CHAR, WPARAM('D' as usize), LPARAM(0));
-            assert_eq!(enumerate(muted), vec!["delta.exe".to_string()]);
-
-            // Clearing the filter keeps the still-present row selected.
-            SendMessageW(excluded, LB_SETCURSEL, WPARAM(0), LPARAM(0));
-            let empty = to_wide("");
-            let _ = SetWindowTextW(excluded_edit, PCWSTR(empty.as_ptr()));
-            assert_eq!(enumerate(excluded).len(), 2);
+            // Clearing the filter keeps the row that was selected before.
+            select_row(hwnd, ID_LIST_EXCLUDED, 0);
+            with_field(ID_EDIT_FILTER_EXCLUDED, |f| {
+                f.text.clear();
+                f.caret = 0;
+                f.anchor = 0;
+            });
+            handle_command(hwnd, ID_EDIT_FILTER_EXCLUDED, EN_CHANGE);
+            assert_eq!(rows_of(ID_LIST_EXCLUDED).len(), 2, "filter did not clear");
             assert_eq!(
-                SendMessageW(excluded, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0,
-                1
+                with_list(ID_LIST_EXCLUDED, |l| l.selected_text()),
+                Some("gamma.exe".to_string()),
+                "the surviving row lost its selection"
             );
         }
         teardown(hwnd);
     }
 
-    /// Rows in the exclusion / always-muted panels carry no PID, so their icon comes
-    /// from the first running process with that exe name.
+    /// A list click selects the row under the point; a second click on the same row
+    /// inside the double-click time moves it across the panels.
+    #[test]
+    fn list_rows_select_and_double_click_moves_them() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            DIALOG_STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                let s = state.as_mut().unwrap();
+                let mut config = Config::default();
+                config.insert_excluded_app("gamma.exe");
+                config.insert_always_muted_app("delta.exe");
+                s.config = Arc::new(RwLock::new(config));
+                s.all_detected_apps = vec![(1, "alpha.exe".into()), (2, "beta.exe".into())];
+            });
+            // Not refresh_detected_apps: that would replace the rows with the sessions
+            // of whatever the test host plays.
+            refill_detected_list(hwnd);
+            refresh_excluded_list(hwnd);
+            refresh_always_muted_list(hwnd);
+
+            let ctl = ctl_of(hwnd, ID_LIST_DETECTED).unwrap();
+            let (x, y) = (center(ctl.rect).0, ctl.rect.top + row_height() / 2);
+            SendMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(1), LPARAM(lparam_of(x, y)));
+            SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), LPARAM(lparam_of(x, y)));
+            assert_eq!(
+                list_sel(ID_LIST_DETECTED),
+                Some(0),
+                "row click did not select"
+            );
+            assert_eq!(focus(), Focus::List(ID_LIST_DETECTED));
+            assert_eq!(
+                rows_of(ID_LIST_EXCLUDED).len(),
+                1,
+                "a single click moved a row"
+            );
+
+            // The same point immediately again is the double click.
+            SendMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(1), LPARAM(lparam_of(x, y)));
+            assert!(config_of_dialog().read().is_excluded("alpha.exe"));
+            SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), LPARAM(lparam_of(x, y)));
+
+            // excluded -> detected, and always muted -> detected. By text: the panel is
+            // sorted, so row 0 is not necessarily the row this test added.
+            select_text_row(ID_LIST_EXCLUDED, "gamma.exe");
+            handle_command(hwnd, ID_LIST_EXCLUDED, LBN_DBLCLK as u16);
+            select_text_row(ID_LIST_ALWAYS_MUTED, "delta.exe");
+            handle_command(hwnd, ID_LIST_ALWAYS_MUTED, LBN_DBLCLK as u16);
+            let config = config_of_dialog();
+            let config = config.read();
+            assert!(!config.is_excluded("gamma.exe"), "exclusion survived");
+            assert!(
+                !config.always_muted_apps.contains("delta.exe"),
+                "always muted row survived"
+            );
+        }
+        teardown(hwnd);
+    }
+
+    /// Every WM_SIZE must end on one complete frame and must not lose list content: a
+    /// resize repaints the rows it already has, it does not drop them.
+    #[test]
+    fn resize_paints_and_keeps_the_rows() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            let mut config = Config::default();
+            for n in 0..40 {
+                config.insert_excluded_app(&format!("app{n}.exe"));
+            }
+            DIALOG_STATE.with(|state| {
+                state.borrow_mut().as_mut().unwrap().config = Arc::new(RwLock::new(config));
+            });
+            refresh_excluded_list(hwnd);
+            let before = rows_of(ID_LIST_EXCLUDED).len();
+            assert!(before > 0, "no rows to guard");
+
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let (w, h) = (client.right, client.bottom);
+            for (dw, dh) in [(0, 0), (40, 30), (-40, -30), (0, 120)] {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    w + dw,
+                    h + dh,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                assert_eq!(
+                    rows_of(ID_LIST_EXCLUDED).len(),
+                    before,
+                    "a resize lost rows"
+                );
+            }
+            let mut dirty = RECT::default();
+            assert!(
+                !windows::Win32::Graphics::Gdi::GetUpdateRect(hwnd, Some(&mut dirty), false)
+                    .as_bool(),
+                "WM_SIZE returned with the window still dirty"
+            );
+            assert_no_overlaps(hwnd);
+        }
+        teardown(hwnd);
+    }
+
+    /// Rows in the exclusion / always-muted panels carry no PID, so their icon comes from
+    /// the first running process with that exe name.
     #[test]
     fn named_rows_resolve_an_icon_from_a_running_process() {
         unsafe {
@@ -2263,54 +3041,5 @@ mod tests {
             assert!(a.is_some(), "explorer.exe row drew no icon");
             assert!(b.is_none(), "a missing exe name drew an icon");
         }
-    }
-
-    /// A double-click on a row moves it: detected -> excluded, excluded -> detected,
-    /// always muted -> detected.
-    #[test]
-    fn double_click_moves_a_row_between_panels() {
-        let _serial = serial();
-        let hwnd = make_dialog();
-        unsafe {
-            DIALOG_STATE.with(|state| {
-                let mut state = state.borrow_mut();
-                let s = state.as_mut().unwrap();
-                let mut config = Config::default();
-                config.insert_excluded_app("gamma.exe");
-                config.insert_always_muted_app("delta.exe");
-                s.config = Arc::new(RwLock::new(config));
-                s.all_detected_apps = vec![(1, "alpha.exe".into())];
-                s.detected_apps = s.all_detected_apps.clone();
-            });
-            refill_detected_list(hwnd);
-            refresh_excluded_list(hwnd);
-            refresh_always_muted_list(hwnd);
-
-            let detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
-            let excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
-            let muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
-
-            SendMessageW(detected, LB_SETCURSEL, WPARAM(0), LPARAM(0));
-            handle_command(hwnd, ID_LIST_DETECTED, LBN_DBLCLK as u16);
-
-            // alpha.exe is now the first exclusion, so target gamma.exe by text.
-            select_text(excluded, "gamma.exe");
-            handle_command(hwnd, ID_LIST_EXCLUDED, LBN_DBLCLK as u16);
-
-            SendMessageW(muted, LB_SETCURSEL, WPARAM(0), LPARAM(0));
-            handle_command(hwnd, ID_LIST_ALWAYS_MUTED, LBN_DBLCLK as u16);
-
-            DIALOG_STATE.with(|state| {
-                let state = state.borrow();
-                let config = state.as_ref().unwrap().config.read();
-                assert!(config.is_excluded("alpha.exe"), "detected row not excluded");
-                assert!(!config.is_excluded("gamma.exe"), "exclusion survived");
-                assert!(
-                    !config.always_muted_apps.contains("delta.exe"),
-                    "always muted row survived"
-                );
-            });
-        }
-        teardown(hwnd);
     }
 }

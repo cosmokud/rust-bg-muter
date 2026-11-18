@@ -1,0 +1,19 @@
+#!/bin/sh
+# The tree this pushes, and every message behind it. prepare-commit-msg covers a
+# message written with -m or -F and cannot be bypassed; this covers the two things it
+# cannot see, which are a message typed in an editor and a file in the working tree.
+#
+# It reads HEAD. Pushing a branch other than the one checked out is therefore checked
+# against the wrong tree, and there is nothing here that reads the ref being pushed.
+
+set -eu
+
+if ! cargo test --test no_path_leaks; then
+  echo "" >&2
+  echo "The push is stopped. A tracked file, or a commit in this branch, names a" >&2
+  echo "profile directory: that directory is named after the account that owns it," >&2
+  echo "and every clone of this branch inherits it." >&2
+  echo "Write the path as <user>, or with a made-up directory instead — then commit" >&2
+  echo "and push again." >&2
+  exit 1
+fi

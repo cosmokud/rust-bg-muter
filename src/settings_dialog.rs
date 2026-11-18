@@ -2333,7 +2333,7 @@ unsafe fn mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         return;
     };
     let visible = visible_rows(ctl.rect);
-    let backwards = (wparam.0 as i16) < 0;
+    let backwards = (((wparam.0 >> 16) & 0xFFFF) as i16) < 0;
     with_list(ctl.id, |l| {
         l.top = if backwards {
             l.top.saturating_add(3)
@@ -2414,17 +2414,9 @@ unsafe fn key_field(hwnd: HWND, id: i32, vk: u16, shift: bool, ctrl: bool) -> bo
     if edited {
         after_field_edit(hwnd, id);
     } else if moved {
-        if let Some(ctl) = ctl_of(hwnd, id) {
-            // Scrolling the caret into view changed the text origin.
-            let Focus::Field(_) = focus() else {
-                repaint(hwnd);
-                return true;
-            };
-            let (x, top) = field_caret(hwnd, &ctl);
-            let _ = SetCaretPos(x, top);
-            repaint(hwnd);
-            update_caret(hwnd);
-        }
+        // The paint scrolls the caret into view; update_caret puts the bar where it landed.
+        repaint(hwnd);
+        update_caret(hwnd);
     }
     true
 }

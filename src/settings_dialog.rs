@@ -2034,18 +2034,18 @@ mod tests {
         teardown(hwnd);
     }
 
-    /// The shell reads the window icon for the taskbar, the Alt+Tab switcher and the
-    /// hover preview; a dialog created without one shows a blank slot there.
+    /// A window with no icon shows a blank or generic square in the caption, in the
+    /// taskbar hover preview and in Alt+Tab, where the shell reads this app's icon from.
     #[test]
     fn dialog_carries_the_app_icon_in_every_slot() {
         let _serial = serial();
         let hwnd = make_dialog();
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{ICON_BIG, ICON_SMALL, WM_GETICON};
-            let big = SendMessageW(hwnd, WM_GETICON, WPARAM(ICON_BIG as usize), LPARAM(0)).0;
-            let small = SendMessageW(hwnd, WM_GETICON, WPARAM(ICON_SMALL as usize), LPARAM(0)).0;
-            assert!(big != 0, "no big icon on the dialog window");
-            assert!(small != 0, "no small icon on the dialog window");
+            for slot in [ICON_BIG, ICON_SMALL] {
+                let icon = SendMessageW(hwnd, WM_GETICON, WPARAM(slot as usize), LPARAM(0)).0;
+                assert!(icon != 0, "icon slot {slot} is empty on the settings window");
+            }
         }
         teardown(hwnd);
     }

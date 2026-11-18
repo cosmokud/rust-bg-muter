@@ -8,9 +8,11 @@
 mod audio;
 mod config;
 mod muter;
+mod od_controls;
 mod process;
 mod settings_dialog;
 mod startup;
+mod theme;
 mod tray;
 
 use config::Config;
@@ -182,6 +184,18 @@ fn run_tray_loop(
                     }
 
                     log::info!("Muting toggled: {}", enabled);
+                }
+                TrayCommand::MuteAllNow => {
+                    // Reuse the existing toggling path: enable muting and let the engine
+                    // apply it on its next poll instead of duplicating engine work here.
+                    let enabled = {
+                        let mut cfg = config.write();
+                        cfg.set_muting(true);
+                        true
+                    };
+                    muting_enabled.store(enabled, Ordering::SeqCst);
+                    tray.update_state(enabled);
+                    log::info!("Mute-all requested from tray");
                 }
                 TrayCommand::OpenSettings => {
                     // Open native Win32 settings dialog

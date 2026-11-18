@@ -6,9 +6,11 @@
 pub mod audio;
 pub mod config;
 pub mod muter;
+pub mod od_controls;
 pub mod process;
 pub mod settings_dialog;
 pub mod startup;
+pub mod theme;
 pub mod tray;
 
 pub use audio::AudioManager;

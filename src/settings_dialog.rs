@@ -1,26 +1,37 @@
-//! Native Win32 Settings Dialog
+//! Native Win32 settings dialog.
 //!
-//! A lightweight settings window using pure Win32 API with Windows 11 visual styles.
-//! Uses GDI rendering (CPU-based) - zero GPU/VRAM usage.
+//! GDI only (CPU rasterized) - zero GPU/VRAM. All layout numbers are DIPs scaled by
+//! GetDpiForWindow, so per-monitor DPI v2 keeps the 4px grid intact.
+//!
+//! Control IDs and WM_COMMAND branches are unchanged from the pre-owner-draw dialog:
+//! toggles answer BM_SETCHECK/BM_GETCHECK and emit BN_CLICKED.
 
 use crate::audio::AudioManager;
 use crate::config::Config;
+use crate::od_controls::{self, to_wide, Gdi};
 use crate::startup;
+use crate::theme::{apply_chrome, Dip, Palette};
 use parking_lot::RwLock;
 use std::cell::RefCell;
-use std::ffi::{c_void, OsStr};
-use std::os::windows::ffi::OsStrExt;
+use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, HBRUSH, HFONT, HGDIOBJ, InvalidateRect,
-    DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-    DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, COLOR_BTNFACE,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
+    SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX};
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, SetWindowTheme, DRAWITEMSTRUCT, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+    EM_SETCUEBANNER, ODS_FOCUS, ODS_SELECTED,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Control IDs
@@ -51,23 +62,20 @@ const ID_LABEL_RANGE: i32 = 123;
 const ID_LABEL_CONFIG: i32 = 124;
 const ID_LABEL_PATH: i32 = 125;
 
-// Edit notification
 const EN_CHANGE: u16 = 0x0300;
 
-// Window dimensions (wider so process name + PID fits without truncation)
-const WINDOW_WIDTH: i32 = 920;
-const WINDOW_HEIGHT: i32 = 680;
-const MIN_WINDOW_WIDTH: i32 = 820;
-const MIN_WINDOW_HEIGHT: i32 = 600;
+// Window size in DIPs; clamped to 90% of the work area when created.
+const WINDOW_WIDTH: f32 = 920.0;
+const WINDOW_HEIGHT: f32 = 680.0;
+const MIN_WINDOW_WIDTH: f32 = 780.0;
+const MIN_WINDOW_HEIGHT: f32 = 560.0;
 
-// Button states
 const BST_CHECKED: usize = 1;
 const BST_UNCHECKED: usize = 0;
 
-// Thread-local storage for dialog state and font
 thread_local! {
     static DIALOG_STATE: RefCell<Option<DialogState>> = const { RefCell::new(None) };
-    static UI_FONT: RefCell<Option<HFONT>> = const { RefCell::new(None) };
+    static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
 }
 
 struct DialogState {
@@ -75,49 +83,98 @@ struct DialogState {
     muting_enabled: Arc<AtomicBool>,
     audio_manager: Arc<AudioManager>,
     detected_apps: Vec<(u32, String)>, // (pid, name)
-    all_detected_apps: Vec<(u32, String)>, // All apps before filtering
+    all_detected_apps: Vec<(u32, String)>, // all apps before filtering
     search_filter: String,
 }
 
-fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
+/// Per-dialog GDI resources; freed when the dialog closes.
+struct Ui {
+    palette: Palette,
+    dip: Dip,
+    font: HFONT,
+    font_small: HFONT,
+    br_window: HBRUSH,
+    br_card: HBRUSH,
+    br_well: HBRUSH,
+    /// Small-icon cache keyed by exe path; icons are owned and destroyed here.
+    icons: HashMap<String, HICON>,
 }
 
-fn to_wide_ptr(s: &str) -> PCWSTR {
-    // This leaks memory, only use for static strings
-    let wide: Vec<u16> = to_wide(s);
-    PCWSTR(Box::leak(wide.into_boxed_slice()).as_ptr())
+impl Ui {
+    unsafe fn new(hwnd: HWND) -> Self {
+        let dip = Dip::at(hwnd);
+        let palette = Palette::system();
+        Self {
+            palette,
+            dip,
+            font: make_font(dip, 13.0, FW_NORMAL.0 as i32),
+            font_small: make_font(dip, 11.0, FW_NORMAL.0 as i32),
+            br_window: CreateSolidBrush(COLORREF(palette.window)),
+            br_card: CreateSolidBrush(COLORREF(palette.card)),
+            br_well: CreateSolidBrush(COLORREF(palette.well)),
+            icons: HashMap::new(),
+        }
+    }
 }
 
-/// Helper to get dialog item handle, returns default HWND on error
-unsafe fn get_dlg_item(hwnd: HWND, id: i32) -> HWND {
-    GetDlgItem(hwnd, id).unwrap_or_default()
+impl Drop for Ui {
+    fn drop(&mut self) {
+        unsafe {
+            for (_, icon) in self.icons.drain() {
+                let _ = DestroyIcon(icon);
+            }
+            let _ = DeleteObject(HGDIOBJ(self.font.0));
+            let _ = DeleteObject(HGDIOBJ(self.font_small.0));
+            let _ = DeleteObject(HGDIOBJ(self.br_window.0));
+            let _ = DeleteObject(HGDIOBJ(self.br_card.0));
+            let _ = DeleteObject(HGDIOBJ(self.br_well.0));
+        }
+    }
 }
 
-/// Create the Segoe UI font for modern Windows look
-unsafe fn create_ui_font() -> HFONT {
+/// Palette used by owner-drawn child windows during their own WM_PAINT.
+pub fn current_palette() -> Palette {
+    UI.with(|u| u.borrow().as_ref().map(|ui| ui.palette))
+        .unwrap_or_else(Palette::system)
+}
+
+fn with_ui<R>(f: impl FnOnce(&Ui) -> R) -> Option<R> {
+    UI.with(|u| u.borrow().as_ref().map(f))
+}
+
+fn with_ui_mut<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
+    UI.with(|u| u.borrow_mut().as_mut().map(f))
+}
+
+fn dip_of() -> Dip {
+    with_ui(|u| u.dip).unwrap_or(Dip::from_dpi(96))
+}
+
+fn ui_font() -> HFONT {
+    with_ui(|u| u.font).unwrap_or(HFONT(std::ptr::null_mut()))
+}
+
+/// Negative height = character cell height in pixels.
+unsafe fn make_font(dip: Dip, size: f32, weight: i32) -> HFONT {
+    let name = to_wide("Segoe UI");
     CreateFontW(
-        -14,                    // Height (negative = character height)
-        0,                      // Width (0 = default)
-        0,                      // Escapement
-        0,                      // Orientation
-        FW_NORMAL.0 as i32,     // Weight
-        0,                      // Italic
-        0,                      // Underline
-        0,                      // StrikeOut
+        -dip.px(size),
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
         DEFAULT_CHARSET.0 as u32,
         OUT_TT_PRECIS.0 as u32,
         CLIP_DEFAULT_PRECIS.0 as u32,
         CLEARTYPE_QUALITY.0 as u32,
         (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-        to_wide_ptr("Segoe UI"),
+        PCWSTR(name.as_ptr()),
     )
 }
 
-/// Initialize common controls for Windows 11 visual styles
 fn init_common_controls() {
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
@@ -128,12 +185,18 @@ fn init_common_controls() {
     }
 }
 
+unsafe fn get_dlg_item(hwnd: HWND, id: i32) -> HWND {
+    GetDlgItem(hwnd, id).unwrap_or_default()
+}
+
+fn invalidate(hwnd: HWND) {
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
 /// Opens the settings dialog (blocks until closed)
-pub fn open_settings_dialog(
-    config: Arc<RwLock<Config>>,
-    muting_enabled: Arc<AtomicBool>,
-) {
-    // Create audio manager for detecting apps
+pub fn open_settings_dialog(config: Arc<RwLock<Config>>, muting_enabled: Arc<AtomicBool>) {
     let audio_manager = match AudioManager::new() {
         Ok(am) => Arc::new(am),
         Err(e) => {
@@ -142,7 +205,6 @@ pub fn open_settings_dialog(
         }
     };
 
-    // Store state in thread-local
     DIALOG_STATE.with(|state| {
         *state.borrow_mut() = Some(DialogState {
             config,
@@ -154,51 +216,46 @@ pub fn open_settings_dialog(
         });
     });
 
-    // Initialize common controls for visual styles
     init_common_controls();
 
     unsafe {
-        // Create the UI font
-        let font = create_ui_font();
-        UI_FONT.with(|f| *f.borrow_mut() = Some(font));
-
-        // Register window class
         let class_name = to_wide("BgMuterSettingsClass");
         let hmodule = GetModuleHandleW(None).unwrap_or_default();
 
+        od_controls::register_classes(hmodule.into());
+
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: WNDCLASS_STYLES(0),
             lpfnWndProc: Some(window_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
             hInstance: hmodule.into(),
-            hIcon: HICON::default(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as *mut c_void), // System button face color
-            lpszMenuName: PCWSTR::null(),
+            // Every pixel is painted by us; no system erase brush.
+            hbrBackground: HBRUSH::default(),
             lpszClassName: PCWSTR(class_name.as_ptr()),
-            hIconSm: HICON::default(),
+            ..WNDCLASSEXW::default()
         };
-
         RegisterClassExW(&wc);
 
-        // Calculate centered position
-        let screen_width = GetSystemMetrics(SM_CXSCREEN);
-        let screen_height = GetSystemMetrics(SM_CYSCREEN);
-        let x = (screen_width - WINDOW_WIDTH) / 2;
-        let y = (screen_height - WINDOW_HEIGHT) / 2;
+        let (width, height, x, y) = initial_geometry();
+        let title = to_wide("Background Muter - Settings");
 
-        // Create window (resizable)
         let hwnd_result = CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             PCWSTR(class_name.as_ptr()),
-            to_wide_ptr("Background Muter - Settings"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
+            PCWSTR(title.as_ptr()),
+            WS_OVERLAPPED
+                | WS_CAPTION
+                | WS_SYSMENU
+                | WS_VISIBLE
+                | WS_THICKFRAME
+                | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX
+                | WS_CLIPCHILDREN,
             x,
             y,
-            WINDOW_WIDTH,
-            WINDOW_HEIGHT,
+            width,
+            height,
             None,
             None,
             hmodule,
@@ -215,45 +272,341 @@ pub fn open_settings_dialog(
 
         let _ = ShowWindow(hwnd, SW_SHOW);
 
-        // Message loop for this window
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if !IsDialogMessageW(hwnd, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            
-            // Check if window was destroyed
             if !IsWindow(hwnd).as_bool() {
                 break;
             }
         }
 
-        // Cleanup
         let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), hmodule);
-        
-        // Delete the font
-        UI_FONT.with(|f| {
-            if let Some(font) = f.borrow_mut().take() {
-                let _ = DeleteObject(HGDIOBJ(font.0));
-            }
-        });
+        UI.with(|u| *u.borrow_mut() = None);
     }
 
-    // Clear thread-local state
     DIALOG_STATE.with(|state| {
         *state.borrow_mut() = None;
     });
 }
 
-unsafe extern "system" fn window_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+fn initial_geometry() -> (i32, i32, i32, i32) {
+    unsafe {
+        let mut work = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut RECT as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let dip = Dip::from_dpi(windows::Win32::UI::HiDpi::GetDpiForSystem());
+        let avail_w = (work.right - work.left).max(1);
+        let avail_h = (work.bottom - work.top).max(1);
+        // Keep the whole dialog on small or heavily scaled screens.
+        let width = dip.px(WINDOW_WIDTH).min(avail_w * 9 / 10);
+        let height = dip.px(WINDOW_HEIGHT).min(avail_h * 9 / 10);
+        let x = work.left + (avail_w - width) / 2;
+        let y = work.top + (avail_h - height) / 2;
+        (width, height, x, y)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Button,
+    Toggle,
+    Label,
+    Edit,
+    List,
+    Card,
+}
+
+struct Ctl {
+    id: i32,
+    kind: Kind,
+    text: String,
+    rect: RECT,
+}
+
+/// Single source of truth for control geometry: creation, WM_SIZE and DPI changes all
+/// go through here so the DIP grid cannot drift between paths.
+fn layout(hwnd: HWND) -> Vec<Ctl> {
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rc);
+    }
+    let width = rc.right - rc.left;
+    let height = rc.bottom - rc.top;
+    let s = |v: f32| dip_of().px(v);
+
+    let margin = s(12.0);
+    let left_panel_width = (width - margin * 3) / 2;
+    let right_panel_x = margin * 2 + left_panel_width;
+    let right_panel_width = width - right_panel_x - margin;
+
+    // Cards fill whatever height the window has; the lower sections are fixed.
+    let detected_group_height = (height - s(130.0) - s(75.0) - s(50.0) - s(30.0)).max(s(200.0));
+    let right_panel_height = (detected_group_height - s(20.0)) / 2;
+    let buttons_y = detected_group_height + s(15.0);
+    let settings_y = buttons_y + s(75.0);
+    let settings_height = s(130.0);
+    let card_y = s(4.0);
+    let card_h = detected_group_height;
+    let row = s(24.0);
+
+    let mut out: Vec<Ctl> = Vec::new();
+    let mut push = |id: i32, kind: Kind, text: &str, x: i32, y: i32, w: i32, h: i32| {
+        out.push(Ctl {
+            id,
+            kind,
+            text: text.to_string(),
+            rect: RECT {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            },
+        });
+    };
+
+    // Cards first: sibling z-order puts the controls created after them on top.
+    push(ID_GRP_DETECTED, Kind::Card, "Detected Audio Apps", margin, card_y, left_panel_width, card_h);
+    push(ID_GRP_EXCLUDED, Kind::Card, "Excluded Apps (Always Audible)", right_panel_x, card_y, right_panel_width, right_panel_height);
+    push(
+        ID_GRP_ALWAYS_MUTED,
+        Kind::Card,
+        "Always Muted",
+        right_panel_x,
+        card_y + right_panel_height + s(8.0),
+        right_panel_width,
+        right_panel_height,
+    );
+    push(ID_GROUP_SETTINGS, Kind::Card, "Settings", margin, settings_y, width - margin * 2, settings_height);
+
+    push(ID_LABEL_SEARCH, Kind::Label, "Search:", margin + s(12.0), card_y + s(32.0), s(50.0), s(20.0));
+    push(ID_EDIT_SEARCH, Kind::Edit, "", margin + s(64.0), card_y + s(30.0), left_panel_width - s(76.0), s(24.0));
+    push(
+        ID_LIST_DETECTED,
+        Kind::List,
+        "",
+        margin + s(12.0),
+        card_y + s(60.0),
+        left_panel_width - s(24.0),
+        card_h - s(60.0) - s(36.0),
+    );
+    push(ID_BTN_REFRESH, Kind::Button, "Refresh List", margin + s(12.0), card_y + card_h - s(30.0), s(100.0), s(26.0));
+
+    push(
+        ID_LIST_EXCLUDED,
+        Kind::List,
+        "",
+        right_panel_x + s(12.0),
+        card_y + s(36.0),
+        right_panel_width - s(24.0),
+        right_panel_height - s(48.0),
+    );
+    push(
+        ID_LIST_ALWAYS_MUTED,
+        Kind::List,
+        "",
+        right_panel_x + s(12.0),
+        card_y + right_panel_height + s(8.0) + s(32.0),
+        right_panel_width - s(24.0),
+        right_panel_height - s(44.0),
+    );
+
+    push(ID_BTN_ADD_EXCLUSION, Kind::Button, "Add to Exclusions \u{2192}", margin + s(12.0), buttons_y, s(180.0), row + s(4.0));
+    push(ID_BTN_ADD_ALWAYS_MUTED, Kind::Button, "Add to Always Muted \u{2192}", margin + s(12.0), buttons_y + row + s(8.0), s(180.0), row + s(4.0));
+    push(
+        ID_BTN_REMOVE_EXCLUSION,
+        Kind::Button,
+        "\u{2190} Remove from Exclusions",
+        right_panel_x + right_panel_width - s(220.0),
+        buttons_y,
+        s(220.0),
+        row + s(4.0),
+    );
+    push(
+        ID_BTN_REMOVE_ALWAYS_MUTED,
+        Kind::Button,
+        "\u{2190} Remove from Always Muted",
+        right_panel_x + right_panel_width - s(240.0),
+        buttons_y + row + s(8.0),
+        s(240.0),
+        row + s(4.0),
+    );
+
+    push(ID_CHECK_ENABLED, Kind::Toggle, "Muting Enabled", margin + s(16.0), settings_y + s(26.0), s(200.0), s(22.0));
+    push(ID_CHECK_START_MINIMIZED, Kind::Toggle, "Start Minimized to Tray", margin + s(16.0), settings_y + s(50.0), s(200.0), s(22.0));
+    push(ID_CHECK_START_WINDOWS, Kind::Toggle, "Start with Windows", margin + s(16.0), settings_y + s(74.0), s(200.0), s(22.0));
+
+    push(ID_LABEL_POLL, Kind::Label, "Poll Interval:", width - s(268.0), settings_y + s(32.0), s(90.0), s(20.0));
+    push(ID_EDIT_POLL_INTERVAL, Kind::Edit, "", width - s(176.0), settings_y + s(30.0), s(60.0), s(24.0));
+    push(ID_LABEL_MS, Kind::Label, "ms", width - s(108.0), settings_y + s(32.0), s(25.0), s(20.0));
+    push(ID_LABEL_RANGE, Kind::Label, "Range: 100-2000 ms", width - s(268.0), settings_y + s(58.0), s(180.0), s(18.0));
+    push(ID_LABEL_CONFIG, Kind::Label, "Config file:", margin + s(16.0), settings_y + s(102.0), s(70.0), s(18.0));
+    let path = Config::config_path().to_string_lossy().to_string();
+    push(ID_LABEL_PATH, Kind::Label, &path, margin + s(88.0), settings_y + s(102.0), width - margin * 2 - s(96.0), s(18.0));
+
+    push(ID_BTN_SAVE_ONLY, Kind::Button, "Save", width - s(330.0), height - s(45.0), s(95.0), s(32.0));
+    push(ID_BTN_SAVE_CLOSE, Kind::Button, "Save && Close", width - s(225.0), height - s(45.0), s(105.0), s(32.0));
+    push(ID_BTN_CLOSE, Kind::Button, "Cancel", width - s(112.0), height - s(45.0), s(100.0), s(32.0));
+
+    out
+}
+
+unsafe fn create_controls(hwnd: HWND) {
+    let hmodule = GetModuleHandleW(None).unwrap_or_default();
+    let font = ui_font();
+    let p = current_palette();
+
+    let mut lists: Vec<HWND> = Vec::new();
+
+    for ctl in layout(hwnd) {
+        let (class, style) = match ctl.kind {
+            Kind::Card => (
+                od_controls::CLASS_CARD,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+            ),
+            Kind::Toggle => (
+                od_controls::CLASS_TOGGLE,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS,
+            ),
+            Kind::Button => (
+                "BUTTON",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WINDOW_STYLE(BS_OWNERDRAW as u32),
+            ),
+            Kind::Label => ("STATIC", WS_CHILD | WS_VISIBLE),
+            Kind::Edit => (
+                "EDIT",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+            ),
+            Kind::List => (
+                "LISTBOX",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | WS_BORDER
+                    | WINDOW_STYLE((LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32),
+            ),
+        };
+
+        let mut style = style;
+        if ctl.id == ID_EDIT_POLL_INTERVAL {
+            style = WINDOW_STYLE(style.0 | ES_NUMBER as u32);
+        }
+
+        let class_w = to_wide(class);
+        let text_w = to_wide(&ctl.text);
+        let created = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class_w.as_ptr()),
+            PCWSTR(text_w.as_ptr()),
+            style,
+            ctl.rect.left,
+            ctl.rect.top,
+            ctl.rect.right - ctl.rect.left,
+            ctl.rect.bottom - ctl.rect.top,
+            hwnd,
+            HMENU(ctl.id as *mut c_void),
+            hmodule,
+            None,
+        );
+
+        if let Ok(ctl_hwnd) = created {
+            set_font(ctl_hwnd, font);
+            match ctl.kind {
+                Kind::Button => od_controls::attach_hover(ctl_hwnd),
+                Kind::List => {
+                    lists.push(ctl_hwnd);
+                    let _ = SendMessageW(
+                        ctl_hwnd,
+                        LB_SETITEMHEIGHT,
+                        WPARAM(0),
+                        LPARAM(dip_of().px(24.0) as isize),
+                    );
+                    let _ = SendMessageW(
+                        ctl_hwnd,
+                        LB_SETHORIZONTALEXTENT,
+                        WPARAM(dip_of().px(600.0) as usize),
+                        LPARAM(0),
+                    );
+                }
+                Kind::Toggle => {
+                    // The toggle draws its own background, so it needs no parent erase.
+                    let _ = InvalidateRect(ctl_hwnd, None, false);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Cue banner on the search box (native EDIT supports it).
+    let search = get_dlg_item(hwnd, ID_EDIT_SEARCH);
+    if !search.0.is_null() {
+        let cue = to_wide("Filter by process name");
+        let _ = SendMessageW(
+            search,
+            EM_SETCUEBANNER,
+            WPARAM(1),
+            LPARAM(cue.as_ptr() as isize),
+        );
+    }
+
+    // Dark scrollbars: documented uxtheme class name; ignored if unavailable.
+    if p.dark {
+        let dark = to_wide("DarkMode_Explorer");
+        for list in lists {
+            let _ = SetWindowTheme(list, PCWSTR(dark.as_ptr()), PCWSTR::null());
+        }
+    }
+}
+
+unsafe fn resize_controls(hwnd: HWND) {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    if rc.right < 100 || rc.bottom < 100 {
+        return; // minimized
+    }
+    for ctl in layout(hwnd) {
+        let ctrl = get_dlg_item(hwnd, ctl.id);
+        if !ctrl.0.is_null() {
+            let _ = SetWindowPos(
+                ctrl,
+                None,
+                ctl.rect.left,
+                ctl.rect.top,
+                ctl.rect.right - ctl.rect.left,
+                ctl.rect.bottom - ctl.rect.top,
+                SWP_NOZORDER,
+            );
+        }
+    }
+    invalidate(hwnd);
+}
+
+unsafe fn set_font(hwnd: HWND, font: HFONT) {
+    SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+}
+
+/// Window background. A memory DC was measured at ~2.5 MB resident for the full
+/// client area, and WS_CLIPCHILDREN + WM_ERASEBKGND=1 already keeps child paints from
+/// flickering, so the flat fill is drawn straight to the window DC.
+unsafe fn paint(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    if rc.right > 0 && rc.bottom > 0 {
+        FillRect(hdc, &ps.rcPaint, HBRUSH(with_ui(|u| u.br_window).unwrap_or_default().0));
+    }
+    let _ = EndPaint(hwnd, &ps);
+}
+
+unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
+            UI.with(|u| *u.borrow_mut() = Some(Ui::new(hwnd)));
+            with_ui(|u| apply_chrome(hwnd, u.palette.dark));
             create_controls(hwnd);
             refresh_detected_apps(hwnd);
             load_settings_to_controls(hwnd);
@@ -279,16 +632,60 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_SIZE => {
-            let width = (lparam.0 & 0xFFFF) as i32;
-            let height = ((lparam.0 >> 16) & 0xFFFF) as i32;
-            resize_controls(hwnd, width, height);
+            resize_controls(hwnd);
             LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            let new_dpi = (wparam.0 & 0xFFFF) as u32;
+            if let Some(suggested) = (lparam.0 as *const RECT).as_ref() {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            reinit_for_dpi(hwnd, new_dpi);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1), // fully painted in WM_PAINT
+        WM_PAINT => {
+            paint(hwnd);
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC => {
+            let p = current_palette();
+            let hdc = HDC(wparam.0 as *mut c_void);
+            SetTextColor(hdc, COLORREF(p.text));
+            SetBkMode(hdc, TRANSPARENT);
+            LRESULT(with_ui(|u| u.br_card).unwrap_or_default().0 as isize)
+        }
+        WM_CTLCOLOREDIT => {
+            let p = current_palette();
+            let hdc = HDC(wparam.0 as *mut c_void);
+            SetTextColor(hdc, COLORREF(p.text));
+            SetBkColor(hdc, COLORREF(p.well));
+            LRESULT(with_ui(|u| u.br_well).unwrap_or_default().0 as isize)
+        }
+
+        WM_CTLCOLORLISTBOX => {
+            let p = current_palette();
+            SetBkColor(HDC(wparam.0 as *mut c_void), COLORREF(p.well));
+            LRESULT(with_ui(|u| u.br_well).unwrap_or_default().0 as isize)
+        }
+        WM_DRAWITEM => {
+            draw_item(lparam);
+            LRESULT(1)
         }
         WM_GETMINMAXINFO => {
             let mmi = lparam.0 as *mut MINMAXINFO;
             if !mmi.is_null() {
-                (*mmi).ptMinTrackSize.x = MIN_WINDOW_WIDTH;
-                (*mmi).ptMinTrackSize.y = MIN_WINDOW_HEIGHT;
+                let dip = dip_of();
+                (*mmi).ptMinTrackSize.x = dip.px(MIN_WINDOW_WIDTH);
+                (*mmi).ptMinTrackSize.y = dip.px(MIN_WINDOW_HEIGHT);
             }
             LRESULT(0)
         }
@@ -304,453 +701,245 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-unsafe fn create_controls(hwnd: HWND) {
-    let hmodule = GetModuleHandleW(None).unwrap_or_default();
-
-    // Get the font
-    let font = UI_FONT.with(|f| f.borrow().unwrap_or_default());
-
-    // Get client rect for initial sizing
-    let mut rect = std::mem::zeroed();
-    let _ = GetClientRect(hwnd, &mut rect);
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-    
-    // Calculate layout
-    let margin = 12;
-    let left_panel_width = (width - margin * 3) / 2;
-    let right_panel_x = margin * 2 + left_panel_width;
-    let right_panel_width = width - right_panel_x - margin;
-    
-    // Calculate list heights - split the right side into two equal parts
-    let detected_group_height = 280;
-    let right_panel_height = (detected_group_height - 20) / 2;
-
-    // === Audio Apps Section ===
-    // Group box for detected apps (left side)
-    let grp_detected = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "Detected Audio Apps",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
-        margin,
-        8,
-        left_panel_width,
-        detected_group_height,
-        ID_GRP_DETECTED,
-    );
-    set_font(grp_detected, font);
-
-    // Search label
-    let lbl_search = create_control(
-        hwnd,
-        hmodule,
-        "STATIC",
-        "Search:",
-        WS_CHILD | WS_VISIBLE,
-        margin + 10,
-        28,
-        50,
-        20,
-        ID_LABEL_SEARCH,
-    );
-    set_font(lbl_search, font);
-
-    // Search box
-    let edit_search = create_control(
-        hwnd,
-        hmodule,
-        "EDIT",
-        "",
-        WS_CHILD | WS_VISIBLE | WS_BORDER,
-        margin + 65,
-        26,
-        left_panel_width - 85,
-        22,
-        ID_EDIT_SEARCH,
-    );
-    set_font(edit_search, font);
-
-    // Detected apps listbox
-    let list_detected = create_control(
-        hwnd,
-        hmodule,
-        "LISTBOX",
-        "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
-        margin + 10,
-        52,
-        left_panel_width - 20,
-        195,
-        ID_LIST_DETECTED,
-    );
-    set_font(list_detected, font);
-
-    // Refresh button under detected list
-    let btn_refresh = create_control(hwnd, hmodule, "BUTTON", "Refresh List", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32), 
-        margin + 10, 252, 100, 26, ID_BTN_REFRESH);
-    set_font(btn_refresh, font);
-
-    // Group box for excluded apps (right side, top)
-    let grp_excluded = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "Excluded Apps (Always Audible)",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
-        right_panel_x,
-        8,
-        right_panel_width,
-        right_panel_height,
-        ID_GRP_EXCLUDED,
-    );
-    set_font(grp_excluded, font);
-
-    // Excluded apps listbox
-    let list_excluded = create_control(
-        hwnd,
-        hmodule,
-        "LISTBOX",
-        "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
-        right_panel_x + 10,
-        28,
-        right_panel_width - 20,
-        right_panel_height - 28,
-        ID_LIST_EXCLUDED,
-    );
-    set_font(list_excluded, font);
-
-    // Group box for always muted apps (right side, bottom)
-    let grp_always_muted = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "Always Muted",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
-        right_panel_x,
-        8 + right_panel_height + 5,
-        right_panel_width,
-        right_panel_height,
-        ID_GRP_ALWAYS_MUTED,
-    );
-    set_font(grp_always_muted, font);
-
-    // Always muted listbox
-    let list_always_muted = create_control(
-        hwnd,
-        hmodule,
-        "LISTBOX",
-        "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_BORDER | WINDOW_STYLE(LBS_NOTIFY as u32),
-        right_panel_x + 10,
-        28 + right_panel_height + 5,
-        right_panel_width - 20,
-        right_panel_height - 28,
-        ID_LIST_ALWAYS_MUTED,
-    );
-    set_font(list_always_muted, font);
-
-    // Add/Remove buttons row
-    let buttons_y = detected_group_height + 15;
-    
-    let btn_add = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "Add to Exclusions →",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        margin + 10,
-        buttons_y,
-        180,
-        28,
-        ID_BTN_ADD_EXCLUSION,
-    );
-    set_font(btn_add, font);
-
-    let btn_add_always = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "Add to Always Muted →",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        margin + 10,
-        buttons_y + 32,
-        180,
-        28,
-        ID_BTN_ADD_ALWAYS_MUTED,
-    );
-    set_font(btn_add_always, font);
-
-    let btn_remove = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "← Remove from Exclusions",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        right_panel_x + right_panel_width - 220,
-        buttons_y,
-        220,
-        28,
-        ID_BTN_REMOVE_EXCLUSION,
-    );
-    set_font(btn_remove, font);
-
-    let btn_remove_always = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "← Remove from Always Muted",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        right_panel_x + right_panel_width - 240,
-        buttons_y + 32,
-        240,
-        28,
-        ID_BTN_REMOVE_ALWAYS_MUTED,
-    );
-    set_font(btn_remove_always, font);
-
-    // === Settings Section ===
-    let settings_y = buttons_y + 75;
-    let settings_height = 130;
-    
-    let grp_settings = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "Settings",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32),
-        margin,
-        settings_y,
-        width - margin * 2,
-        settings_height,
-        ID_GROUP_SETTINGS,
-    );
-    set_font(grp_settings, font);
-
-    // Checkboxes
-    let chk_enabled = create_control(hwnd, hmodule, "BUTTON", "Muting Enabled", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
-        margin + 13, settings_y + 22, 200, 22, ID_CHECK_ENABLED);
-    set_font(chk_enabled, font);
-
-    let chk_minimized = create_control(hwnd, hmodule, "BUTTON", "Start Minimized to Tray", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
-        margin + 13, settings_y + 46, 200, 22, ID_CHECK_START_MINIMIZED);
-    set_font(chk_minimized, font);
-
-    let chk_startup = create_control(hwnd, hmodule, "BUTTON", "Start with Windows", 
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 
-        margin + 13, settings_y + 70, 200, 22, ID_CHECK_START_WINDOWS);
-    set_font(chk_startup, font);
-
-    // Poll interval on the right side
-    let lbl_poll = create_control(
-        hwnd,
-        hmodule,
-        "STATIC",
-        "Poll Interval:",
-        WS_CHILD | WS_VISIBLE,
-        width - 260,
-        settings_y + 25,
-        90,
-        20,
-        ID_LABEL_POLL,
-    );
-    set_font(lbl_poll, font);
-
-    let edit_poll = create_control(
-        hwnd,
-        hmodule,
-        "EDIT",
-        "",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32),
-        width - 165,
-        settings_y + 22,
-        60,
-        24,
-        ID_EDIT_POLL_INTERVAL,
-    );
-    set_font(edit_poll, font);
-
-    let lbl_ms = create_control(hwnd, hmodule, "STATIC", "ms", WS_CHILD | WS_VISIBLE, width - 100, settings_y + 25, 25, 20, ID_LABEL_MS);
-    set_font(lbl_ms, font);
-
-    let lbl_range = create_control(
-        hwnd,
-        hmodule,
-        "STATIC",
-        "(Range: 100-2000 ms)",
-        WS_CHILD | WS_VISIBLE,
-        width - 260,
-        settings_y + 50,
-        180,
-        18,
-        ID_LABEL_RANGE,
-    );
-    set_font(lbl_range, font);
-
-    // Config path info
-    let lbl_config = create_control(hwnd, hmodule, "STATIC", "Config file:", 
-        WS_CHILD | WS_VISIBLE, 
-        margin + 13, settings_y + 98, 70, 18, ID_LABEL_CONFIG);
-    set_font(lbl_config, font);
-    
-    let config_path = Config::config_path();
-    let path_str = config_path.to_string_lossy();
-    let lbl_path = create_control(hwnd, hmodule, "STATIC", &path_str, WS_CHILD | WS_VISIBLE, margin + 85, settings_y + 98, width - margin * 2 - 90, 18, ID_LABEL_PATH);
-    set_font(lbl_path, font);
-
-    // === Bottom Buttons ===
-    let btn_save_only = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "Save",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        width - 330,
-        height - 45,
-        95,
-        32,
-        ID_BTN_SAVE_ONLY,
-    );
-    set_font(btn_save_only, font);
-
-    let btn_save_close = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "Save && Close",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        width - 225,
-        height - 45,
-        105,
-        32,
-        ID_BTN_SAVE_CLOSE,
-    );
-    set_font(btn_save_close, font);
-
-    let btn_cancel = create_control(
-        hwnd,
-        hmodule,
-        "BUTTON",
-        "Cancel",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-        width - 112,
-        height - 45,
-        100,
-        32,
-        ID_BTN_CLOSE,
-    );
-    set_font(btn_cancel, font);
-}
-
-/// Handle window resize - reposition all controls
-unsafe fn resize_controls(hwnd: HWND, width: i32, height: i32) {
-    if width < 100 || height < 100 {
-        return; // Prevent invalid sizes during minimize
+unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
+    with_ui_mut(|ui| {
+        let dip = Dip::from_dpi(dpi);
+        let _ = DeleteObject(HGDIOBJ(ui.font.0));
+        let _ = DeleteObject(HGDIOBJ(ui.font_small.0));
+        ui.dip = dip;
+        ui.font = make_font(dip, 13.0, FW_NORMAL.0 as i32);
+        ui.font_small = make_font(dip, 11.0, FW_NORMAL.0 as i32);
+    });
+    let font = ui_font();
+    for ctl in layout(hwnd) {
+        let ctrl = get_dlg_item(hwnd, ctl.id);
+        if !ctrl.0.is_null() {
+            set_font(ctrl, font);
+            if ctl.kind == Kind::List {
+                let _ = SendMessageW(ctrl, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(dip_of().px(24.0) as isize));
+            }
+        }
     }
-
-    let margin = 12;
-    let left_panel_width = (width - margin * 3) / 2;
-    let right_panel_x = margin * 2 + left_panel_width;
-    let right_panel_width = width - right_panel_x - margin;
-    
-    // Calculate available height for app lists (leave room for settings, buttons)
-    let settings_height = 130;
-    let bottom_buttons_height = 50;
-    let buttons_row_height = 75;
-    let available_for_lists = height - settings_height - bottom_buttons_height - buttons_row_height - 30;
-    let detected_group_height = available_for_lists.max(200);
-    let right_panel_height = (detected_group_height - 20) / 2;
-
-    // Detected apps group
-    move_control(hwnd, ID_GRP_DETECTED, margin, 8, left_panel_width, detected_group_height);
-    move_control(hwnd, ID_LABEL_SEARCH, margin + 10, 28, 50, 20);
-    move_control(hwnd, ID_EDIT_SEARCH, margin + 65, 26, left_panel_width - 85, 22);
-    move_control(hwnd, ID_LIST_DETECTED, margin + 10, 52, left_panel_width - 20, detected_group_height - 85);
-    move_control(hwnd, ID_BTN_REFRESH, margin + 10, detected_group_height - 25, 100, 26);
-
-    // Excluded apps group
-    move_control(hwnd, ID_GRP_EXCLUDED, right_panel_x, 8, right_panel_width, right_panel_height);
-    move_control(hwnd, ID_LIST_EXCLUDED, right_panel_x + 10, 28, right_panel_width - 20, right_panel_height - 28);
-
-    // Always muted group
-    move_control(hwnd, ID_GRP_ALWAYS_MUTED, right_panel_x, 8 + right_panel_height + 5, right_panel_width, right_panel_height);
-    move_control(hwnd, ID_LIST_ALWAYS_MUTED, right_panel_x + 10, 28 + right_panel_height + 5, right_panel_width - 20, right_panel_height - 28);
-
-    // Add/Remove buttons
-    let buttons_y = detected_group_height + 15;
-    move_control(hwnd, ID_BTN_ADD_EXCLUSION, margin + 10, buttons_y, 180, 28);
-    move_control(hwnd, ID_BTN_ADD_ALWAYS_MUTED, margin + 10, buttons_y + 32, 180, 28);
-    move_control(hwnd, ID_BTN_REMOVE_EXCLUSION, right_panel_x + right_panel_width - 220, buttons_y, 220, 28);
-    move_control(hwnd, ID_BTN_REMOVE_ALWAYS_MUTED, right_panel_x + right_panel_width - 240, buttons_y + 32, 240, 28);
-
-    // Settings group
-    let settings_y = buttons_y + 75;
-    move_control(hwnd, ID_GROUP_SETTINGS, margin, settings_y, width - margin * 2, settings_height);
-    move_control(hwnd, ID_CHECK_ENABLED, margin + 13, settings_y + 22, 200, 22);
-    move_control(hwnd, ID_CHECK_START_MINIMIZED, margin + 13, settings_y + 46, 200, 22);
-    move_control(hwnd, ID_CHECK_START_WINDOWS, margin + 13, settings_y + 70, 200, 22);
-    move_control(hwnd, ID_LABEL_POLL, width - 260, settings_y + 25, 90, 20);
-    move_control(hwnd, ID_EDIT_POLL_INTERVAL, width - 165, settings_y + 22, 60, 24);
-    move_control(hwnd, ID_LABEL_MS, width - 100, settings_y + 25, 25, 20);
-    move_control(hwnd, ID_LABEL_RANGE, width - 260, settings_y + 50, 180, 18);
-    move_control(hwnd, ID_LABEL_CONFIG, margin + 13, settings_y + 98, 70, 18);
-    move_control(hwnd, ID_LABEL_PATH, margin + 85, settings_y + 98, width - margin * 2 - 90, 18);
-
-    // Bottom buttons
-    move_control(hwnd, ID_BTN_SAVE_ONLY, width - 330, height - 45, 95, 32);
-    move_control(hwnd, ID_BTN_SAVE_CLOSE, width - 225, height - 45, 105, 32);
-    move_control(hwnd, ID_BTN_CLOSE, width - 112, height - 45, 100, 32);
-
-    // Force redraw
-    let _ = InvalidateRect(hwnd, None, true);
+    resize_controls(hwnd);
 }
 
-/// Helper to move/resize a control
-unsafe fn move_control(hwnd: HWND, id: i32, x: i32, y: i32, w: i32, h: i32) {
-    let ctrl = get_dlg_item(hwnd, id);
-    if !ctrl.0.is_null() {
-        let _ = SetWindowPos(ctrl, None, x, y, w, h, SWP_NOZORDER);
+unsafe fn draw_item_bg(hdc: HDC, rc: RECT) {
+    let p = current_palette();
+    let mut g = Gdi::default();
+    g.fill(hdc, &rc, p.well);
+}
+
+unsafe fn draw_item(lparam: LPARAM) {
+    let dis = lparam.0 as *const DRAWITEMSTRUCT;
+    let Some(dis) = dis.as_ref() else { return };
+    if dis.CtlID == 0 {
+        return;
+    }
+    match dis.CtlID as i32 {
+        ID_LIST_DETECTED | ID_LIST_EXCLUDED | ID_LIST_ALWAYS_MUTED => draw_list_item(dis),
+        _ => draw_button(dis),
     }
 }
 
-/// Helper to create a control and return its handle
-unsafe fn create_control(hwnd: HWND, hmodule: HMODULE, class: &str, text: &str, style: WINDOW_STYLE, x: i32, y: i32, w: i32, h: i32, id: i32) -> HWND {
-    let hwnd_ctl = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        to_wide_ptr(class),
-        to_wide_ptr(text),
-        style,
-        x,
-        y,
-        w,
-        h,
-        hwnd,
-        if id != 0 { HMENU(id as *mut c_void) } else { HMENU::default() },
-        hmodule,
-        None,
-    );
-    hwnd_ctl.unwrap_or_default()
+/// Background surface under a control: the card it overlaps, else the window.
+fn surface_under(parent: HWND, rc: RECT) -> u32 {
+    let p = current_palette();
+    let center = windows::Win32::Foundation::POINT {
+        x: (rc.left + rc.right) / 2,
+        y: (rc.top + rc.bottom) / 2,
+    };
+    let on_card = layout(parent).iter().any(|c| {
+        c.kind == Kind::Card
+            && center.x >= c.rect.left
+            && center.x <= c.rect.right
+            && center.y >= c.rect.top
+            && center.y <= c.rect.bottom
+    });
+    if on_card {
+        p.card
+    } else {
+        p.window
+    }
 }
 
-/// Set font on a control
-unsafe fn set_font(hwnd: HWND, font: HFONT) {
-    SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
+    let p = current_palette();
+    let dip = dip_of();
+    let s = |v: f32| dip.px(v);
+    let mut g = Gdi::default();
+    let rc = dis.rcItem;
+    let label = od_controls::window_text(dis.hwndItem);
+    let primary = dis.CtlID as i32 == ID_BTN_SAVE_CLOSE;
+    let hot = od_controls::is_hot(dis.hwndItem);
+    let pressed = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+    let focused = (dis.itemState.0 & ODS_FOCUS.0) != 0 || GetFocus() == dis.hwndItem;
+    let small = with_ui(|u| u.font_small).unwrap_or(HFONT(std::ptr::null_mut()));
+
+    let parent = GetParent(dis.hwndItem).unwrap_or_default();
+    g.fill(dis.hDC, &rc, surface_under(parent, rc));
+
+    let (fill, fg, border) = if primary {
+        let f = if pressed {
+            od_controls::mix(p.accent, 0x000000, 0.25)
+        } else if hot {
+            od_controls::mix(p.accent, p.text, 0.12)
+        } else {
+            p.accent
+        };
+        (f, p.on_accent, None)
+    } else {
+        let f = if pressed {
+            p.pressed
+        } else if hot {
+            p.hover
+        } else {
+            p.card
+        };
+        (f, p.text, Some(if focused { p.accent } else { p.hairline }))
+    };
+
+    let inner = RECT {
+        left: rc.left + s(2.0),
+        top: rc.top + s(3.0),
+        right: rc.right - s(2.0),
+        bottom: rc.bottom - s(3.0),
+    };
+    g.round(dis.hDC, &inner, s(6.0), fill, border);
+    g.text(
+        dis.hDC,
+        &inner,
+        &label,
+        small,
+        fg,
+        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS,
+    );
+}
+
+unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
+    if dis.itemID as usize == usize::MAX {
+        // LB_SETITEMHEIGHT / empty list: paint the empty row so the well keeps its color.
+        draw_item_bg(dis.hDC, dis.rcItem);
+        return;
+    }
+    let p = current_palette();
+    let dip = dip_of();
+    let s = |v: f32| dip.px(v);
+    let mut g = Gdi::default();
+    let rc = dis.rcItem;
+    let selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+    let focused = selected && ((dis.itemState.0 & ODS_FOCUS.0) != 0 || GetFocus() == dis.hwndItem);
+
+    let bg = if selected {
+        od_controls::mix(p.well, p.accent, 0.30)
+    } else if od_controls::hot_item(dis.hwndItem) == dis.itemID as isize {
+        p.hover
+    } else {
+        p.well
+    };
+    g.fill(dis.hDC, &rc, bg);
+    if focused {
+        g.round(dis.hDC, &rc, s(4.0), bg, Some(p.accent));
+    }
+
+    let len = SendMessageW(dis.hwndItem, LB_GETTEXTLEN, WPARAM(dis.itemID as usize), LPARAM(0)).0 as usize;
+    if len == 0 {
+        return;
+    }
+    let mut buf: Vec<u16> = vec![0; len + 1];
+    SendMessageW(
+        dis.hwndItem,
+        LB_GETTEXT,
+        WPARAM(dis.itemID as usize),
+        LPARAM(buf.as_mut_ptr() as isize),
+    );
+    let text = String::from_utf16_lossy(&buf[..len]);
+
+    let icon_size = s(16.0);
+    let pid = SendMessageW(dis.hwndItem, LB_GETITEMDATA, WPARAM(dis.itemID as usize), LPARAM(0)).0;
+    let icon = row_icon(pid.max(0) as u32, &text);
+
+    let text_left;
+    if let Some(icon) = icon {
+        let y = rc.top + ((rc.bottom - rc.top) - icon_size) / 2;
+        let _ = DrawIconEx(dis.hDC, rc.left + s(6.0), y, icon, icon_size, icon_size, 0, HBRUSH::default(), DI_NORMAL);
+        text_left = rc.left + s(6.0) + icon_size + s(8.0);
+    } else {
+        text_left = rc.left + s(8.0);
+    }
+
+    let text_rc = RECT {
+        left: text_left,
+        top: rc.top,
+        right: rc.right - s(4.0),
+        bottom: rc.bottom,
+    };
+    g.text(
+        dis.hDC,
+        &text_rc,
+        &text,
+        ui_font(),
+        p.text,
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
+}
+
+/// Small icon for a list row. `pid` is the real process (detected list); otherwise the
+/// text is a process name and the generic executable icon is used.
+unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
+    let path = if pid > 0 {
+        process_image_path(pid).unwrap_or_else(|| text.to_string())
+    } else {
+        text.to_string()
+    };
+
+    if let Some(icon) = with_ui(|u| u.icons.get(&path).copied()).flatten() {
+        return Some(icon);
+    }
+
+    // shortcut: ExtractIconEx only, SHGetFileInfoW costs ~7 MB of shell heap per dialog,
+    // measured; revisit if a per-extension icon (non-exe names) is needed.
+    let wide = to_wide(&path);
+    let mut large = HICON::default();
+    let mut small = HICON::default();
+    let count = ExtractIconExW(PCWSTR(wide.as_ptr()), 0, Some(&mut large), Some(&mut small), 1);
+    if !large.0.is_null() {
+        let _ = DestroyIcon(large);
+    }
+    if count == 0 || small.0.is_null() {
+        return None;
+    }
+    with_ui_mut(|u| {
+        u.icons.insert(path, small);
+    });
+    Some(small)
+}
+
+/// Full exe path of a running process, capped so a dead PID costs one syscall.
+unsafe fn process_image_path(pid: u32) -> Option<String> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+    let mut buf = [0u16; 260];
+    let mut size = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(
+        process,
+        PROCESS_NAME_WIN32,
+        windows::core::PWSTR(buf.as_mut_ptr()),
+        &mut size,
+    )
+    .is_ok();
+    let _ = windows::Win32::Foundation::CloseHandle(process);
+    (ok && size > 0).then(|| String::from_utf16_lossy(&buf[..size as usize]))
 }
 
 unsafe fn refresh_detected_apps(hwnd: HWND) {
     let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
-    
-    // Clear list
+
     SendMessageW(list_detected, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
 
     DIALOG_STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
-            // Get current audio sessions
             let sessions = s.audio_manager.get_sessions();
             s.all_detected_apps.clear();
             s.detected_apps.clear();
@@ -760,77 +949,79 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
             let always_muted = config.always_muted_apps.clone();
             drop(config);
 
-            // Build the full list of apps (excluding already excluded/always-muted)
             let mut apps: Vec<(u32, String)> = Vec::new();
             for session in sessions {
-                // Skip if already excluded
                 if excluded.contains(&session.process_name.to_lowercase()) {
                     continue;
                 }
-
-                // Skip if already always-muted
                 if always_muted.contains(&session.process_name.to_lowercase()) {
                     continue;
                 }
-
                 apps.push((session.process_id, session.process_name.clone()));
             }
 
-            // Sort alphabetically by process name (case-insensitive)
             apps.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
             s.all_detected_apps = apps;
 
-            // Apply search filter
             let filter = s.search_filter.to_lowercase();
             for (pid, name) in &s.all_detected_apps {
                 if filter.is_empty() || name.to_lowercase().contains(&filter) {
                     s.detected_apps.push((*pid, name.clone()));
-                    
                     let display = format!("{} (PID: {})", name, pid);
                     let wide = to_wide(&display);
-                    SendMessageW(
+                    let idx = SendMessageW(
                         list_detected,
                         LB_ADDSTRING,
                         WPARAM(0),
                         LPARAM(wide.as_ptr() as isize),
                     );
+                    if idx.0 >= 0 {
+                        // Item data = PID, so the owner-draw can resolve the real icon.
+                        SendMessageW(
+                            list_detected,
+                            LB_SETITEMDATA,
+                            WPARAM(idx.0 as usize),
+                            LPARAM(*pid as isize),
+                        );
+                    }
                 }
             }
         }
     });
 
-    // Refresh excluded list too
     refresh_excluded_list(hwnd);
-
-    // Refresh always muted list too
     refresh_always_muted_list(hwnd);
 }
 
-/// Apply search filter without refreshing from audio manager
 unsafe fn apply_search_filter(hwnd: HWND) {
     let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
-    
-    // Clear list
+
     SendMessageW(list_detected, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
 
     DIALOG_STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
             s.detected_apps.clear();
 
-            // Apply search filter
             let filter = s.search_filter.to_lowercase();
             for (pid, name) in &s.all_detected_apps {
                 if filter.is_empty() || name.to_lowercase().contains(&filter) {
                     s.detected_apps.push((*pid, name.clone()));
-                    
                     let display = format!("{} (PID: {})", name, pid);
                     let wide = to_wide(&display);
-                    SendMessageW(
+                    let idx = SendMessageW(
                         list_detected,
                         LB_ADDSTRING,
                         WPARAM(0),
                         LPARAM(wide.as_ptr() as isize),
                     );
+                    if idx.0 >= 0 {
+                        SendMessageW(
+                            list_detected,
+                            LB_SETITEMDATA,
+                            WPARAM(idx.0 as usize),
+                            LPARAM(*pid as isize),
+                        );
+                    }
                 }
             }
         }
@@ -839,17 +1030,14 @@ unsafe fn apply_search_filter(hwnd: HWND) {
 
 unsafe fn refresh_excluded_list(hwnd: HWND) {
     let list_excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
-    
-    // Clear list
+
     SendMessageW(list_excluded, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
 
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
             let mut excluded: Vec<_> = s.config.read().excluded_apps.iter().cloned().collect();
-            
-            // Sort alphabetically (case-insensitive)
             excluded.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-            
+
             for app in excluded {
                 let wide = to_wide(&app);
                 SendMessageW(
@@ -866,14 +1054,11 @@ unsafe fn refresh_excluded_list(hwnd: HWND) {
 unsafe fn refresh_always_muted_list(hwnd: HWND) {
     let list_always_muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
 
-    // Clear list
     SendMessageW(list_always_muted, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
 
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
             let mut always_muted: Vec<_> = s.config.read().always_muted_apps.iter().cloned().collect();
-
-            // Sort alphabetically (case-insensitive)
             always_muted.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
 
             for app in always_muted {
@@ -895,43 +1080,33 @@ unsafe fn load_settings_to_controls(hwnd: HWND) {
             let config = s.config.read();
             let muting_enabled = s.muting_enabled.load(Ordering::Relaxed);
 
-            // Muting enabled checkbox
-            SendMessageW(
-                get_dlg_item(hwnd, ID_CHECK_ENABLED),
-                BM_SETCHECK,
-                WPARAM(if muting_enabled { BST_CHECKED } else { BST_UNCHECKED }),
-                LPARAM(0),
-            );
+            set_check(hwnd, ID_CHECK_ENABLED, muting_enabled);
+            set_check(hwnd, ID_CHECK_START_MINIMIZED, config.start_minimized);
+            set_check(hwnd, ID_CHECK_START_WINDOWS, config.start_with_windows);
 
-            // Start minimized checkbox
-            SendMessageW(
-                get_dlg_item(hwnd, ID_CHECK_START_MINIMIZED),
-                BM_SETCHECK,
-                WPARAM(if config.start_minimized { BST_CHECKED } else { BST_UNCHECKED }),
-                LPARAM(0),
-            );
-
-            // Start with Windows checkbox
-            SendMessageW(
-                get_dlg_item(hwnd, ID_CHECK_START_WINDOWS),
-                BM_SETCHECK,
-                WPARAM(if config.start_with_windows { BST_CHECKED } else { BST_UNCHECKED }),
-                LPARAM(0),
-            );
-
-            // Poll interval edit
             let poll_str = to_wide(&config.poll_interval_ms.to_string());
             let _ = SetWindowTextW(get_dlg_item(hwnd, ID_EDIT_POLL_INTERVAL), PCWSTR(poll_str.as_ptr()));
         }
     });
 }
 
+unsafe fn set_check(hwnd: HWND, id: i32, on: bool) {
+    SendMessageW(
+        get_dlg_item(hwnd, id),
+        BM_SETCHECK,
+        WPARAM(if on { BST_CHECKED } else { BST_UNCHECKED }),
+        LPARAM(0),
+    );
+}
+
+unsafe fn get_check(hwnd: HWND, id: i32) -> bool {
+    SendMessageW(get_dlg_item(hwnd, id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == BST_CHECKED as isize
+}
+
 unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
     match control_id {
         ID_EDIT_SEARCH => {
-            // Handle search box text change
             if notification == EN_CHANGE {
-                // Get search text
                 let edit_search = get_dlg_item(hwnd, ID_EDIT_SEARCH);
                 let mut buffer: [u16; 256] = [0; 256];
                 let len = GetWindowTextW(edit_search, &mut buffer);
@@ -940,15 +1115,13 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
                 } else {
                     String::new()
                 };
-                
-                // Update search filter in state
+
                 DIALOG_STATE.with(|state| {
                     if let Some(ref mut s) = *state.borrow_mut() {
                         s.search_filter = search_text;
                     }
                 });
-                
-                // Apply filter
+
                 apply_search_filter(hwnd);
             }
         }
@@ -984,7 +1157,7 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
 unsafe fn add_selected_to_exclusions(hwnd: HWND) {
     let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
     let sel_idx = SendMessageW(list_detected, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
-    
+
     if sel_idx < 0 {
         return; // Nothing selected
     }
@@ -1004,12 +1177,11 @@ unsafe fn add_selected_to_exclusions(hwnd: HWND) {
 unsafe fn remove_selected_exclusion(hwnd: HWND) {
     let list_excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
     let sel_idx = SendMessageW(list_excluded, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
-    
+
     if sel_idx < 0 {
         return; // Nothing selected
     }
 
-    // Get the selected text
     let text_len = SendMessageW(list_excluded, LB_GETTEXTLEN, WPARAM(sel_idx as usize), LPARAM(0)).0 as usize;
     if text_len == 0 {
         return;
@@ -1063,7 +1235,6 @@ unsafe fn remove_selected_always_muted(hwnd: HWND) {
         return; // Nothing selected
     }
 
-    // Get the selected text
     let text_len = SendMessageW(list_always_muted, LB_GETTEXTLEN, WPARAM(sel_idx as usize), LPARAM(0)).0 as usize;
     if text_len == 0 {
         return;
@@ -1094,41 +1265,20 @@ unsafe fn save_settings(hwnd: HWND) {
         if let Some(ref s) = *state.borrow() {
             let mut config = s.config.write();
 
-            // Read checkbox states
-            let muting_checked = SendMessageW(
-                get_dlg_item(hwnd, ID_CHECK_ENABLED),
-                BM_GETCHECK,
-                WPARAM(0),
-                LPARAM(0),
-            ).0 == BST_CHECKED as isize;
+            let muting_checked = get_check(hwnd, ID_CHECK_ENABLED);
+            let start_minimized_checked = get_check(hwnd, ID_CHECK_START_MINIMIZED);
+            let start_windows_checked = get_check(hwnd, ID_CHECK_START_WINDOWS);
 
-            let start_minimized_checked = SendMessageW(
-                get_dlg_item(hwnd, ID_CHECK_START_MINIMIZED),
-                BM_GETCHECK,
-                WPARAM(0),
-                LPARAM(0),
-            ).0 == BST_CHECKED as isize;
-
-            let start_windows_checked = SendMessageW(
-                get_dlg_item(hwnd, ID_CHECK_START_WINDOWS),
-                BM_GETCHECK,
-                WPARAM(0),
-                LPARAM(0),
-            ).0 == BST_CHECKED as isize;
-
-            // Read poll interval
             let mut buffer: [u16; 32] = [0; 32];
             GetWindowTextW(get_dlg_item(hwnd, ID_EDIT_POLL_INTERVAL), &mut buffer);
             let poll_str = String::from_utf16_lossy(&buffer);
             let poll_str = poll_str.trim_matches('\0').trim();
             let poll_interval: u64 = poll_str.parse().unwrap_or(500).clamp(100, 2000);
 
-            // Update config
             config.muting_enabled = muting_checked;
             config.start_minimized = start_minimized_checked;
             config.poll_interval_ms = poll_interval;
 
-            // Handle startup setting change
             if config.start_with_windows != start_windows_checked {
                 config.start_with_windows = start_windows_checked;
                 if let Err(e) = startup::set_run_at_startup(start_windows_checked) {
@@ -1136,10 +1286,7 @@ unsafe fn save_settings(hwnd: HWND) {
                 }
             }
 
-            // Update atomic muting state
             s.muting_enabled.store(muting_checked, Ordering::SeqCst);
-
-            // Save to disk
             let _ = config.save();
         }
     });

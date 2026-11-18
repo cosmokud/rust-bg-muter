@@ -5,6 +5,8 @@
 
 pub mod audio;
 pub mod config;
+pub mod confirm_dialog;
+pub mod mixer_reset;
 pub mod muter;
 pub mod od_controls;
 pub mod process;

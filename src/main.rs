@@ -7,6 +7,8 @@
 
 mod audio;
 mod config;
+mod confirm_dialog;
+mod mixer_reset;
 mod muter;
 mod od_controls;
 mod process;

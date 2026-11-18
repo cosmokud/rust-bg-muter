@@ -8,6 +8,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::sync::Arc;
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, FALSE, TRUE};
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
     eCommunications, eConsole, eMultimedia, eRender, IAudioSessionControl2,
     IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
@@ -121,6 +122,43 @@ impl AudioManager {
         Ok(())
     }
 
+    /// Puts every live session and every default render endpoint back to the state a
+    /// fresh session starts in: unmuted, full volume.
+    ///
+    /// This is the runtime half of the Volume Mixer reset - the stored per-app
+    /// preferences are cleared separately - and it is what makes a reset visible now
+    /// instead of at the next session start. A session that cannot be written is
+    /// skipped rather than aborting the pass: one protected process must not leave the
+    /// rest of the mixer at its old level. Returns the number of targets updated.
+    pub fn reset_all(&self) -> usize {
+        let mut devices: Vec<IMMDevice> = Vec::new();
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if let Ok(enumerator) =
+                CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            {
+                for role in [eConsole, eMultimedia, eCommunications] {
+                    if let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, role) {
+                        devices.push(device);
+                    }
+                }
+            }
+        }
+
+        // Endpoints first, sessions after: a session write is what the user sees in the
+        // mixer, so it must win over whatever the endpoint change propagated down.
+        let mut changed = 0;
+        for device in &devices {
+            changed += reset_device_endpoint(device);
+        }
+        changed += reset_sessions(&self.sessions);
+
+        // The cached session interfaces now describe a muted mixer; the muter repopulates
+        // them on its next poll, and a stale entry here would be read as the old level.
+        self.sessions.lock().clear();
+        changed
+    }
+
     /// Checks if a process is currently muted
     #[allow(dead_code)]
     pub fn is_muted(&self, pid: u32) -> bool {
@@ -137,6 +175,50 @@ impl Default for AudioManager {
     fn default() -> Self {
         Self::new().expect("Failed to create AudioManager")
     }
+}
+
+/// Unmutes the default endpoint and sets it to full volume; 1 when both writes land.
+fn reset_device_endpoint(device: &IMMDevice) -> usize {
+    unsafe {
+        let Ok(endpoint) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) else {
+            return 0;
+        };
+        let mut done = 0;
+        if endpoint.SetMute(FALSE, std::ptr::null()).is_ok() {
+            done += 1;
+        }
+        if endpoint
+            .SetMasterVolumeLevelScalar(1.0, std::ptr::null())
+            .is_ok()
+        {
+            done += 1;
+        }
+        done
+    }
+}
+
+/// Unmutes every live session and sets it to full volume, across every render device -
+/// not just the default ones, so a session on a secondary output is reset too.
+fn reset_sessions(sessions: &Mutex<HashMap<u32, CachedSession>>) -> usize {
+    let cached: Vec<isize> = {
+        let guard = sessions.lock();
+        guard.values().map(|s| s.volume.as_raw() as isize).collect()
+    };
+    let mut changed = 0;
+    for raw in cached {
+        // The cached interface owns one reference; this one is dropped with `volume`, so
+        // the cache stays valid for the next poll.
+        let volume = unsafe { ISimpleAudioVolume::from_raw(raw as *mut std::ffi::c_void) };
+        let landed = unsafe {
+            let unmuted = volume.SetMute(FALSE, std::ptr::null()).is_ok();
+            let full = volume.SetMasterVolume(1.0, std::ptr::null()).is_ok();
+            unmuted && full
+        };
+        if landed {
+            changed += 1;
+        }
+    }
+    changed
 }
 
 /// Collects sessions for a specific audio device
@@ -256,7 +338,7 @@ fn get_process_name_cached(pid: u32) -> String {
 /// Normalizes known system processes to "System Sounds" for cleaner display
 fn normalize_system_process_name(name: String) -> String {
     let lower = name.to_lowercase();
-    
+
     // Known Windows system sound processes - these should be tagged as "System Sounds"
     const SYSTEM_SOUND_PROCESSES: &[&str] = &[
         "audiodg.exe",           // Windows Audio Device Graph Isolation
@@ -265,13 +347,13 @@ fn normalize_system_process_name(name: String) -> String {
         "systemsounds.exe",      // System Sounds
         "rundll32.exe",          // Often used for playing system sounds
     ];
-    
+
     for sys_proc in SYSTEM_SOUND_PROCESSES {
         if lower == *sys_proc {
             return "System Sounds".to_string();
         }
     }
-    
+
     name
 }
 

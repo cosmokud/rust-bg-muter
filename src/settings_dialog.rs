@@ -78,13 +78,21 @@ const ID_LABEL_PATH: i32 = 125;
 const ID_EDIT_FILTER_EXCLUDED: i32 = 127;
 const ID_EDIT_FILTER_ALWAYS_MUTED: i32 = 128;
 const ID_BTN_EDIT_CONFIG: i32 = 129;
+const ID_BTN_RESET_MIXER: i32 = 130;
+
+/// Bottom button row, in DIPs: one width for every button and the gap between them. The
+/// row is anchored to the right edge, so it only grows leftwards as it gains a button.
+const ROW_BTN_W: f32 = 100.0;
+const ROW_BTN_GAP: f32 = 7.0;
 
 const EN_CHANGE: u16 = 0x0300;
 
 // Window size in DIPs; clamped to 90% of the work area when created.
 const WINDOW_WIDTH: f32 = 920.0;
 const WINDOW_HEIGHT: f32 = 680.0;
-const MIN_WINDOW_WIDTH: f32 = 780.0;
+// Room for the four-button bottom row plus the two list panels: the row is right
+// anchored, so it is what sets the floor once it has four buttons.
+const MIN_WINDOW_WIDTH: f32 = 880.0;
 const MIN_WINDOW_HEIGHT: f32 = 560.0;
 
 thread_local! {
@@ -316,7 +324,15 @@ pub fn ui_font() -> HFONT {
 }
 
 /// Negative height = character cell height in pixels.
-unsafe fn make_font(dip: Dip, size: f32, weight: i32) -> HFONT {
+///
+/// Shared with the confirmation prompt, which builds its own pair: it can open on a
+/// monitor whose DPI this dialog never saw, so it cannot reuse these handles.
+///
+/// # Safety
+/// `CreateFontW` writes to no shared state; the returned handle must be kept for the
+/// process lifetime (fonts are cached per DPI, never deleted while a window may select
+/// one).
+pub unsafe fn make_font(dip: Dip, size: f32, weight: i32) -> HFONT {
     let name = to_wide("Segoe UI");
     CreateFontW(
         -dip.px(size),
@@ -776,40 +792,56 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         s(18.0),
     );
 
+    // Bottom row, right anchored: Cancel is the rightmost, then Save && Close, Save,
+    // Edit Config, and Reset Mixer at the far left of the row.
+    let row_y = height - s(45.0);
+    let slot =
+        |index: i32| width - s(12.0) - s(ROW_BTN_W) - (s(ROW_BTN_W) + s(ROW_BTN_GAP)) * index;
+    // Reset Mixer sits left of Edit Config: it is the one button that acts on the mixer
+    // instead of on the dialog, so it is set apart from the save/config group.
+    push(
+        ID_BTN_RESET_MIXER,
+        Kind::Button,
+        "Reset Mixer",
+        slot(4),
+        row_y,
+        s(ROW_BTN_W),
+        s(32.0),
+    );
     push(
         ID_BTN_EDIT_CONFIG,
         Kind::Button,
         "Edit Config",
-        width - s(438.0),
-        height - s(45.0),
-        s(100.0),
+        slot(3),
+        row_y,
+        s(ROW_BTN_W),
         s(32.0),
     );
     push(
         ID_BTN_SAVE_ONLY,
         Kind::Button,
         "Save",
-        width - s(330.0),
-        height - s(45.0),
-        s(95.0),
+        slot(2),
+        row_y,
+        s(ROW_BTN_W),
         s(32.0),
     );
     push(
         ID_BTN_SAVE_CLOSE,
         Kind::Button,
         "Save && Close",
-        width - s(225.0),
-        height - s(45.0),
-        s(105.0),
+        slot(1),
+        row_y,
+        s(ROW_BTN_W),
         s(32.0),
     );
     push(
         ID_BTN_CLOSE,
         Kind::Button,
         "Cancel",
-        width - s(112.0),
-        height - s(45.0),
-        s(100.0),
+        slot(0),
+        row_y,
+        s(ROW_BTN_W),
         s(32.0),
     );
 
@@ -1994,6 +2026,9 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
         ID_BTN_SAVE_ONLY => {
             save_settings(hwnd);
         }
+        ID_BTN_RESET_MIXER => {
+            reset_mixer(hwnd);
+        }
         ID_BTN_EDIT_CONFIG => {
             // Save first so the file on disk matches the dialog the user is looking at.
             save_settings(hwnd);
@@ -2019,6 +2054,50 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
         }
         _ => {}
     }
+}
+
+/// Reset Mixer: the Windows Volume Mixer reset, both halves of the state Windows keeps.
+///
+/// The stored half is the per-app preference subtree under `LowRegistry` - the part
+/// Windows' own reset deletes - and the live half puts every session and every default
+/// endpoint back to unmuted at full volume, so the result is visible now rather than at
+/// the next stream. The settings file is deliberately untouched: the exclusion and
+/// always-muted lists are this app's configuration, not mixer state.
+unsafe fn reset_mixer(hwnd: HWND) {
+    let confirmed = crate::confirm_dialog::open_confirm(
+        hwnd,
+        "Reset Mixer",
+        "Every app's volume and mute state goes back to the Windows defaults, and the \
+         levels Windows remembers for them are cleared. Apps that are playing stop \
+         muted. This cannot be undone.",
+        "Reset",
+    );
+    if !confirmed {
+        return;
+    }
+
+    let report = crate::mixer_reset::clear_stored_preferences();
+    let levels = DIALOG_STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|s| s.audio_manager.reset_all())
+            .unwrap_or(0)
+    });
+
+    log::info!(
+        "Mixer reset: {} remembered key(s) cleared, {} live level(s) restored, {} failure(s)",
+        report.keys_removed,
+        levels,
+        report.failures.len()
+    );
+    for failure in &report.failures {
+        log::warn!("Mixer reset: {}", failure);
+    }
+
+    // The detected list is a reading of the mixer: it must show what the reset left.
+    refresh_detected_apps(hwnd);
+    repaint(hwnd);
 }
 
 unsafe fn add_selected_to_exclusions(hwnd: HWND) {
@@ -3256,7 +3335,7 @@ mod tests {
         teardown(hwnd);
     }
 
-
+ 
     /// Every control must land inside the card that owns it, and no row may collide with
     /// another. A pill painted away from its row (all three at one height) is exactly the
     /// class of bug a wrong scale or a wrong origin introduces, so pin the numbers down.
@@ -3447,7 +3526,6 @@ mod tests {
         teardown(hwnd);
     }
 
-
     /// A toggle must not draw a focus ring: the accent outline that appeared after a click
     /// read as a leftover highlight. Painting onto the card colour, nothing but the pill and
     /// its knob may change a pixel: the band just outside the pill stays card.
@@ -3509,5 +3587,4 @@ mod tests {
         }
         teardown(hwnd);
     }
-
 }

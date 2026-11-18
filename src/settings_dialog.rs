@@ -28,10 +28,11 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, DeleteDC,
     DeleteObject, EndPaint, GetDC, GetTextExtentPoint32W, IntersectClipRect, InvalidateRect,
-    ReleaseDC, RestoreDC, SaveDC, SelectObject, UpdateWindow, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, HBITMAP, HBRUSH, HDC, HFONT,
-    HGDIOBJ, OUT_TT_PRECIS, PAINTSTRUCT, SRCCOPY,
+    ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBrushOrgEx, SetStretchBltMode,
+    StretchBlt, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    FF_DONTCARE, FW_NORMAL, HALFTONE, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_TT_PRECIS,
+    PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -916,7 +917,159 @@ unsafe fn process_image_path(pid: u32) -> Option<String> {
     let _ = windows::Win32::Foundation::CloseHandle(process);
     (ok && size > 0).then(|| String::from_utf16_lossy(&buf[..size as usize]))
 }
-// ------------------------------------------------------------------- painting
+// GDI has no antialiasing, so curved edges are supersampled: the shape is rasterized at
+// AA_SUPERSAMPLE x into a small off-screen bitmap and downscaled with HALFTONE (a box
+// average of the covered pixels) -> sub-pixel pill edges and a smooth knob.
+const AA_SUPERSAMPLE: i32 = 8;
+
+pub enum Shape {
+    Round,
+    Dot,
+}
+
+/// Shapes to rasterize supersampled, in draw order: kind, rect (dialog coords), corner
+/// radius at 1x, fill colour.
+type Shapes<'a> = &'a [(Shape, RECT, i32, u32)];
+
+/// Cached supersampled bitmap identity: (control id, rect, backdrop, dark palette, on,
+/// hot, pressed, focused, accent). Every palette is derived from dark + accent, so that
+/// pair identifies the colours too; the rect carries the DPI-scaled geometry.
+type SsKey = (i32, [i32; 4], u32, bool, bool, bool, bool, bool, u32);
+
+// One slot per control: state permutations would otherwise pile up megabytes of bitmaps.
+thread_local! {
+    static SS: RefCell<HashMap<i32, (SsKey, HDC, HBITMAP, i32, i32)>> = RefCell::new(HashMap::new());
+}
+
+// Creation count, so a test can prove a repaint of an unchanged toggle reuses the bitmap.
+#[cfg(test)]
+thread_local! {
+    static SS_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Draws `shapes` antialiased into `rc`, then strokes `border` at 1x on top: a downscaled
+/// 1px line softens into grey haze, so the outline must stay on the final 1x buffer.
+/// `bg` is the flat surface behind `rc`; the rounded corners show it through.
+/// `state` is (on, hot, pressed, focused) and only selects the cache slot.
+unsafe fn aa_shape(
+    hdc: HDC,
+    id: i32,
+    rc: &RECT,
+    radius: i32,
+    p: &Palette,
+    bg: u32,
+    border: Option<u32>,
+    state: (bool, bool, bool, bool),
+    shapes: Shapes,
+) {
+    let (on, hot, pressed, focused) = state;
+    let key = (
+        id,
+        [rc.left, rc.top, rc.right, rc.bottom],
+        bg,
+        p.dark,
+        on,
+        hot,
+        pressed,
+        focused,
+        p.accent,
+    );
+    if let Some(dc) = ss_buffer(hdc, &key, rc, bg, shapes) {
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        SetStretchBltMode(hdc, HALFTONE);
+        // HALFTONE samples from the brush origin; a stale one shifts the downscale by it.
+        let _ = SetBrushOrgEx(hdc, 0, 0, None);
+        let _ = StretchBlt(
+            hdc,
+            rc.left,
+            rc.top,
+            w,
+            h,
+            dc,
+            0,
+            0,
+            w * AA_SUPERSAMPLE,
+            h * AA_SUPERSAMPLE,
+            SRCCOPY,
+        );
+    }
+    if let Some(color) = border {
+        od_controls::stroke(hdc, rc, radius, color);
+    }
+}
+
+/// Memory DC holding `shapes` at AA_SUPERSAMPLE scale over `bg`, created once per `key`.
+unsafe fn ss_buffer(
+    hdc: HDC,
+    key: &SsKey,
+    rc: &RECT,
+    bg: u32,
+    shapes: Shapes,
+) -> Option<HDC> {
+    SS.with(|ss| {
+        let mut ss = ss.borrow_mut();
+        if let Some((held, dc, _, _, _)) = ss.get(&key.0) {
+            if *held == *key {
+                return Some(*dc);
+            }
+        }
+        // DC first: destroying it deselects the bitmap, which is what makes deleting it legal.
+        if let Some((_, dc, bmp, _, _)) = ss.remove(&key.0) {
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(bmp);
+        }
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let (sw, sh) = (w * AA_SUPERSAMPLE, h * AA_SUPERSAMPLE);
+        let dc = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, sw, sh);
+        if dc.0.is_null() || bmp.0.is_null() {
+            if !dc.0.is_null() {
+                let _ = DeleteDC(dc);
+            }
+            if !bmp.0.is_null() {
+                let _ = DeleteObject(bmp);
+            }
+            return None;
+        }
+        SelectObject(dc, bmp);
+        let full = RECT {
+            left: 0,
+            top: 0,
+            right: sw,
+            bottom: sh,
+        };
+        od_controls::fill(dc, &full, bg);
+        for (shape, rect, radius, color) in shapes {
+            let at = |v: i32| (v - rc.left) * AA_SUPERSAMPLE;
+            let at_y = |v: i32| (v - rc.top) * AA_SUPERSAMPLE;
+            let r = RECT {
+                left: at(rect.left),
+                top: at_y(rect.top),
+                right: at(rect.right),
+                bottom: at_y(rect.bottom),
+            };
+            match shape {
+                Shape::Round => {
+                    od_controls::round(dc, &r, radius * AA_SUPERSAMPLE, *color, None)
+                }
+                Shape::Dot => od_controls::dot(dc, &r, *color),
+            }
+        }
+        #[cfg(test)]
+        SS_BUILDS.with(|c| c.set(c.get() + 1));
+        ss.insert(key.0, (*key, dc, bmp, sw, sh));
+        Some(dc)
+    })
+}
+
+unsafe fn free_ss_buffers() {
+    SS.with(|ss| {
+        for (_, (_, dc, bmp, _, _)) in ss.borrow_mut().drain() {
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(bmp);
+        }
+    });
+}
 
 thread_local! {
     // One off-screen surface per window, rebuilt only when the client size changes.
@@ -1165,37 +1318,48 @@ unsafe fn draw_toggle(
     } else {
         p.well
     };
-    od_controls::round(hdc, &pill, pill_h / 2, track, (!on).then_some(p.hairline));
-
-    let knob_d = pill_h - dip.px(4.0);
-    let knob_x = if on {
-        pill.right - dip.px(2.0) - knob_d
-    } else {
-        pill.left + dip.px(2.0)
-    };
-    od_controls::dot(
-        hdc,
-        &RECT {
-            left: knob_x,
-            top: pill.top + dip.px(2.0),
-            right: knob_x + knob_d,
-            bottom: pill.top + dip.px(2.0) + knob_d,
+    let knob = RECT {
+        left: if on {
+            pill.right - dip.px(2.0) - (pill_h - dip.px(4.0))
+        } else {
+            pill.left + dip.px(2.0)
         },
-        if on { p.on_accent } else { p.secondary },
+        top: pill.top + dip.px(2.0),
+        ..Default::default()
+    };
+    let knob = RECT {
+        right: knob.left + pill_h - dip.px(4.0),
+        bottom: knob.top + pill_h - dip.px(4.0),
+        ..knob
+    };
+    let ring = RECT {
+        left: pill.left - dip.px(2.0),
+        top: pill.top - dip.px(2.0),
+        right: pill.right + dip.px(2.0),
+        bottom: pill.bottom + dip.px(2.0),
+    };
+    // The focus ring is stroked at 1x, so it is not part of the supersampled pass.
+    aa_shape(
+        hdc,
+        ctl.id,
+        &pill,
+        pill_h / 2,
+        p,
+        surface_of(rc, cards),
+        (!on).then_some(p.hairline),
+        (on, hot, pressed, focused),
+        &[
+            (Shape::Round, pill, pill_h / 2, track),
+            (
+                Shape::Dot,
+                knob,
+                0,
+                if on { p.on_accent } else { p.secondary },
+            ),
+        ],
     );
-
     if focused {
-        od_controls::stroke(
-            hdc,
-            &RECT {
-                left: pill.left - dip.px(2.0),
-                top: pill.top - dip.px(2.0),
-                right: pill.right + dip.px(2.0),
-                bottom: pill.bottom + dip.px(2.0),
-            },
-            pill_h / 2 + dip.px(2.0),
-            p.accent,
-        );
+        od_controls::stroke(hdc, &ring, pill_h / 2 + dip.px(2.0), p.accent);
     }
 
     if !ctl.text.is_empty() {
@@ -2621,6 +2785,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_NCDESTROY => {
             free_back_buffer(hwnd);
+            free_ss_buffers();
             // Still DefWindowProc: it is what clears the thread's last-active-popup state.
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -2708,6 +2873,9 @@ mod tests {
         LISTS.with(|l| l.borrow_mut().clear());
         TOGGLES.with(|t| t.borrow_mut().clear());
         BACK.with(|b| b.borrow_mut().clear());
+        unsafe { free_ss_buffers() };
+        #[cfg(test)]
+        SS_BUILDS.with(|c| c.set(0));
         HOT.with(|h| h.set(0));
         PRESSED.with(|p| p.set(0));
         set_focus_value(Focus::None);
@@ -3016,5 +3184,61 @@ mod tests {
             assert!(a.is_some(), "explorer.exe row drew no icon");
             assert!(b.is_none(), "a missing exe name drew an icon");
         }
+    }
+
+    /// Repainting an unchanged toggle must reuse its supersampled bitmap; a state change
+    /// must rebuild it, or the pill would show the previous state.
+    #[test]
+    fn toggle_supersample_buffer_is_reused_until_state_changes() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            let ctls = layout(hwnd);
+            let cards: Vec<RECT> = ctls
+                .iter()
+                .filter(|c| c.kind == Kind::Card)
+                .map(|c| c.rect)
+                .collect();
+            let ctl = ctls
+                .iter()
+                .find(|c| c.kind == Kind::Toggle)
+                .unwrap()
+                .clone();
+            let p = current_palette();
+            let dip = dip_of();
+
+            let mut full = RECT::default();
+            let _ = GetClientRect(hwnd, &mut full);
+            let window_dc = GetDC(hwnd);
+            let dc = CreateCompatibleDC(window_dc);
+            let bmp = CreateCompatibleBitmap(window_dc, full.right, full.bottom);
+            let _ = ReleaseDC(hwnd, window_dc);
+            SelectObject(dc, bmp);
+
+            // The dialog's own creation paint already filled a slot; start from empty.
+            free_ss_buffers();
+            SS_BUILDS.with(|c| c.set(0));
+            draw_toggle(dc, &ctl, &p, dip, false, &cards);
+            let first = SS_BUILDS.with(|c| c.get());
+            assert!(first > 0, "the toggle never built a supersampled bitmap");
+            draw_toggle(dc, &ctl, &p, dip, false, &cards);
+            assert_eq!(
+                SS_BUILDS.with(|c| c.get()),
+                first,
+                "an unchanged toggle re-rendered its bitmap"
+            );
+
+            set_toggle(ctl.id, !toggle(ctl.id));
+            draw_toggle(dc, &ctl, &p, dip, false, &cards);
+            assert_eq!(
+                SS_BUILDS.with(|c| c.get()),
+                first + 1,
+                "a flipped toggle kept the old bitmap"
+            );
+
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(bmp);
+        }
+        teardown(hwnd);
     }
 }

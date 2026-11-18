@@ -1034,9 +1034,8 @@ unsafe fn process_image_path(pid: u32) -> Option<String> {
     (ok && size > 0).then(|| String::from_utf16_lossy(&buf[..size as usize]))
 }
 
-/// Text of the selected row, so a refill can restore the selection when the row survives.
-unsafe fn selected_text(list: HWND) -> Option<String> {
-    let idx = SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+/// Text of a list row by index; `None` for an empty or invalid row.
+unsafe fn list_text_at(list: HWND, idx: i32) -> Option<String> {
     if idx < 0 {
         return None;
     }
@@ -1052,6 +1051,12 @@ unsafe fn selected_text(list: HWND) -> Option<String> {
         LPARAM(buf.as_mut_ptr() as isize),
     );
     Some(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+/// Text of the selected row, so a refill can restore the selection when the row survives.
+unsafe fn selected_text(list: HWND) -> Option<String> {
+    let idx = SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
+    list_text_at(list, idx)
 }
 
 unsafe fn select_text(list: HWND, text: &str) {
@@ -1296,6 +1301,14 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
         ID_BTN_CLOSE => {
             let _ = DestroyWindow(hwnd);
         }
+        // Double-click moves the row across the panels: detected -> excluded,
+        // excluded -> detected, always muted -> detected.
+        ID_LIST_DETECTED | ID_LIST_EXCLUDED | ID_LIST_ALWAYS_MUTED
+            if notification == LBN_DBLCLK as u16 => match control_id {
+                ID_LIST_DETECTED => add_selected_to_exclusions(hwnd),
+                ID_LIST_EXCLUDED => remove_selected_exclusion(hwnd),
+                _ => remove_selected_always_muted(hwnd),
+            },
         _ => {}
     }
 }
@@ -1324,24 +1337,9 @@ unsafe fn remove_selected_exclusion(hwnd: HWND) {
     let list_excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
     let sel_idx = SendMessageW(list_excluded, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
 
-    if sel_idx < 0 {
+    let Some(app_name) = list_text_at(list_excluded, sel_idx) else {
         return; // Nothing selected
-    }
-
-    let text_len = SendMessageW(list_excluded, LB_GETTEXTLEN, WPARAM(sel_idx as usize), LPARAM(0)).0 as usize;
-    if text_len == 0 {
-        return;
-    }
-
-    let mut buffer: Vec<u16> = vec![0; text_len + 1];
-    SendMessageW(
-        list_excluded,
-        LB_GETTEXT,
-        WPARAM(sel_idx as usize),
-        LPARAM(buffer.as_mut_ptr() as isize),
-    );
-
-    let app_name = String::from_utf16_lossy(&buffer[..text_len]);
+    };
 
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
@@ -1377,24 +1375,9 @@ unsafe fn remove_selected_always_muted(hwnd: HWND) {
     let list_always_muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
     let sel_idx = SendMessageW(list_always_muted, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
 
-    if sel_idx < 0 {
+    let Some(app_name) = list_text_at(list_always_muted, sel_idx) else {
         return; // Nothing selected
-    }
-
-    let text_len = SendMessageW(list_always_muted, LB_GETTEXTLEN, WPARAM(sel_idx as usize), LPARAM(0)).0 as usize;
-    if text_len == 0 {
-        return;
-    }
-
-    let mut buffer: Vec<u16> = vec![0; text_len + 1];
-    SendMessageW(
-        list_always_muted,
-        LB_GETTEXT,
-        WPARAM(sel_idx as usize),
-        LPARAM(buffer.as_mut_ptr() as isize),
-    );
-
-    let app_name = String::from_utf16_lossy(&buffer[..text_len]);
+    };
 
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
@@ -1681,6 +1664,55 @@ mod tests {
                 SendMessageW(excluded, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0,
                 1
             );
+        }
+        teardown(hwnd);
+    }
+
+    /// A double-click on a row moves it: detected -> excluded, excluded -> detected,
+    /// always muted -> detected.
+    #[test]
+    fn double_click_moves_a_row_between_panels() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            DIALOG_STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                let s = state.as_mut().unwrap();
+                let mut config = Config::default();
+                config.insert_excluded_app("gamma.exe");
+                config.insert_always_muted_app("delta.exe");
+                s.config = Arc::new(RwLock::new(config));
+                s.all_detected_apps = vec![(1, "alpha.exe".into())];
+                s.detected_apps = s.all_detected_apps.clone();
+            });
+            refill_detected_list(hwnd);
+            refresh_excluded_list(hwnd);
+            refresh_always_muted_list(hwnd);
+
+            let detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
+            let excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
+            let muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
+
+            SendMessageW(detected, LB_SETCURSEL, WPARAM(0), LPARAM(0));
+            handle_command(hwnd, ID_LIST_DETECTED, LBN_DBLCLK as u16);
+
+            // alpha.exe is now the first exclusion, so target gamma.exe by text.
+            select_text(excluded, "gamma.exe");
+            handle_command(hwnd, ID_LIST_EXCLUDED, LBN_DBLCLK as u16);
+
+            SendMessageW(muted, LB_SETCURSEL, WPARAM(0), LPARAM(0));
+            handle_command(hwnd, ID_LIST_ALWAYS_MUTED, LBN_DBLCLK as u16);
+
+            DIALOG_STATE.with(|state| {
+                let state = state.borrow();
+                let config = state.as_ref().unwrap().config.read();
+                assert!(config.is_excluded("alpha.exe"), "detected row not excluded");
+                assert!(!config.is_excluded("gamma.exe"), "exclusion survived");
+                assert!(
+                    !config.always_muted_apps.contains("delta.exe"),
+                    "always muted row survived"
+                );
+            });
         }
         teardown(hwnd);
     }

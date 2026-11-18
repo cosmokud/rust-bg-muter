@@ -447,6 +447,9 @@ pub fn register_classes(hinstance: HINSTANCE) {
             lpfnWndProc: Some(proc_fn),
             hInstance: hinstance,
             hCursor: cursor,
+            // Owner-drawn classes are repositioned by the dialog's layout pass; a size
+            // change must repaint the whole control, never a subset of it.
+            style: WNDCLASS_STYLES(CS_HREDRAW.0 | CS_VREDRAW.0),
             lpszClassName: PCWSTR(class.as_ptr()),
             ..WNDCLASSEXW::default()
         };

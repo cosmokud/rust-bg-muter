@@ -20,7 +20,8 @@ use std::sync::{Arc, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, FillRect, InvalidateRect, SetBkColor,
+    BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, FillRect, InvalidateRect, RedrawWindow,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, SetBkColor,
     SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
     DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
@@ -226,12 +227,6 @@ unsafe fn get_dlg_item(hwnd: HWND, id: i32) -> HWND {
     GetDlgItem(hwnd, id).unwrap_or_default()
 }
 
-fn invalidate(hwnd: HWND) {
-    unsafe {
-        let _ = InvalidateRect(hwnd, None, false);
-    }
-}
-
 /// Opens the settings dialog (blocks until closed)
 pub fn open_settings_dialog(
     config: Arc<RwLock<Config>>,
@@ -296,7 +291,9 @@ unsafe fn create_dialog_window() -> Option<HWND> {
 
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style: WNDCLASS_STYLES(0),
+        // CS_HREDRAW | CS_VREDRAW: a size change invalidates the whole class window, so
+        // a control that grew or shrank can never keep pixels from its previous size.
+        style: WNDCLASS_STYLES(CS_HREDRAW.0 | CS_VREDRAW.0),
         lpfnWndProc: Some(window_proc),
         hInstance: hmodule.into(),
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
@@ -311,8 +308,10 @@ unsafe fn create_dialog_window() -> Option<HWND> {
     let title = to_wide("Background Muter - Settings");
 
     let hwnd = CreateWindowExW(
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        PCWSTR(class_name.as_ptr()),
+        // WS_EX_COMPOSITED: the dialog and all of its children are painted bottom-up into
+        // one off-screen buffer and flipped as a single frame, so a live resize never
+        // exposes a half-moved control or a stale band (the ghosting/trails).
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST | WS_EX_COMPOSITED,        PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
         WS_OVERLAPPED
             | WS_CAPTION
@@ -715,12 +714,15 @@ unsafe fn create_controls(hwnd: HWND) {
                     | WS_CLIPSIBLINGS
                     | WINDOW_STYLE(BS_OWNERDRAW as u32),
             ),
-            Kind::Label => ("STATIC", WS_CHILD | WS_VISIBLE),
+            // WS_CLIPSIBLINGS on every child: without it a sibling that repaints
+            // during a resize paints over its neighbours (trails, torn borders).
+            Kind::Label => ("STATIC", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS),
             Kind::Edit => (
                 "EDIT",
                 WS_CHILD
                     | WS_VISIBLE
                     | WS_TABSTOP
+                    | WS_CLIPSIBLINGS
                     | WS_BORDER
                     | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
             ),
@@ -729,6 +731,7 @@ unsafe fn create_controls(hwnd: HWND) {
                 WS_CHILD
                     | WS_VISIBLE
                     | WS_TABSTOP
+                    | WS_CLIPSIBLINGS
                     | WS_VSCROLL
                     | WS_HSCROLL
                     | WS_BORDER
@@ -837,21 +840,55 @@ unsafe fn resize_controls(hwnd: HWND) {
     if rc.right < 100 || rc.bottom < 100 {
         return; // minimized
     }
-    for ctl in layout(hwnd) {
+    let ctls = layout(hwnd);
+    // One deferred batch instead of a SetWindowPos per control: the move is applied in a
+    // single pass, so no frame shows half the controls at the old size and half at the new.
+    let mut batch = BeginDeferWindowPos(ctls.len() as i32).ok();
+    for ctl in &ctls {
         let ctrl = get_dlg_item(hwnd, ctl.id);
-        if !ctrl.0.is_null() {
-            let _ = SetWindowPos(
+        if ctrl.0.is_null() {
+            continue;
+        }
+        let (x, y) = (ctl.rect.left, ctl.rect.top);
+        let (w, h) = (ctl.rect.right - ctl.rect.left, ctl.rect.bottom - ctl.rect.top);
+        let moved = match batch {
+            Some(hdwp) => match DeferWindowPos(
+                hdwp,
                 ctrl,
                 None,
-                ctl.rect.left,
-                ctl.rect.top,
-                ctl.rect.right - ctl.rect.left,
-                ctl.rect.bottom - ctl.rect.top,
-                SWP_NOZORDER,
-            );
+                x,
+                y,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            ) {
+                Ok(next) => {
+                    batch = Some(next);
+                    true
+                }
+                Err(_) => false,
+            },
+            None => false,
+        };
+        if !moved {
+            // The batch failed (out of memory): move this control directly and keep going.
+            batch = None;
+            let _ = SetWindowPos(ctrl, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
-    invalidate(hwnd);
+    if let Some(hdwp) = batch {
+        let _ = EndDeferWindowPos(hdwp);
+    }
+    // Controls that grew keep stale pixels on the strip they just gained, and controls
+    // that moved leave their old pixels on the parent: invalidate the window *and* every
+    // child and repaint them before returning, so each WM_SIZE ends on one clean frame
+    // and never leaves the previous geometry on screen (the ghosting/artifacting).
+    let _ = RedrawWindow(
+        hwnd,
+        None,
+        None,
+        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+    );
 }
 
 unsafe fn set_font(hwnd: HWND, font: HFONT) {
@@ -1788,6 +1825,48 @@ mod tests {
         }
     }
 
+    /// The resize path must land every control on its layout rect: a control that keeps its
+    /// pre-resize geometry is what the user sees as ghosts and staggered borders. A list box
+    /// is exempt from the exact height, which Windows snaps to whole owner-draw item rows.
+    fn assert_controls_follow_the_layout(hwnd: HWND) {
+        unsafe {
+            for ctl in layout(hwnd) {
+                let ctrl = get_dlg_item(hwnd, ctl.id);
+                assert!(!ctrl.0.is_null(), "control {} is missing", ctl.id);
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(ctrl, &mut rc);
+                let mut origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut origin);
+                let got = (
+                    rc.left - origin.x,
+                    rc.top - origin.y,
+                    rc.right - rc.left,
+                    rc.bottom - rc.top,
+                );
+                let want = (
+                    ctl.rect.left,
+                    ctl.rect.top,
+                    ctl.rect.right - ctl.rect.left,
+                    ctl.rect.bottom - ctl.rect.top,
+                );
+                if ctl.kind == Kind::List {
+                    assert_eq!((got.0, got.1), (want.0, want.1), "list {} moved", ctl.id);
+                    assert_eq!(got.2, want.2, "list {} has the wrong width", ctl.id);
+                    // Snapped down to whole rows, never up past the layout rect.
+                    assert!(
+                        got.3 <= want.3 && want.3 - got.3 < dip_of().px(48.0),
+                        "list {} height {} left the layout height {}",
+                        ctl.id,
+                        got.3,
+                        want.3
+                    );
+                } else {
+                    assert_eq!(got, want, "control {} sits at the wrong rect after a resize", ctl.id);
+                }
+            }
+        }
+    }
+
     /// A card that covers its children takes the hit test, the focus and the clicks.
     #[test]
     fn detected_list_accepts_a_row_click() {
@@ -1857,6 +1936,7 @@ mod tests {
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
             assert_no_overlaps(hwnd);
+            assert_controls_follow_the_layout(hwnd);
             with_ui_mut(|ui| ui.dip = Dip::at(hwnd));
         }
         teardown(hwnd);

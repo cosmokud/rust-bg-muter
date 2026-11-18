@@ -12,7 +12,7 @@ use crate::od_controls::{self, to_wide};
 use crate::startup;
 use crate::theme::{apply_chrome, Dip, Palette};
 use parking_lot::{Mutex, RwLock};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +21,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, FillRect, InvalidateRect, RedrawWindow,
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, SetBkColor,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, SetBkColor,
     SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
     DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
@@ -79,6 +79,11 @@ const BST_UNCHECKED: usize = 0;
 thread_local! {
     static DIALOG_STATE: RefCell<Option<DialogState>> = const { RefCell::new(None) };
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
+    // (window, client rect) the last layout pass ran for: a repeated WM_SIZE is a no-op.
+    static LAST_LAYOUT: Cell<(isize, i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, -1, -1)) };
+    // Card rects derived from `layout()`, keyed on the same window + client rect.
+    static CARD_RECTS: RefCell<((isize, i32, i32, i32, i32), Vec<RECT>)> =
+        const { RefCell::new(((0, 0, 0, -1, -1), Vec::new())) };
 }
 
 struct DialogState {
@@ -309,10 +314,11 @@ unsafe fn create_dialog_window() -> Option<HWND> {
     let title = to_wide(&format!("{} - Settings", crate::tray::APP_NAME));
 
     let hwnd = CreateWindowExW(
-        // WS_EX_COMPOSITED: the dialog and all of its children are painted bottom-up into
-        // one off-screen buffer and flipped as a single frame, so a live resize never
-        // exposes a half-moved control or a stale band (the ghosting/trails).
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST | WS_EX_COMPOSITED,        PCWSTR(class_name.as_ptr()),
+        // No WS_EX_COMPOSITED: it redirects every update into one off-screen buffer and
+        // serializes child paints per WM_SIZE, capping a live resize far below the display
+        // refresh rate. WS_CLIPCHILDREN + WM_ERASEBKGND=1 keep the frame clean without it.
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
         WS_OVERLAPPED
             | WS_CAPTION
@@ -850,6 +856,13 @@ unsafe fn resize_controls(hwnd: HWND) {
     if rc.right < 100 || rc.bottom < 100 {
         return; // minimized
     }
+    // Live resize sends far more WM_SIZE than there are display frames; a repeated size
+    // must not re-run the batch or the invalidate.
+    let key = (hwnd.0 as isize, rc.left, rc.top, rc.right, rc.bottom);
+    if LAST_LAYOUT.with(|l| l.get()) == key {
+        return;
+    }
+    LAST_LAYOUT.with(|l| l.set(key));
     let ctls = layout(hwnd);
     // One deferred batch instead of a SetWindowPos per control: the move is applied in a
     // single pass, so no frame shows half the controls at the old size and half at the new.
@@ -890,15 +903,11 @@ unsafe fn resize_controls(hwnd: HWND) {
         let _ = EndDeferWindowPos(hdwp);
     }
     // Controls that grew keep stale pixels on the strip they just gained, and controls
-    // that moved leave their old pixels on the parent: invalidate the window *and* every
-    // child and repaint them before returning, so each WM_SIZE ends on one clean frame
-    // and never leaves the previous geometry on screen (the ghosting/artifacting).
-    let _ = RedrawWindow(
-        hwnd,
-        None,
-        None,
-        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-    );
+    // that moved leave their old pixels on the parent. Invalidate only: WM_PAINT is
+    // coalesced per display frame, whereas RDW_UPDATENOW forced a synchronous full-window
+    // plus all-children repaint per WM_SIZE, which at 144Hz blew the 6.9ms budget and left
+    // stale bands. Invalidating stamps each child's update region so no strip is missed.
+    let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 unsafe fn set_font(hwnd: HWND, font: HFONT) {
@@ -1070,21 +1079,39 @@ unsafe fn draw_item(lparam: LPARAM) {
     }
 }
 
+/// True if `pt` lies on a card, judged against card rects derived from `layout()` for the
+/// current client rect. Derived, never duplicated: rebuilt only when the key changes, so a
+/// paint costs no GetClientRect + Ctl vec + String allocations per owner-drawn button.
+fn point_on_card(parent: HWND, pt: windows::Win32::Foundation::POINT) -> bool {
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(parent, &mut rc);
+    }
+    let key = (parent.0 as isize, rc.left, rc.top, rc.right, rc.bottom);
+    CARD_RECTS.with(|c| {
+        if c.borrow().0 != key {
+            let rects: Vec<RECT> = layout(parent)
+                .into_iter()
+                .filter(|x| x.kind == Kind::Card)
+                .map(|x| x.rect)
+                .collect();
+            *c.borrow_mut() = (key, rects);
+        }
+        let c = c.borrow();
+        c.1.iter()
+            .any(|r| pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom)
+    })
+}
+
 /// Background surface under a control: the card it overlaps, else the window.
 fn surface_under(parent: HWND, rc: RECT) -> u32 {
     let p = current_palette();
+
     let center = windows::Win32::Foundation::POINT {
         x: (rc.left + rc.right) / 2,
         y: (rc.top + rc.bottom) / 2,
     };
-    let on_card = layout(parent).iter().any(|c| {
-        c.kind == Kind::Card
-            && center.x >= c.rect.left
-            && center.x <= c.rect.right
-            && center.y >= c.rect.top
-            && center.y <= c.rect.bottom
-    });
-    if on_card {
+    if point_on_card(parent, center) {
         p.card
     } else {
         p.window
@@ -1238,6 +1265,11 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
 /// Icons are handles, not pointers we dereference: kept as `isize` so the cache is `Send`.
 static ICONS: OnceLock<Mutex<HashMap<String, isize>>> = OnceLock::new();
 
+/// Per-row icon answers, misses included: a repaint must do no syscall at all, so neither
+/// OpenProcess/QueryFullProcessImageNameW nor a toolhelp snapshot runs twice for one row.
+static ICON_OF_PID: OnceLock<Mutex<HashMap<u32, Option<isize>>>> = OnceLock::new();
+static ICON_OF_NAME: OnceLock<Mutex<HashMap<String, Option<isize>>>> = OnceLock::new();
+
 /// Names that resolved to no running process; a repaint must not rescan for them.
 static MISSING_PATHS: OnceLock<Mutex<HashMap<String, ()>>> = OnceLock::new();
 
@@ -1248,16 +1280,48 @@ unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
         Some(cut) => &text[..cut],
         None => text,
     };
-    let path = if pid > 0 {
-        process_image_path(pid)
-            .or_else(|| path_for_name(name))
-            .unwrap_or_else(|| name.to_string())
-    } else {
-        path_for_name(name).unwrap_or_else(|| name.to_string())
-    };
 
+    // Locks are dropped before any syscall; only the map probe is inside one.
+    if pid > 0 {
+        if let Some(hit) = ICON_OF_PID
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .get(&pid)
+            .copied()
+        {
+            return hit.map(|i| HICON(i as *mut c_void));
+        }
+        let path = process_image_path(pid).or_else(|| path_for_name(name));
+        let icon = icon_of_path(path.as_deref().unwrap_or(name));
+        ICON_OF_PID
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .insert(pid, icon.map(|h| h.0 as isize));
+        return icon;
+    }
+
+    if let Some(hit) = ICON_OF_NAME
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .get(name)
+        .copied()
+    {
+        return hit.map(|i| HICON(i as *mut c_void));
+    }
+    let path = path_for_name(name);
+    let icon = icon_of_path(path.as_deref().unwrap_or(name));
+    ICON_OF_NAME
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .insert(name.to_string(), icon.map(|h| h.0 as isize));
+    icon
+}
+
+/// Extracts (once per path) the small icon of an exe. `path` may be a bare name that has
+/// no file behind it; PrivateExtractIconsW then just fails and the miss is remembered.
+unsafe fn icon_of_path(path: &str) -> Option<HICON> {
     let icons = ICONS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(icon) = icons.lock().get(&path) {
+    if let Some(icon) = icons.lock().get(path) {
         return Some(HICON(*icon as *mut c_void));
     }
 
@@ -1274,7 +1338,7 @@ unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
     if icon.0.is_null() {
         return None;
     }
-    icons.lock().insert(path, icon.0 as isize);
+    icons.lock().insert(path.to_string(), icon.0 as isize);
     Some(icon)
 }
 
@@ -1446,8 +1510,12 @@ unsafe fn refill_named_list(list: HWND, names: &[String]) {
 
 unsafe fn refresh_detected_apps(hwnd: HWND) {
     // A fresh scan may now find apps that were gone last time, so retry their icons.
+    // PIDs are recycled, so the id-keyed answers go too; path-keyed icons stay.
     if let Some(missing) = MISSING_PATHS.get() {
         missing.lock().clear();
+    }
+    if let Some(by_pid) = ICON_OF_PID.get() {
+        by_pid.lock().clear();
     }
     DIALOG_STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
@@ -1966,6 +2034,22 @@ mod tests {
         teardown(hwnd);
     }
 
+    /// The shell reads the window icon for the taskbar, the Alt+Tab switcher and the
+    /// hover preview; a dialog created without one shows a blank slot there.
+    #[test]
+    fn dialog_carries_the_app_icon_in_every_slot() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{ICON_BIG, ICON_SMALL, WM_GETICON};
+            let big = SendMessageW(hwnd, WM_GETICON, WPARAM(ICON_BIG as usize), LPARAM(0)).0;
+            let small = SendMessageW(hwnd, WM_GETICON, WPARAM(ICON_SMALL as usize), LPARAM(0)).0;
+            assert!(big != 0, "no big icon on the dialog window");
+            assert!(small != 0, "no small icon on the dialog window");
+        }
+        teardown(hwnd);
+    }
+
     /// The filter edits must process input: disabled or covered, WM_CHAR is dropped.
     #[test]
     fn filter_edits_accept_typing_and_filter_their_lists() {
@@ -2053,6 +2137,10 @@ mod tests {
     fn named_rows_resolve_an_icon_from_a_running_process() {
         unsafe {
             MISSING_PATHS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .clear();
+            ICON_OF_NAME
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
                 .clear();

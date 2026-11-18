@@ -46,10 +46,28 @@ const VISUAL_STYLES_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" sta
 "#;
 
 fn main() {
-    // Tell cargo to rerun if the build script or icon changes
+    // Tell cargo to rerun if the build script or icon changes. `src` is watched on purpose: it
+    // is what lets a build in a checkout other than the one that last linked relink its own
+    // binary at the shared target dir (see .githooks/post-checkout and scripts/build-release.ps1).
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=assets/icon.ico");
+
+    // A release build links over `rust-bg-muter.exe`, which Windows will not allow while the
+    // app is up: the link fails with "Access is denied" and the build has to be run again.
+    // Ending a running copy here, before the crate is linked, is what lets
+    // `cargo build --release` replace the binary in one pass.
+    #[cfg(target_os = "windows")]
+    if env::var("PROFILE").as_deref() == Ok("release") {
+        stop_running_app();
+    }
+
+    // The commit this build is of, stamped into the executable so a binary can be told from
+    // the one another checkout linked over it at the shared target dir.
+    let commit = the_commit();
+    println!("cargo:rustc-env=BGM_COMMIT={commit}");
 
     // This build script is only meaningful when the *target* is Windows.
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -85,6 +103,9 @@ fn main() {
     res.set("LegalCopyright", "MIT License");
     res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
     res.set("FileVersion", env!("CARGO_PKG_VERSION"));
+    // Read back as `(Get-Item <exe>).VersionInfo.Comments`, which is how the build tells a
+    // binary of this checkout from one another checkout left at the same path.
+    res.set("Comments", commit.as_str());
 
     if ico_path.exists() {
         // Convert to string, handling the \\?\ prefix from canonicalize on Windows
@@ -126,6 +147,49 @@ fn main() {
         Err(e) => {
             eprintln!("Warning: Failed to compile Windows resources: {}", e);
         }
+    }
+}
+
+/// The commit this build is of, or `"unknown"` where git cannot say: a source tarball has no
+/// git and still has to build, and a stamp nobody can read has to compare unequal to every
+/// HEAD.
+fn the_commit() -> String {
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default();
+    if commit.is_empty() {
+        "unknown".to_owned()
+    } else {
+        commit
+    }
+}
+
+/// Ends a running copy of the app so a release build can replace its binary.
+/// Nothing is reported when the app is not running, which is the usual case.
+#[cfg(target_os = "windows")]
+fn stop_running_app() {
+    use std::os::windows::process::CommandExt;
+
+    /// CREATE_NO_WINDOW, so a build started from an IDE shows no console flash.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let image = concat!(env!("CARGO_PKG_NAME"), ".exe");
+    let stopped = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", image])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|status| status.success());
+
+    if stopped {
+        println!("cargo:warning=Stopped the running {image} before rebuilding");
     }
 }
 

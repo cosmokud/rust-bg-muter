@@ -21,7 +21,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, FillRect, InvalidateRect, RedrawWindow,
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, SetBkColor,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, SetBkColor,
     SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
     DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
@@ -32,6 +32,7 @@ use windows::Win32::UI::Controls::{
     INITCOMMONCONTROLSEX, ODS_FOCUS, ODS_SELECTED,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Control IDs
@@ -314,10 +315,12 @@ unsafe fn create_dialog_window() -> Option<HWND> {
     let title = to_wide(&format!("{} - Settings", crate::tray::APP_NAME));
 
     let hwnd = CreateWindowExW(
-        // No WS_EX_COMPOSITED: it redirects every update into one off-screen buffer and
-        // serializes child paints per WM_SIZE, capping a live resize far below the display
-        // refresh rate. WS_CLIPCHILDREN + WM_ERASEBKGND=1 keep the frame clean without it.
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        // WS_EX_COMPOSITED: the dialog + children paint into one off-screen buffer that
+        // flips as one frame, so a resize can never expose a half-moved control or stale
+        // band. WS_CLIPCHILDREN + WM_ERASEBKGND=1 remain, but only COMPOSITED makes the
+        // forced RDW_UPDATENOW in resize_controls land as a single complete frame.
+        // No WS_EX_TOPMOST: the main window stays behind other apps like a normal window.
+        WS_EX_DLGMODALFRAME | WS_EX_COMPOSITED,
         PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
         WS_OVERLAPPED
@@ -787,6 +790,7 @@ unsafe fn create_controls(hwnd: HWND) {
                 Kind::Button => od_controls::attach_hover(ctl_hwnd),
                 Kind::List => {
                     lists.push(ctl_hwnd);
+                    attach_list_resize_repaint(ctl_hwnd);
                     let _ = SendMessageW(
                         ctl_hwnd,
                         LB_SETITEMHEIGHT,
@@ -903,15 +907,60 @@ unsafe fn resize_controls(hwnd: HWND) {
         let _ = EndDeferWindowPos(hdwp);
     }
     // Controls that grew keep stale pixels on the strip they just gained, and controls
-    // that moved leave their old pixels on the parent. Invalidate only: WM_PAINT is
-    // coalesced per display frame, whereas RDW_UPDATENOW forced a synchronous full-window
-    // plus all-children repaint per WM_SIZE, which at 144Hz blew the 6.9ms budget and left
-    // stale bands. Invalidating stamps each child's update region so no strip is missed.
-    let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    // that moved leave their old pixels on the parent, so the final state must be painted
+    // before this WM_SIZE returns. RDW_UPDATENOW is affordable here *because* the batch
+    // above is one pass and the LAST_LAYOUT/CARD_RECTS/icon caches keep the paint cheap;
+    // with COMPOSITED it ends each WM_SIZE on one complete buffer instead of leaving the
+    // previous geometry on screen.
+    let _ = RedrawWindow(
+        hwnd,
+        None,
+        None,
+        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+    );
 }
 
 unsafe fn set_font(hwnd: HWND, font: HFONT) {
     SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+}
+
+// Per-list subclass ids, offset so they never collide with od_controls' hover id.
+const LIST_RESIZE_SUBCLASS_ID: usize = 0x100;
+
+/// A listbox clips its client to whole owner-draw rows and puts its horizontal
+/// scrollbar in the non-client area, so after a resize the partial-row strip and the
+/// h-scroll thumb band (`WS_HSCROLL` + `LB_SETHORIZONTALEXTENT` set in create_controls)
+/// can keep pixels from the pre-resize layout. DefSubclassProc runs first so the new
+/// geometry and scrollbar state exist, then the whole list is invalidated.
+unsafe extern "system" fn list_resize_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _refdata: usize,
+) -> LRESULT {
+    let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+    match msg {
+        WM_SIZE => {
+            let _ = InvalidateRect(hwnd, None, false);
+            result
+        }
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(list_resize_subclass), LIST_RESIZE_SUBCLASS_ID);
+            result
+        }
+        _ => result,
+    }
+}
+
+unsafe fn attach_list_resize_repaint(hwnd: HWND) {
+    let _ = SetWindowSubclass(
+        hwnd,
+        Some(list_resize_subclass),
+        LIST_RESIZE_SUBCLASS_ID,
+        0,
+    );
 }
 
 /// Window background. A memory DC was measured at ~2.5 MB resident for the full
@@ -1849,11 +1898,26 @@ mod tests {
                 filter_always_muted: String::new(),
             });
         });
-        unsafe { create_dialog_window().expect("settings window") }
+        let hwnd = unsafe { create_dialog_window().expect("settings window") };
+        // Hit tests answer for the whole desktop: raise the dialog like ShowWindow would,
+        // or any other top-level window can sit over it and own WindowFromPoint.
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        hwnd
     }
 
     fn teardown(hwnd: HWND) {
         unsafe {
+            let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             let _ = DestroyWindow(hwnd);
             let name = to_wide(SETTINGS_CLASS);
             let _ = UnregisterClassW(

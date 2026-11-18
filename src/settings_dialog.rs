@@ -1550,7 +1550,13 @@ unsafe fn update_caret(hwnd: HWND) {
     }
     let (x, top) = field_caret(hwnd, &ctl);
     let _ = SetCaretPos(x, top);
-    let _ = ShowCaret(hwnd);
+    // A caret on an inactive window would blink on top of every repaint; the window that
+    // is not focused hides it the way a native edit does.
+    if GetFocus() == hwnd {
+        let _ = ShowCaret(hwnd);
+    } else {
+        let _ = HideCaret(hwnd);
+    }
 }
 
 unsafe fn hide_caret(hwnd: HWND) {

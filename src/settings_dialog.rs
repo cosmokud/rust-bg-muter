@@ -20,15 +20,15 @@ use std::sync::{Arc, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, FillRect, InvalidateRect,
-    SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, FillRect, InvalidateRect, SetBkColor,
+    SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
     DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, SetWindowTheme, DRAWITEMSTRUCT, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
-    EM_SETCUEBANNER, ODS_FOCUS, ODS_SELECTED,
+    InitCommonControlsEx, SetWindowTheme, DRAWITEMSTRUCT, EM_SETCUEBANNER, ICC_STANDARD_CLASSES,
+    INITCOMMONCONTROLSEX, ODS_FOCUS, ODS_SELECTED,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -83,7 +83,7 @@ struct DialogState {
     config: Arc<RwLock<Config>>,
     muting_enabled: Arc<AtomicBool>,
     audio_manager: Arc<AudioManager>,
-    detected_apps: Vec<(u32, String)>, // (pid, name)
+    detected_apps: Vec<(u32, String)>,     // (pid, name)
     all_detected_apps: Vec<(u32, String)>, // all apps before filtering
     // Lowercased filters, one per list; the lists are substring-matched against them.
     filter_detected: String,
@@ -120,9 +120,7 @@ static SHARED: OnceLock<Mutex<Shared>> = OnceLock::new();
 
 impl Shared {
     unsafe fn get(dip: u32, palette: &Palette) -> Shared {
-        let cache = SHARED.get_or_init(|| {
-            Mutex::new(Shared::build(Dip::from_dpi(dip), palette))
-        });
+        let cache = SHARED.get_or_init(|| Mutex::new(Shared::build(Dip::from_dpi(dip), palette)));
         let mut cache = cache.lock();
         if cache.dip != Dip::from_dpi(dip).dpi || cache.dark != palette.dark {
             // The retired handles are never deleted: a control still selecting one would
@@ -426,8 +424,24 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
     };
 
     // Cards first, then their children: `create_controls` sinks every card below them.
-    push(ID_GRP_DETECTED, Kind::Card, "Detected Audio Apps", margin, card_y, left_panel_width, card_h);
-    push(ID_GRP_EXCLUDED, Kind::Card, "Excluded Apps (Always Audible)", right_panel_x, card_y, right_panel_width, right_panel_height);
+    push(
+        ID_GRP_DETECTED,
+        Kind::Card,
+        "Detected Audio Apps",
+        margin,
+        card_y,
+        left_panel_width,
+        card_h,
+    );
+    push(
+        ID_GRP_EXCLUDED,
+        Kind::Card,
+        "Excluded Apps (Always Audible)",
+        right_panel_x,
+        card_y,
+        right_panel_width,
+        right_panel_height,
+    );
     push(
         ID_GRP_ALWAYS_MUTED,
         Kind::Card,
@@ -437,10 +451,34 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         right_panel_width,
         right_panel_height,
     );
-    push(ID_GROUP_SETTINGS, Kind::Card, "Settings", margin, settings_y, width - margin * 2, settings_height);
+    push(
+        ID_GROUP_SETTINGS,
+        Kind::Card,
+        "Settings",
+        margin,
+        settings_y,
+        width - margin * 2,
+        settings_height,
+    );
 
-    push(ID_LABEL_SEARCH, Kind::Label, "Search:", margin + s(12.0), card_y + s(32.0), s(50.0), s(20.0));
-    push(ID_EDIT_SEARCH, Kind::Edit, "", margin + s(64.0), card_y + s(30.0), left_panel_width - s(76.0), s(24.0));
+    push(
+        ID_LABEL_SEARCH,
+        Kind::Label,
+        "Search:",
+        margin + s(12.0),
+        card_y + s(32.0),
+        s(50.0),
+        s(20.0),
+    );
+    push(
+        ID_EDIT_SEARCH,
+        Kind::Edit,
+        "",
+        margin + s(64.0),
+        card_y + s(30.0),
+        left_panel_width - s(76.0),
+        s(24.0),
+    );
     push(
         ID_LIST_DETECTED,
         Kind::List,
@@ -450,7 +488,15 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         left_panel_width - s(24.0),
         card_h - s(60.0) - s(36.0),
     );
-    push(ID_BTN_REFRESH, Kind::Button, "Refresh List", margin + s(12.0), card_y + card_h - s(30.0), s(100.0), s(26.0));
+    push(
+        ID_BTN_REFRESH,
+        Kind::Button,
+        "Refresh List",
+        margin + s(12.0),
+        card_y + card_h - s(30.0),
+        s(100.0),
+        s(26.0),
+    );
 
     // Right cards: caption row, filter edit, then the list; the card bottom is unchanged.
     push(
@@ -491,8 +537,24 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         right_panel_height - s(72.0),
     );
 
-    push(ID_BTN_ADD_EXCLUSION, Kind::Button, "Add to Exclusions \u{2192}", margin + s(12.0), buttons_y, s(180.0), row + s(4.0));
-    push(ID_BTN_ADD_ALWAYS_MUTED, Kind::Button, "Add to Always Muted \u{2192}", margin + s(12.0), buttons_y + row + s(8.0), s(180.0), row + s(4.0));
+    push(
+        ID_BTN_ADD_EXCLUSION,
+        Kind::Button,
+        "Add to Exclusions \u{2192}",
+        margin + s(12.0),
+        buttons_y,
+        s(180.0),
+        row + s(4.0),
+    );
+    push(
+        ID_BTN_ADD_ALWAYS_MUTED,
+        Kind::Button,
+        "Add to Always Muted \u{2192}",
+        margin + s(12.0),
+        buttons_y + row + s(8.0),
+        s(180.0),
+        row + s(4.0),
+    );
     push(
         ID_BTN_REMOVE_EXCLUSION,
         Kind::Button,
@@ -512,21 +574,117 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         row + s(4.0),
     );
 
-    push(ID_CHECK_ENABLED, Kind::Toggle, "Muting Enabled", margin + s(16.0), settings_y + s(26.0), s(200.0), s(22.0));
-    push(ID_CHECK_START_MINIMIZED, Kind::Toggle, "Start Minimized to Tray", margin + s(16.0), settings_y + s(50.0), s(200.0), s(22.0));
-    push(ID_CHECK_START_WINDOWS, Kind::Toggle, "Start with Windows", margin + s(16.0), settings_y + s(74.0), s(200.0), s(22.0));
+    push(
+        ID_CHECK_ENABLED,
+        Kind::Toggle,
+        "Muting Enabled",
+        margin + s(16.0),
+        settings_y + s(26.0),
+        s(200.0),
+        s(22.0),
+    );
+    push(
+        ID_CHECK_START_MINIMIZED,
+        Kind::Toggle,
+        "Start Minimized to Tray",
+        margin + s(16.0),
+        settings_y + s(50.0),
+        s(200.0),
+        s(22.0),
+    );
+    push(
+        ID_CHECK_START_WINDOWS,
+        Kind::Toggle,
+        "Start with Windows",
+        margin + s(16.0),
+        settings_y + s(74.0),
+        s(200.0),
+        s(22.0),
+    );
 
-    push(ID_LABEL_POLL, Kind::Label, "Poll Interval:", width - s(268.0), settings_y + s(32.0), s(90.0), s(20.0));
-    push(ID_EDIT_POLL_INTERVAL, Kind::Edit, "", width - s(176.0), settings_y + s(30.0), s(60.0), s(24.0));
-    push(ID_LABEL_MS, Kind::Label, "ms", width - s(108.0), settings_y + s(32.0), s(25.0), s(20.0));
-    push(ID_LABEL_RANGE, Kind::Label, "Range: 100-2000 ms", width - s(268.0), settings_y + s(58.0), s(180.0), s(18.0));
-    push(ID_LABEL_CONFIG, Kind::Label, "Config file:", margin + s(16.0), settings_y + s(102.0), s(70.0), s(18.0));
+    push(
+        ID_LABEL_POLL,
+        Kind::Label,
+        "Poll Interval:",
+        width - s(268.0),
+        settings_y + s(32.0),
+        s(90.0),
+        s(20.0),
+    );
+    push(
+        ID_EDIT_POLL_INTERVAL,
+        Kind::Edit,
+        "",
+        width - s(176.0),
+        settings_y + s(30.0),
+        s(60.0),
+        s(24.0),
+    );
+    push(
+        ID_LABEL_MS,
+        Kind::Label,
+        "ms",
+        width - s(108.0),
+        settings_y + s(32.0),
+        s(25.0),
+        s(20.0),
+    );
+    push(
+        ID_LABEL_RANGE,
+        Kind::Label,
+        "Range: 100-2000 ms",
+        width - s(268.0),
+        settings_y + s(58.0),
+        s(180.0),
+        s(18.0),
+    );
+    push(
+        ID_LABEL_CONFIG,
+        Kind::Label,
+        "Config file:",
+        margin + s(16.0),
+        settings_y + s(102.0),
+        s(70.0),
+        s(18.0),
+    );
     let path = Config::config_path().to_string_lossy().to_string();
-    push(ID_LABEL_PATH, Kind::Label, &path, margin + s(88.0), settings_y + s(102.0), width - margin * 2 - s(96.0), s(18.0));
+    push(
+        ID_LABEL_PATH,
+        Kind::Label,
+        &path,
+        margin + s(88.0),
+        settings_y + s(102.0),
+        width - margin * 2 - s(96.0),
+        s(18.0),
+    );
 
-    push(ID_BTN_SAVE_ONLY, Kind::Button, "Save", width - s(330.0), height - s(45.0), s(95.0), s(32.0));
-    push(ID_BTN_SAVE_CLOSE, Kind::Button, "Save && Close", width - s(225.0), height - s(45.0), s(105.0), s(32.0));
-    push(ID_BTN_CLOSE, Kind::Button, "Cancel", width - s(112.0), height - s(45.0), s(100.0), s(32.0));
+    push(
+        ID_BTN_SAVE_ONLY,
+        Kind::Button,
+        "Save",
+        width - s(330.0),
+        height - s(45.0),
+        s(95.0),
+        s(32.0),
+    );
+    push(
+        ID_BTN_SAVE_CLOSE,
+        Kind::Button,
+        "Save && Close",
+        width - s(225.0),
+        height - s(45.0),
+        s(105.0),
+        s(32.0),
+    );
+    push(
+        ID_BTN_CLOSE,
+        Kind::Button,
+        "Cancel",
+        width - s(112.0),
+        height - s(45.0),
+        s(100.0),
+        s(32.0),
+    );
 
     out
 }
@@ -551,16 +709,29 @@ unsafe fn create_controls(hwnd: HWND) {
             ),
             Kind::Button => (
                 "BUTTON",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_TABSTOP
+                    | WS_CLIPSIBLINGS
+                    | WINDOW_STYLE(BS_OWNERDRAW as u32),
             ),
             Kind::Label => ("STATIC", WS_CHILD | WS_VISIBLE),
             Kind::Edit => (
                 "EDIT",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_TABSTOP
+                    | WS_BORDER
+                    | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
             ),
             Kind::List => (
                 "LISTBOX",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | WS_BORDER
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_TABSTOP
+                    | WS_VSCROLL
+                    | WS_HSCROLL
+                    | WS_BORDER
                     | WINDOW_STYLE((LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32),
             ),
         };
@@ -696,12 +867,21 @@ unsafe fn paint(hwnd: HWND) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     if rc.right > 0 && rc.bottom > 0 {
-        FillRect(hdc, &ps.rcPaint, HBRUSH(with_ui(|u| u.br_window).unwrap_or_default().0));
+        FillRect(
+            hdc,
+            &ps.rcPaint,
+            HBRUSH(with_ui(|u| u.br_window).unwrap_or_default().0),
+        );
     }
     let _ = EndPaint(hwnd, &ps);
 }
 
-unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_CREATE => {
             UI.with(|u| *u.borrow_mut() = Some(Ui::new(hwnd)));
@@ -814,7 +994,12 @@ unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
         if !ctrl.0.is_null() {
             set_font(ctrl, font);
             if ctl.kind == Kind::List {
-                let _ = SendMessageW(ctrl, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(dip_of().px(24.0) as isize));
+                let _ = SendMessageW(
+                    ctrl,
+                    LB_SETITEMHEIGHT,
+                    WPARAM(0),
+                    LPARAM(dip_of().px(24.0) as isize),
+                );
             }
         }
     }
@@ -937,7 +1122,13 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
         od_controls::round(dis.hDC, &rc, s(4.0), bg, Some(p.accent));
     }
 
-    let len = SendMessageW(dis.hwndItem, LB_GETTEXTLEN, WPARAM(dis.itemID as usize), LPARAM(0)).0 as usize;
+    let len = SendMessageW(
+        dis.hwndItem,
+        LB_GETTEXTLEN,
+        WPARAM(dis.itemID as usize),
+        LPARAM(0),
+    )
+    .0 as usize;
     if len == 0 {
         return;
     }
@@ -951,13 +1142,29 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
     let text = String::from_utf16_lossy(&buf[..len]);
 
     let icon_size = s(16.0);
-    let pid = SendMessageW(dis.hwndItem, LB_GETITEMDATA, WPARAM(dis.itemID as usize), LPARAM(0)).0;
+    let pid = SendMessageW(
+        dis.hwndItem,
+        LB_GETITEMDATA,
+        WPARAM(dis.itemID as usize),
+        LPARAM(0),
+    )
+    .0;
     let icon = row_icon(pid.max(0) as u32, &text);
 
     let text_left;
     if let Some(icon) = icon {
         let y = rc.top + ((rc.bottom - rc.top) - icon_size) / 2;
-        let _ = DrawIconEx(dis.hDC, rc.left + s(6.0), y, icon, icon_size, icon_size, 0, HBRUSH::default(), DI_NORMAL);
+        let _ = DrawIconEx(
+            dis.hDC,
+            rc.left + s(6.0),
+            y,
+            icon,
+            icon_size,
+            icon_size,
+            0,
+            HBRUSH::default(),
+            DI_NORMAL,
+        );
         text_left = rc.left + s(6.0) + icon_size + s(8.0);
     } else {
         text_left = rc.left + s(8.0);
@@ -984,13 +1191,22 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
 /// Icons are handles, not pointers we dereference: kept as `isize` so the cache is `Send`.
 static ICONS: OnceLock<Mutex<HashMap<String, isize>>> = OnceLock::new();
 
+/// Names that resolved to no running process; a repaint must not rescan for them.
+static MISSING_PATHS: OnceLock<Mutex<HashMap<String, ()>>> = OnceLock::new();
+
 /// Small icon for a list row. `pid` is the real process (detected list); otherwise the
-/// text is a process name and the generic executable icon is used.
+/// text is a process name, so the first running process with that name supplies the path.
 unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
+    let name = match text.find(" (PID: ") {
+        Some(cut) => &text[..cut],
+        None => text,
+    };
     let path = if pid > 0 {
-        process_image_path(pid).unwrap_or_else(|| text.to_string())
+        process_image_path(pid)
+            .or_else(|| path_for_name(name))
+            .unwrap_or_else(|| name.to_string())
     } else {
-        text.to_string()
+        path_for_name(name).unwrap_or_else(|| name.to_string())
     };
 
     let icons = ICONS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1018,7 +1234,8 @@ unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
 /// Full exe path of a running process, capped so a dead PID costs one syscall.
 unsafe fn process_image_path(pid: u32) -> Option<String> {
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
     let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
     let mut buf = [0u16; 260];
@@ -1032,6 +1249,53 @@ unsafe fn process_image_path(pid: u32) -> Option<String> {
     .is_ok();
     let _ = windows::Win32::Foundation::CloseHandle(process);
     (ok && size > 0).then(|| String::from_utf16_lossy(&buf[..size as usize]))
+}
+
+/// Exe path for a process named `name` that is no longer running (it was excluded or
+/// always-muted earlier). One toolhelp snapshot per miss, cached per name.
+unsafe fn path_for_name(name: &str) -> Option<String> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let wanted = name.to_lowercase();
+    if MISSING_PATHS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .contains_key(&wanted)
+    {
+        return None;
+    }
+
+    let mut found: Option<u32> = None;
+    if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
+        while ok {
+            let exe = String::from_utf16_lossy(&entry.szExeFile);
+            let exe = exe.trim_end_matches('\0').to_lowercase();
+            if exe == wanted {
+                found = Some(entry.th32ProcessID);
+                break;
+            }
+            ok = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+    }
+
+    let path = found.and_then(|pid| process_image_path(pid));
+    if path.is_none() {
+        // Not running: remember the miss so a repaint never walks the process list again.
+        MISSING_PATHS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .insert(wanted, ());
+    }
+    path
 }
 
 /// Text of a list row by index; `None` for an empty or invalid row.
@@ -1134,6 +1398,10 @@ unsafe fn refill_named_list(list: HWND, names: &[String]) {
 }
 
 unsafe fn refresh_detected_apps(hwnd: HWND) {
+    // A fresh scan may now find apps that were gone last time, so retry their icons.
+    if let Some(missing) = MISSING_PATHS.get() {
+        missing.lock().clear();
+    }
     DIALOG_STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
             let sessions = s.audio_manager.get_sessions();
@@ -1221,7 +1489,10 @@ unsafe fn load_settings_to_controls(hwnd: HWND) {
             set_check(hwnd, ID_CHECK_START_WINDOWS, config.start_with_windows);
 
             let poll_str = to_wide(&config.poll_interval_ms.to_string());
-            let _ = SetWindowTextW(get_dlg_item(hwnd, ID_EDIT_POLL_INTERVAL), PCWSTR(poll_str.as_ptr()));
+            let _ = SetWindowTextW(
+                get_dlg_item(hwnd, ID_EDIT_POLL_INTERVAL),
+                PCWSTR(poll_str.as_ptr()),
+            );
         }
     });
 }
@@ -1236,7 +1507,8 @@ unsafe fn set_check(hwnd: HWND, id: i32, on: bool) {
 }
 
 unsafe fn get_check(hwnd: HWND, id: i32) -> bool {
-    SendMessageW(get_dlg_item(hwnd, id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == BST_CHECKED as isize
+    SendMessageW(get_dlg_item(hwnd, id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0
+        == BST_CHECKED as isize
 }
 
 /// One filter edit changed: store the needle lowercased and refill only its own list,
@@ -1304,11 +1576,14 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
         // Double-click moves the row across the panels: detected -> excluded,
         // excluded -> detected, always muted -> detected.
         ID_LIST_DETECTED | ID_LIST_EXCLUDED | ID_LIST_ALWAYS_MUTED
-            if notification == LBN_DBLCLK as u16 => match control_id {
+            if notification == LBN_DBLCLK as u16 =>
+        {
+            match control_id {
                 ID_LIST_DETECTED => add_selected_to_exclusions(hwnd),
                 ID_LIST_EXCLUDED => remove_selected_exclusion(hwnd),
                 _ => remove_selected_always_muted(hwnd),
-            },
+            }
+        }
         _ => {}
     }
 }
@@ -1666,6 +1941,22 @@ mod tests {
             );
         }
         teardown(hwnd);
+    }
+
+    /// Rows in the exclusion / always-muted panels carry no PID, so their icon comes
+    /// from the first running process with that exe name.
+    #[test]
+    fn named_rows_resolve_an_icon_from_a_running_process() {
+        unsafe {
+            MISSING_PATHS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .clear();
+            let a = row_icon(0, "explorer.exe");
+            let b = row_icon(0, "nonexistent-xyz.exe");
+            assert!(a.is_some(), "explorer.exe row drew no icon");
+            assert!(b.is_none(), "a missing exe name drew an icon");
+        }
     }
 
     /// A double-click on a row moves it: detected -> excluded, excluded -> detected,

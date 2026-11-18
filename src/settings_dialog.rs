@@ -960,7 +960,7 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
                 apps.push((session.process_id, session.process_name.clone()));
             }
 
-            apps.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+            apps.sort_by_key(|a| a.1.to_lowercase());
             s.all_detected_apps = apps;
 
             let filter = s.search_filter.to_lowercase();
@@ -1036,7 +1036,7 @@ unsafe fn refresh_excluded_list(hwnd: HWND) {
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
             let mut excluded: Vec<_> = s.config.read().excluded_apps.iter().cloned().collect();
-            excluded.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            excluded.sort_by_key(|a| a.to_lowercase());
 
             for app in excluded {
                 let wide = to_wide(&app);
@@ -1059,7 +1059,7 @@ unsafe fn refresh_always_muted_list(hwnd: HWND) {
     DIALOG_STATE.with(|state| {
         if let Some(ref s) = *state.borrow() {
             let mut always_muted: Vec<_> = s.config.read().always_muted_apps.iter().cloned().collect();
-            always_muted.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            always_muted.sort_by_key(|a| a.to_lowercase());
 
             for app in always_muted {
                 let wide = to_wide(&app);

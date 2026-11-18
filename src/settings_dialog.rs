@@ -3241,4 +3241,43 @@ mod tests {
         }
         teardown(hwnd);
     }
+
+
+    /// Every control must land inside the card that owns it, and no row may collide with
+    /// another. A pill painted away from its row (all three at one height) is exactly the
+    /// class of bug a wrong scale or a wrong origin introduces, so pin the numbers down.
+    #[test]
+    fn toggle_rows_are_distinct_and_inside_the_settings_card() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        let ctls = layout(hwnd);
+        let card = ctls
+            .iter()
+            .find(|c| c.id == ID_GROUP_SETTINGS)
+            .expect("settings card")
+            .rect;
+        let toggles: Vec<RECT> = ctls
+            .iter()
+            .filter(|c| c.kind == Kind::Toggle)
+            .map(|c| c.rect)
+            .collect();
+        assert_eq!(toggles.len(), 3, "three toggles");
+        for (i, a) in toggles.iter().enumerate() {
+            assert!(
+                a.top >= card.top && a.bottom <= card.bottom && a.left >= card.left
+                    && a.right <= card.right,
+                "toggle {i} at {a:?} is outside the settings card {card:?}"
+            );
+            for b in toggles.iter().skip(i + 1) {
+                assert!(
+                    a.bottom <= b.top || b.bottom <= a.top,
+                    "toggles {a:?} and {b:?} overlap vertically"
+                );
+            }
+        }
+        // Rows are separated by at least one row height, not stacked on each other.
+        let gap = toggles[1].top - toggles[0].top;
+        assert!(gap >= row_height(), "toggle rows are only {gap}px apart");
+        teardown(hwnd);
+    }
 }

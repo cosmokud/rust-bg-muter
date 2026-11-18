@@ -8,7 +8,7 @@
 
 use crate::audio::AudioManager;
 use crate::config::Config;
-use crate::od_controls::{self, to_wide, Gdi};
+use crate::od_controls::{self, to_wide};
 use crate::startup;
 use crate::theme::{apply_chrome, Dip, Palette};
 use parking_lot::{Mutex, RwLock};
@@ -718,8 +718,7 @@ unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
 
 unsafe fn draw_item_bg(hdc: HDC, rc: RECT) {
     let p = current_palette();
-    let mut g = Gdi::default();
-    g.fill(hdc, &rc, p.well);
+    od_controls::fill(hdc, &rc, p.well);
 }
 
 unsafe fn draw_item(lparam: LPARAM) {
@@ -759,7 +758,6 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
     let p = current_palette();
     let dip = dip_of();
     let s = |v: f32| dip.px(v);
-    let mut g = Gdi::default();
     let rc = dis.rcItem;
     let label = od_controls::window_text(dis.hwndItem);
     let primary = dis.CtlID as i32 == ID_BTN_SAVE_CLOSE;
@@ -769,7 +767,7 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
     let small = with_ui(|u| u.font_small).unwrap_or(HFONT(std::ptr::null_mut()));
 
     let parent = GetParent(dis.hwndItem).unwrap_or_default();
-    g.fill(dis.hDC, &rc, surface_under(parent, rc));
+    od_controls::fill(dis.hDC, &rc, surface_under(parent, rc));
 
     let (fill, fg, border) = if primary {
         let f = if pressed {
@@ -797,8 +795,8 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
         right: rc.right - s(2.0),
         bottom: rc.bottom - s(3.0),
     };
-    g.round(dis.hDC, &inner, s(6.0), fill, border);
-    g.text(
+    od_controls::round(dis.hDC, &inner, s(6.0), fill, border);
+    od_controls::text(
         dis.hDC,
         &inner,
         &label,
@@ -817,7 +815,6 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
     let p = current_palette();
     let dip = dip_of();
     let s = |v: f32| dip.px(v);
-    let mut g = Gdi::default();
     let rc = dis.rcItem;
     let selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
     let focused = selected && ((dis.itemState.0 & ODS_FOCUS.0) != 0 || GetFocus() == dis.hwndItem);
@@ -829,9 +826,9 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
     } else {
         p.well
     };
-    g.fill(dis.hDC, &rc, bg);
+    od_controls::fill(dis.hDC, &rc, bg);
     if focused {
-        g.round(dis.hDC, &rc, s(4.0), bg, Some(p.accent));
+        od_controls::round(dis.hDC, &rc, s(4.0), bg, Some(p.accent));
     }
 
     let len = SendMessageW(dis.hwndItem, LB_GETTEXTLEN, WPARAM(dis.itemID as usize), LPARAM(0)).0 as usize;
@@ -866,7 +863,7 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
         right: rc.right - s(4.0),
         bottom: rc.bottom,
     };
-    g.text(
+    od_controls::text(
         dis.hDC,
         &text_rc,
         &text,

@@ -13,10 +13,10 @@ use std::ffi::c_void;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, DRAW_TEXT_FORMAT,
-    DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, NULL_BRUSH,
-    PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    BeginPaint, DrawTextW, Ellipse, EndPaint, FillRect, GetStockObject, InvalidateRect, RoundRect,
+    SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, DRAW_TEXT_FORMAT, DC_BRUSH,
+    DC_PEN, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ,
+    NULL_BRUSH, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, VK_RETURN, VK_SPACE,
@@ -31,77 +31,66 @@ use crate::theme::Dip;
 pub const CLASS_TOGGLE: &str = "BgMuterToggle";
 pub const CLASS_CARD: &str = "BgMuterCard";
 
-/// GDI objects alive for one paint pass; deleted on drop so early returns cannot leak.
-#[derive(Default)]
-pub struct Gdi {
-    objs: Vec<HGDIOBJ>,
+/// Selects DC_BRUSH and DC_PEN in `fill`/`pen`, draws, then restores the DC.
+/// Colours are DC attributes, so a paint pass creates no GDI objects at all (measured:
+/// the old CreateSolidBrush + CreatePen per row left ~4 objects behind after each repaint).
+unsafe fn shaped(hdc: HDC, fill: u32, pen: u32, draw: impl FnOnce()) {
+    let brush = GetStockObject(DC_BRUSH);
+    let pen_obj = GetStockObject(DC_PEN);
+    let old_brush = SelectObject(hdc, brush);
+    let old_pen = SelectObject(hdc, pen_obj);
+    SetDCBrushColor(hdc, COLORREF(fill));
+    SetDCPenColor(hdc, COLORREF(pen));
+    draw();
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
 }
 
-impl Gdi {
-    fn own(&mut self, obj: HGDIOBJ) -> HGDIOBJ {
-        if !obj.0.is_null() {
-            self.objs.push(obj);
-        }
-        obj
+pub fn fill(hdc: HDC, rc: &RECT, color: u32) {
+    unsafe {
+        let brush = GetStockObject(DC_BRUSH);
+        let old = SelectObject(hdc, brush);
+        SetDCBrushColor(hdc, COLORREF(color));
+        FillRect(hdc, rc, HBRUSH(brush.0));
+        SelectObject(hdc, old);
     }
+}
 
-    fn brush(&mut self, color: u32) -> HBRUSH {
-        let b = unsafe { CreateSolidBrush(COLORREF(color)) };
-        let o = self.own(HGDIOBJ(b.0));
-        HBRUSH(o.0)
-    }
-
-    pub fn fill(&mut self, hdc: HDC, rc: &RECT, color: u32) {
-        let b = self.brush(color);
-        unsafe {
-            FillRect(hdc, rc, b);
-        }
-    }
-
-    /// Filled rounded rect; `border` draws a 1px outline in that color.
-    pub fn round(&mut self, hdc: HDC, rc: &RECT, radius: i32, fill: u32, border: Option<u32>) {
-        let b = self.brush(fill);
-        let pen = unsafe { CreatePen(PS_SOLID, 1, COLORREF(border.unwrap_or(fill))) };
-        let pen = self.own(HGDIOBJ(pen.0));
-        unsafe {
-            let ob = SelectObject(hdc, b);
-            let op = SelectObject(hdc, pen);
+/// Filled rounded rect; `border` draws a 1px outline in that color.
+pub fn round(hdc: HDC, rc: &RECT, radius: i32, fill: u32, border: Option<u32>) {
+    let edge = border.unwrap_or(fill);
+    unsafe {
+        shaped(hdc, fill, edge, || {
             let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-        }
+        });
     }
+}
 
-    /// Outline only (1px), rounded.
-    pub fn stroke(&mut self, hdc: HDC, rc: &RECT, radius: i32, color: u32) {
-        let pen = unsafe { CreatePen(PS_SOLID, 1, COLORREF(color)) };
-        let pen = self.own(HGDIOBJ(pen.0));
-        unsafe {
-            let null_brush = GetStockObject(NULL_BRUSH);
-            let ob = SelectObject(hdc, null_brush);
-            let op = SelectObject(hdc, pen);
-            let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-        }
+/// Outline only (1px), rounded.
+pub fn stroke(hdc: HDC, rc: &RECT, radius: i32, color: u32) {
+    unsafe {
+        let brush = GetStockObject(NULL_BRUSH);
+        let pen = GetStockObject(DC_PEN);
+        let old_brush = SelectObject(hdc, brush);
+        let old_pen = SelectObject(hdc, pen);
+        SetDCPenColor(hdc, COLORREF(color));
+        let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
     }
+}
 
-    /// Filled circle (toggle knob).
-    pub fn dot(&mut self, hdc: HDC, rc: &RECT, color: u32) {
-        let b = self.brush(color);
-        let pen = unsafe { CreatePen(PS_SOLID, 1, COLORREF(color)) };
-        let pen = self.own(HGDIOBJ(pen.0));
-        unsafe {
-            let ob = SelectObject(hdc, b);
-            let op = SelectObject(hdc, pen);
+/// Filled circle (toggle knob).
+pub fn dot(hdc: HDC, rc: &RECT, color: u32) {
+    unsafe {
+        shaped(hdc, color, color, || {
             let _ = Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-        }
+        });
     }
+}
 
-    pub fn text(&mut self, hdc: HDC, rc: &RECT, s: &str, font: HFONT, color: u32, flags: DRAW_TEXT_FORMAT) {
-        let mut wide: Vec<u16> = s.encode_utf16().collect();
+pub fn text(hdc: HDC, rc: &RECT, s: &str, font: HFONT, color: u32, flags: DRAW_TEXT_FORMAT) {
+    let mut wide: Vec<u16> = s.encode_utf16().collect();
         unsafe {
             let old_font = SelectObject(hdc, HGDIOBJ(font.0));
             let old_color = SetTextColor(hdc, COLORREF(color));
@@ -110,17 +99,6 @@ impl Gdi {
             DrawTextW(hdc, &mut wide, &mut r, flags);
             SetTextColor(hdc, old_color);
             SelectObject(hdc, old_font);
-        }
-    }
-}
-
-impl Drop for Gdi {
-    fn drop(&mut self) {
-        for obj in self.objs.drain(..) {
-            unsafe {
-                let _ = DeleteObject(obj);
-            }
-        }
     }
 }
 
@@ -247,9 +225,8 @@ unsafe fn paint_toggle(hwnd: HWND) {
     };
 
     paint_banner(hwnd, |hdc, rc| {
-        let mut g = Gdi::default();
         // Toggles sit on the settings card.
-        g.fill(hdc, rc, p.card);
+        fill(hdc, rc, p.card);
 
         let pill_h = dip.px(18.0);
         let pill = RECT {
@@ -273,7 +250,7 @@ unsafe fn paint_toggle(hwnd: HWND) {
         } else {
             p.well
         };
-        g.round(hdc, &pill, pill_h / 2, track, (!on).then_some(p.hairline));
+        round(hdc, &pill, pill_h / 2, track, (!on).then_some(p.hairline));
 
         let knob_d = pill_h - dip.px(4.0);
         let knob_x = if on {
@@ -281,7 +258,7 @@ unsafe fn paint_toggle(hwnd: HWND) {
         } else {
             pill.left + dip.px(2.0)
         };
-        g.dot(
+        dot(
             hdc,
             &RECT {
                 left: knob_x,
@@ -293,7 +270,7 @@ unsafe fn paint_toggle(hwnd: HWND) {
         );
 
         if focused {
-            g.stroke(
+            stroke(
                 hdc,
                 &RECT {
                     left: pill.left - dip.px(2.0),
@@ -308,7 +285,7 @@ unsafe fn paint_toggle(hwnd: HWND) {
 
         let label = window_text(hwnd);
         if !label.is_empty() {
-            g.text(
+            text(
                 hdc,
                 &RECT {
                     left: pill.right + dip.px(10.0),
@@ -416,19 +393,18 @@ unsafe extern "system" fn card_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             let dip = Dip::at(hwnd);
             let font = control_font(hwnd);
             paint_banner(hwnd, |hdc, rc| {
-                let mut g = Gdi::default();
-                g.fill(hdc, rc, p.window);
+                fill(hdc, rc, p.window);
                 let card = RECT {
                     left: rc.left + dip.px(1.0),
                     top: rc.top + dip.px(1.0),
                     right: rc.right - dip.px(1.0),
                     bottom: rc.bottom - dip.px(1.0),
                 };
-                g.round(hdc, &card, dip.px(8.0), p.card, Some(p.hairline));
+                round(hdc, &card, dip.px(8.0), p.card, Some(p.hairline));
 
                 let caption = window_text(hwnd);
                 if !caption.is_empty() {
-                    g.text(
+                    text(
                         hdc,
                         &RECT {
                             left: card.left + dip.px(12.0),

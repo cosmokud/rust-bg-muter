@@ -9,9 +9,12 @@ use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver};
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+
+/// Stable label: the check mark, not the wording, shows the state.
+const TOGGLE_LABEL: &str = "Muting";
 
 /// Embedded icon bytes
 const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
@@ -20,6 +23,8 @@ const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 #[derive(Debug, Clone, Copy)]
 pub enum TrayCommand {
     ToggleMuting,
+    /// Mute every background app right now, then report the resulting state.
+    MuteAllNow,
     OpenSettings,
     EditConfig,
     Exit,
@@ -28,7 +33,7 @@ pub enum TrayCommand {
 /// Lightweight system tray manager
 pub struct SystemTray {
     _tray_icon: TrayIcon,
-    menu_toggle: MenuItem,
+    menu_toggle: CheckMenuItem,
     command_rx: Receiver<TrayCommand>,
     last_muting_state: bool,
     exit_flag: Arc<AtomicBool>,
@@ -40,13 +45,8 @@ impl SystemTray {
         let icon = load_tray_icon()?;
 
         // Create menu items
-        let toggle_text = if muting_enabled {
-            "Disable Muting"
-        } else {
-            "Enable Muting"
-        };
-
-        let menu_toggle = MenuItem::new(toggle_text, true, None);
+        let menu_toggle = CheckMenuItem::new(TOGGLE_LABEL, true, muting_enabled, None);
+        let menu_mute_all = MenuItem::new("Mute all now", !muting_enabled, None);
         let menu_settings = MenuItem::new("Settings...", true, None);
         let menu_edit_config = MenuItem::new("Edit Config.json", true, None);
         let menu_separator = PredefinedMenuItem::separator();
@@ -54,6 +54,7 @@ impl SystemTray {
 
         let menu = Menu::new();
         menu.append(&menu_toggle)?;
+        menu.append(&menu_mute_all)?;
         menu.append(&menu_settings)?;
         menu.append(&menu_edit_config)?;
         menu.append(&menu_separator)?;
@@ -63,6 +64,7 @@ impl SystemTray {
         let (command_tx, command_rx) = unbounded();
 
         let toggle_id = menu_toggle.id().clone();
+        let mute_all_id = menu_mute_all.id().clone();
         let settings_id = menu_settings.id().clone();
         let edit_config_id = menu_edit_config.id().clone();
         let exit_id = menu_exit.id().clone();
@@ -75,6 +77,8 @@ impl SystemTray {
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let cmd = if event.id == toggle_id {
                 Some(TrayCommand::ToggleMuting)
+            } else if event.id == mute_all_id {
+                Some(TrayCommand::MuteAllNow)
             } else if event.id == settings_id {
                 Some(TrayCommand::OpenSettings)
             } else if event.id == edit_config_id {
@@ -133,12 +137,8 @@ impl SystemTray {
         }
         self.last_muting_state = muting_enabled;
 
-        let toggle_text = if muting_enabled {
-            "Disable Muting"
-        } else {
-            "Enable Muting"
-        };
-        let _ = self.menu_toggle.set_text(toggle_text);
+        // Check mark carries the state; the label stays stable.
+        self.menu_toggle.set_checked(muting_enabled);
 
         let tooltip = if muting_enabled {
             "Background Muter - Active"

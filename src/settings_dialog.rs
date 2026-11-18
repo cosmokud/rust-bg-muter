@@ -60,6 +60,8 @@ const ID_LABEL_MS: i32 = 122;
 const ID_LABEL_RANGE: i32 = 123;
 const ID_LABEL_CONFIG: i32 = 124;
 const ID_LABEL_PATH: i32 = 125;
+const ID_EDIT_FILTER_EXCLUDED: i32 = 127;
+const ID_EDIT_FILTER_ALWAYS_MUTED: i32 = 128;
 
 const EN_CHANGE: u16 = 0x0300;
 
@@ -83,7 +85,10 @@ struct DialogState {
     audio_manager: Arc<AudioManager>,
     detected_apps: Vec<(u32, String)>, // (pid, name)
     all_detected_apps: Vec<(u32, String)>, // all apps before filtering
-    search_filter: String,
+    // Lowercased filters, one per list; the lists are substring-matched against them.
+    filter_detected: String,
+    filter_excluded: String,
+    filter_always_muted: String,
 }
 
 /// GDI resources for one dialog; freed when it closes. Fonts and brushes live in the
@@ -242,7 +247,9 @@ pub fn open_settings_dialog(
             audio_manager,
             detected_apps: Vec::new(),
             all_detected_apps: Vec::new(),
-            search_filter: String::new(),
+            filter_detected: String::new(),
+            filter_excluded: String::new(),
+            filter_always_muted: String::new(),
         });
     });
 
@@ -339,7 +346,6 @@ unsafe fn create_dialog_window() -> Option<HWND> {
     Some(hwnd)
 }
 
-
 fn initial_geometry() -> (i32, i32, i32, i32) {
     unsafe {
         let mut work = RECT::default();
@@ -419,7 +425,7 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         });
     };
 
-    // Cards first: sibling z-order puts the controls created after them on top.
+    // Cards first, then their children: `create_controls` sinks every card below them.
     push(ID_GRP_DETECTED, Kind::Card, "Detected Audio Apps", margin, card_y, left_panel_width, card_h);
     push(ID_GRP_EXCLUDED, Kind::Card, "Excluded Apps (Always Audible)", right_panel_x, card_y, right_panel_width, right_panel_height);
     push(
@@ -446,23 +452,43 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
     );
     push(ID_BTN_REFRESH, Kind::Button, "Refresh List", margin + s(12.0), card_y + card_h - s(30.0), s(100.0), s(26.0));
 
+    // Right cards: caption row, filter edit, then the list; the card bottom is unchanged.
+    push(
+        ID_EDIT_FILTER_EXCLUDED,
+        Kind::Edit,
+        "",
+        right_panel_x + s(12.0),
+        card_y + s(32.0),
+        right_panel_width - s(24.0),
+        s(24.0),
+    );
     push(
         ID_LIST_EXCLUDED,
         Kind::List,
         "",
         right_panel_x + s(12.0),
-        card_y + s(36.0),
+        card_y + s(60.0),
         right_panel_width - s(24.0),
-        right_panel_height - s(48.0),
+        right_panel_height - s(72.0),
+    );
+    let muted_card_y = card_y + right_panel_height + s(8.0);
+    push(
+        ID_EDIT_FILTER_ALWAYS_MUTED,
+        Kind::Edit,
+        "",
+        right_panel_x + s(12.0),
+        muted_card_y + s(32.0),
+        right_panel_width - s(24.0),
+        s(24.0),
     );
     push(
         ID_LIST_ALWAYS_MUTED,
         Kind::List,
         "",
         right_panel_x + s(12.0),
-        card_y + right_panel_height + s(8.0) + s(32.0),
+        muted_card_y + s(60.0),
         right_panel_width - s(24.0),
-        right_panel_height - s(44.0),
+        right_panel_height - s(72.0),
     );
 
     push(ID_BTN_ADD_EXCLUSION, Kind::Button, "Add to Exclusions \u{2192}", margin + s(12.0), buttons_y, s(180.0), row + s(4.0));
@@ -607,16 +633,22 @@ unsafe fn create_controls(hwnd: HWND) {
         );
     }
 
-    // Cue banner on the search box (native EDIT supports it).
-    let search = get_dlg_item(hwnd, ID_EDIT_SEARCH);
-    if !search.0.is_null() {
-        let cue = to_wide("Filter by process name");
-        let _ = SendMessageW(
-            search,
-            EM_SETCUEBANNER,
-            WPARAM(1),
-            LPARAM(cue.as_ptr() as isize),
-        );
+    // Cue banners: a native EDIT draws them until the user types.
+    for (id, cue) in [
+        (ID_EDIT_SEARCH, "Filter by process name"),
+        (ID_EDIT_FILTER_EXCLUDED, "Filter exclusions"),
+        (ID_EDIT_FILTER_ALWAYS_MUTED, "Filter always muted"),
+    ] {
+        let edit = get_dlg_item(hwnd, id);
+        if !edit.0.is_null() {
+            let cue = to_wide(cue);
+            let _ = SendMessageW(
+                edit,
+                EM_SETCUEBANNER,
+                WPARAM(1),
+                LPARAM(cue.as_ptr() as isize),
+            );
+        }
     }
 
     // Dark scrollbars: documented uxtheme class name; ignored if unavailable.
@@ -1002,16 +1034,104 @@ unsafe fn process_image_path(pid: u32) -> Option<String> {
     (ok && size > 0).then(|| String::from_utf16_lossy(&buf[..size as usize]))
 }
 
+/// Text of the selected row, so a refill can restore the selection when the row survives.
+unsafe fn selected_text(list: HWND) -> Option<String> {
+    let idx = SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+    if idx < 0 {
+        return None;
+    }
+    let len = SendMessageW(list, LB_GETTEXTLEN, WPARAM(idx as usize), LPARAM(0)).0;
+    if len <= 0 {
+        return None;
+    }
+    let mut buf: Vec<u16> = vec![0; len as usize + 1];
+    SendMessageW(
+        list,
+        LB_GETTEXT,
+        WPARAM(idx as usize),
+        LPARAM(buf.as_mut_ptr() as isize),
+    );
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+unsafe fn select_text(list: HWND, text: &str) {
+    let wide = to_wide(text);
+    let idx = SendMessageW(
+        list,
+        LB_FINDSTRINGEXACT,
+        WPARAM(usize::MAX),
+        LPARAM(wide.as_ptr() as isize),
+    )
+    .0;
+    if idx >= 0 {
+        SendMessageW(list, LB_SETCURSEL, WPARAM(idx as usize), LPARAM(0));
+    }
+}
+
+unsafe fn add_row(list: HWND, text: &str, data: isize) -> isize {
+    let wide = to_wide(text);
+    let idx = SendMessageW(
+        list,
+        LB_ADDSTRING,
+        WPARAM(0),
+        LPARAM(wide.as_ptr() as isize),
+    )
+    .0;
+    if idx >= 0 && data != 0 {
+        SendMessageW(list, LB_SETITEMDATA, WPARAM(idx as usize), LPARAM(data));
+    }
+    idx
+}
+
+/// Detected rows visible under `filter_detected`; `detected_apps` mirrors the list so a
+/// selected row index maps back to its pid.
+fn filtered_detected() -> Vec<(u32, String)> {
+    DIALOG_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(s) = state.as_mut() else {
+            return Vec::new();
+        };
+        let rows: Vec<(u32, String)> = s
+            .all_detected_apps
+            .iter()
+            .filter(|(_, name)| {
+                s.filter_detected.is_empty() || name.to_lowercase().contains(&s.filter_detected)
+            })
+            .cloned()
+            .collect();
+        s.detected_apps = rows.clone();
+        rows
+    })
+}
+
+unsafe fn refill_detected_list(hwnd: HWND) {
+    let list = get_dlg_item(hwnd, ID_LIST_DETECTED);
+    let keep = selected_text(list);
+    SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+    for (pid, name) in filtered_detected() {
+        // Item data = PID, so the owner-draw can resolve the real icon.
+        add_row(list, &format!("{} (PID: {})", name, pid), pid as isize);
+    }
+    if let Some(text) = keep {
+        select_text(list, &text);
+    }
+}
+
+unsafe fn refill_named_list(list: HWND, names: &[String]) {
+    let keep = selected_text(list);
+    SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+    for name in names {
+        add_row(list, name, 0);
+    }
+    if let Some(text) = keep {
+        select_text(list, &text);
+    }
+}
+
 unsafe fn refresh_detected_apps(hwnd: HWND) {
-    let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
-
-    SendMessageW(list_detected, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-
     DIALOG_STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
             let sessions = s.audio_manager.get_sessions();
-            s.all_detected_apps.clear();
-            s.detected_apps.clear();
 
             let config = s.config.read();
             let excluded = config.excluded_apps.clone();
@@ -1031,116 +1151,58 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
 
             apps.sort_by_key(|a| a.1.to_lowercase());
             s.all_detected_apps = apps;
-
-            let filter = s.search_filter.to_lowercase();
-            for (pid, name) in &s.all_detected_apps {
-                if filter.is_empty() || name.to_lowercase().contains(&filter) {
-                    s.detected_apps.push((*pid, name.clone()));
-                    let display = format!("{} (PID: {})", name, pid);
-                    let wide = to_wide(&display);
-                    let idx = SendMessageW(
-                        list_detected,
-                        LB_ADDSTRING,
-                        WPARAM(0),
-                        LPARAM(wide.as_ptr() as isize),
-                    );
-                    if idx.0 >= 0 {
-                        // Item data = PID, so the owner-draw can resolve the real icon.
-                        SendMessageW(
-                            list_detected,
-                            LB_SETITEMDATA,
-                            WPARAM(idx.0 as usize),
-                            LPARAM(*pid as isize),
-                        );
-                    }
-                }
-            }
         }
     });
 
+    refill_detected_list(hwnd);
     refresh_excluded_list(hwnd);
     refresh_always_muted_list(hwnd);
 }
 
-unsafe fn apply_search_filter(hwnd: HWND) {
-    let list_detected = get_dlg_item(hwnd, ID_LIST_DETECTED);
-
-    SendMessageW(list_detected, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-
-    DIALOG_STATE.with(|state| {
-        if let Some(ref mut s) = *state.borrow_mut() {
-            s.detected_apps.clear();
-
-            let filter = s.search_filter.to_lowercase();
-            for (pid, name) in &s.all_detected_apps {
-                if filter.is_empty() || name.to_lowercase().contains(&filter) {
-                    s.detected_apps.push((*pid, name.clone()));
-                    let display = format!("{} (PID: {})", name, pid);
-                    let wide = to_wide(&display);
-                    let idx = SendMessageW(
-                        list_detected,
-                        LB_ADDSTRING,
-                        WPARAM(0),
-                        LPARAM(wide.as_ptr() as isize),
-                    );
-                    if idx.0 >= 0 {
-                        SendMessageW(
-                            list_detected,
-                            LB_SETITEMDATA,
-                            WPARAM(idx.0 as usize),
-                            LPARAM(*pid as isize),
-                        );
-                    }
-                }
-            }
-        }
-    });
-}
-
 unsafe fn refresh_excluded_list(hwnd: HWND) {
-    let list_excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
-
-    SendMessageW(list_excluded, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-
-    DIALOG_STATE.with(|state| {
-        if let Some(ref s) = *state.borrow() {
-            let mut excluded: Vec<_> = s.config.read().excluded_apps.iter().cloned().collect();
-            excluded.sort_by_key(|a| a.to_lowercase());
-
-            for app in excluded {
-                let wide = to_wide(&app);
-                SendMessageW(
-                    list_excluded,
-                    LB_ADDSTRING,
-                    WPARAM(0),
-                    LPARAM(wide.as_ptr() as isize),
-                );
-            }
+    let (names, filter) = DIALOG_STATE.with(|state| {
+        let state = state.borrow();
+        match state.as_ref() {
+            Some(s) => (
+                {
+                    let mut names: Vec<String> =
+                        s.config.read().excluded_apps.iter().cloned().collect();
+                    names.sort_by_key(|a| a.to_lowercase());
+                    names
+                },
+                s.filter_excluded.clone(),
+            ),
+            None => (Vec::new(), String::new()),
         }
     });
+    let names: Vec<String> = names
+        .into_iter()
+        .filter(|n| filter.is_empty() || n.to_lowercase().contains(&filter))
+        .collect();
+    refill_named_list(get_dlg_item(hwnd, ID_LIST_EXCLUDED), &names);
 }
 
 unsafe fn refresh_always_muted_list(hwnd: HWND) {
-    let list_always_muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
-
-    SendMessageW(list_always_muted, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-
-    DIALOG_STATE.with(|state| {
-        if let Some(ref s) = *state.borrow() {
-            let mut always_muted: Vec<_> = s.config.read().always_muted_apps.iter().cloned().collect();
-            always_muted.sort_by_key(|a| a.to_lowercase());
-
-            for app in always_muted {
-                let wide = to_wide(&app);
-                SendMessageW(
-                    list_always_muted,
-                    LB_ADDSTRING,
-                    WPARAM(0),
-                    LPARAM(wide.as_ptr() as isize),
-                );
-            }
+    let (names, filter) = DIALOG_STATE.with(|state| {
+        let state = state.borrow();
+        match state.as_ref() {
+            Some(s) => (
+                {
+                    let mut names: Vec<String> =
+                        s.config.read().always_muted_apps.iter().cloned().collect();
+                    names.sort_by_key(|a| a.to_lowercase());
+                    names
+                },
+                s.filter_always_muted.clone(),
+            ),
+            None => (Vec::new(), String::new()),
         }
     });
+    let names: Vec<String> = names
+        .into_iter()
+        .filter(|n| filter.is_empty() || n.to_lowercase().contains(&filter))
+        .collect();
+    refill_named_list(get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED), &names);
 }
 
 unsafe fn load_settings_to_controls(hwnd: HWND) {
@@ -1172,26 +1234,41 @@ unsafe fn get_check(hwnd: HWND, id: i32) -> bool {
     SendMessageW(get_dlg_item(hwnd, id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == BST_CHECKED as isize
 }
 
+/// One filter edit changed: store the needle lowercased and refill only its own list,
+/// so the other two lists keep their selection.
+unsafe fn apply_edit_filter(hwnd: HWND, id: i32) {
+    let needle = od_controls::window_text(get_dlg_item(hwnd, id)).to_lowercase();
+    DIALOG_STATE.with(|state| {
+        if let Some(ref mut s) = *state.borrow_mut() {
+            match id {
+                ID_EDIT_SEARCH => s.filter_detected = needle,
+                ID_EDIT_FILTER_EXCLUDED => s.filter_excluded = needle,
+                _ => s.filter_always_muted = needle,
+            }
+        }
+    });
+    match id {
+        ID_EDIT_SEARCH => refill_detected_list(hwnd),
+        ID_EDIT_FILTER_EXCLUDED => refresh_excluded_list(hwnd),
+        _ => refresh_always_muted_list(hwnd),
+    }
+}
+
 unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
     match control_id {
         ID_EDIT_SEARCH => {
             if notification == EN_CHANGE {
-                let edit_search = get_dlg_item(hwnd, ID_EDIT_SEARCH);
-                let mut buffer: [u16; 256] = [0; 256];
-                let len = GetWindowTextW(edit_search, &mut buffer);
-                let search_text = if len > 0 {
-                    String::from_utf16_lossy(&buffer[..len as usize])
-                } else {
-                    String::new()
-                };
-
-                DIALOG_STATE.with(|state| {
-                    if let Some(ref mut s) = *state.borrow_mut() {
-                        s.search_filter = search_text;
-                    }
-                });
-
-                apply_search_filter(hwnd);
+                apply_edit_filter(hwnd, ID_EDIT_SEARCH);
+            }
+        }
+        ID_EDIT_FILTER_EXCLUDED => {
+            if notification == EN_CHANGE {
+                apply_edit_filter(hwnd, ID_EDIT_FILTER_EXCLUDED);
+            }
+        }
+        ID_EDIT_FILTER_ALWAYS_MUTED => {
+            if notification == EN_CHANGE {
+                apply_edit_filter(hwnd, ID_EDIT_FILTER_ALWAYS_MUTED);
             }
         }
         ID_BTN_REFRESH => {
@@ -1389,7 +1466,9 @@ mod tests {
                 audio_manager: Arc::new(AudioManager::new().expect("audio manager")),
                 detected_apps: Vec::new(),
                 all_detected_apps: Vec::new(),
-                search_filter: String::new(),
+                filter_detected: String::new(),
+                filter_excluded: String::new(),
+                filter_always_muted: String::new(),
             });
         });
         unsafe { create_dialog_window().expect("settings window") }
@@ -1462,7 +1541,7 @@ mod tests {
                 let s = state.as_mut().unwrap();
                 s.all_detected_apps = vec![(1, "alpha.exe".into()), (2, "beta.exe".into())];
             });
-            refresh_detected_apps(hwnd);
+            refill_detected_list(hwnd);
 
             let list = get_dlg_item(hwnd, ID_LIST_DETECTED);
             let mut rc = RECT::default();
@@ -1521,6 +1600,87 @@ mod tests {
             );
             assert_no_overlaps(hwnd);
             with_ui_mut(|ui| ui.dip = Dip::at(hwnd));
+        }
+        teardown(hwnd);
+    }
+
+    /// The filter edits must process input: disabled or covered, WM_CHAR is dropped.
+    #[test]
+    fn filter_edits_accept_typing_and_filter_their_lists() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+
+            let search = get_dlg_item(hwnd, ID_EDIT_SEARCH);
+            let excluded_edit = get_dlg_item(hwnd, ID_EDIT_FILTER_EXCLUDED);
+            let muted_edit = get_dlg_item(hwnd, ID_EDIT_FILTER_ALWAYS_MUTED);
+            for edit in [search, excluded_edit, muted_edit] {
+                assert!(IsWindowEnabled(edit).as_bool(), "filter edit is disabled");
+                let style = GetWindowLongW(edit, GWL_STYLE);
+                assert_eq!(
+                    style & (WS_TABSTOP.0 as i32),
+                    WS_TABSTOP.0 as i32,
+                    "filter edit lost WS_TABSTOP"
+                );
+                let mut rc = RECT::default();
+                let _ = GetClientRect(edit, &mut rc);
+                let mut pt = windows::Win32::Foundation::POINT {
+                    x: rc.right / 2,
+                    y: rc.bottom / 2,
+                };
+                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(edit, &mut pt);
+                assert_eq!(
+                    WindowFromPoint(pt),
+                    edit,
+                    "a sibling window covers a filter edit"
+                );
+            }
+
+            SendMessageW(search, WM_CHAR, WPARAM('a' as usize), LPARAM(0));
+            assert_eq!(
+                od_controls::window_text(search),
+                "a",
+                "search edit dropped a keystroke"
+            );
+
+            // In-memory config only: the saving variants would rewrite the user's file.
+            DIALOG_STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                let s = state.as_mut().unwrap();
+                let mut config = Config::default();
+                config.insert_excluded_app("beta.exe");
+                config.insert_excluded_app("gamma.exe");
+                config.insert_always_muted_app("delta.exe");
+                config.insert_always_muted_app("epsilon.exe");
+                s.config = Arc::new(RwLock::new(config));
+            });
+            refresh_excluded_list(hwnd);
+            refresh_always_muted_list(hwnd);
+
+            let excluded = get_dlg_item(hwnd, ID_LIST_EXCLUDED);
+            let muted = get_dlg_item(hwnd, ID_LIST_ALWAYS_MUTED);
+            // Typing goes through WM_CHAR, so the EN_CHANGE branch refills the list.
+            SendMessageW(excluded_edit, WM_CHAR, WPARAM('g' as usize), LPARAM(0));
+            assert_eq!(enumerate(excluded), vec!["gamma.exe".to_string()]);
+            assert_eq!(
+                enumerate(muted).len(),
+                2,
+                "filtering one list refilled another"
+            );
+
+            SendMessageW(muted_edit, WM_CHAR, WPARAM('D' as usize), LPARAM(0));
+            assert_eq!(enumerate(muted), vec!["delta.exe".to_string()]);
+
+            // Clearing the filter keeps the still-present row selected.
+            SendMessageW(excluded, LB_SETCURSEL, WPARAM(0), LPARAM(0));
+            let empty = to_wide("");
+            let _ = SetWindowTextW(excluded_edit, PCWSTR(empty.as_ptr()));
+            assert_eq!(enumerate(excluded).len(), 2);
+            assert_eq!(
+                SendMessageW(excluded, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0,
+                1
+            );
         }
         teardown(hwnd);
     }

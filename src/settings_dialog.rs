@@ -754,7 +754,6 @@ unsafe fn create_controls(hwnd: HWND) {
                     | WS_TABSTOP
                     | WS_CLIPSIBLINGS
                     | WS_VSCROLL
-                    | WS_HSCROLL
                     | WS_BORDER
                     | WINDOW_STYLE((LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32),
             ),
@@ -929,11 +928,9 @@ unsafe fn set_font(hwnd: HWND, font: HFONT) {
 // Per-list subclass ids, offset so they never collide with od_controls' hover id.
 const LIST_RESIZE_SUBCLASS_ID: usize = 0x100;
 
-/// A listbox clips its client to whole owner-draw rows and puts its horizontal
-/// scrollbar in the non-client area, so after a resize the partial-row strip and the
-/// h-scroll thumb band (`WS_HSCROLL` + `LB_SETHORIZONTALEXTENT` set in create_controls)
-/// can keep pixels from the pre-resize layout. DefSubclassProc runs first so the new
-/// geometry and scrollbar state exist, then the whole list is invalidated.
+/// A listbox clips its client to whole owner-draw rows, so after a resize the
+/// partial-row strip can keep pixels from the pre-resize layout. DefSubclassProc runs
+/// first so the new geometry exists, then the whole list is invalidated.
 unsafe extern "system" fn list_resize_subclass(
     hwnd: HWND,
     msg: u32,

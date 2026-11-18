@@ -952,6 +952,7 @@ thread_local! {
 /// `bg` is the flat surface behind `rc`; the rounded corners show it through.
 /// `state` is (on, hot, pressed, focused) and only selects the cache slot.
 unsafe fn aa_shape(
+    hwnd: HWND,
     hdc: HDC,
     id: i32,
     rc: &RECT,
@@ -974,7 +975,7 @@ unsafe fn aa_shape(
         focused,
         p.accent,
     );
-    if let Some(dc) = ss_buffer(hdc, &key, rc, bg, shapes) {
+    if let Some(dc) = ss_buffer(hwnd, &key, rc, bg, shapes) {
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         SetStretchBltMode(hdc, HALFTONE);
         // HALFTONE samples from the brush origin; a stale one shifts the downscale by it.
@@ -1000,7 +1001,7 @@ unsafe fn aa_shape(
 
 /// Memory DC holding `shapes` at AA_SUPERSAMPLE scale over `bg`, created once per `key`.
 unsafe fn ss_buffer(
-    hdc: HDC,
+    hwnd: HWND,
     key: &SsKey,
     rc: &RECT,
     bg: u32,
@@ -1020,8 +1021,13 @@ unsafe fn ss_buffer(
         }
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         let (sw, sh) = (w * AA_SUPERSAMPLE, h * AA_SUPERSAMPLE);
-        let dc = CreateCompatibleDC(hdc);
-        let bmp = CreateCompatibleBitmap(hdc, sw, sh);
+        // The colour format must come from a device DC: CreateCompatibleBitmap on a
+        // memory DC (the dialog's back buffer) would hand back a 1bpp monochrome bitmap,
+        // so the supersampled shapes would render as black and white.
+        let window_dc = GetDC(hwnd);
+        let dc = CreateCompatibleDC(window_dc);
+        let bmp = CreateCompatibleBitmap(window_dc, sw, sh);
+        let _ = ReleaseDC(hwnd, window_dc);
         if dc.0.is_null() || bmp.0.is_null() {
             if !dc.0.is_null() {
                 let _ = DeleteDC(dc);
@@ -1031,6 +1037,7 @@ unsafe fn ss_buffer(
             }
             return None;
         }
+        // The memory DC outlives the bitmap it holds; the returned handle is not kept.
         SelectObject(dc, bmp);
         let full = RECT {
             left: 0,
@@ -1172,7 +1179,7 @@ unsafe fn paint_frame(hwnd: HWND, hdc: HDC, rc: &RECT) {
                 DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
             ),
             Kind::Button => draw_button(hdc, ctl, &p, dip, window_focused, &cards),
-            Kind::Toggle => draw_toggle(hdc, ctl, &p, dip, window_focused, &cards),
+            Kind::Toggle => draw_toggle(hwnd, hdc, ctl, &p, dip, window_focused, &cards),
             Kind::Edit => draw_field(hdc, ctl, &p, dip, window_focused),
             Kind::List => draw_list(hdc, ctl, &p, dip, window_focused),
         }
@@ -1281,6 +1288,7 @@ unsafe fn draw_button(
 }
 
 unsafe fn draw_toggle(
+    hwnd: HWND,
     hdc: HDC,
     ctl: &Ctl,
     p: &Palette,
@@ -1297,11 +1305,15 @@ unsafe fn draw_toggle(
     od_controls::fill(hdc, &rc, surface_of(rc, cards));
 
     let pill_h = dip.px(18.0);
+    // Centred on the control's own rect: `rc` is in dialog coordinates, so a bare
+    // `rc.bottom / 2` would put the pill at half the window height, well above its row,
+    // and every toggle would land on nearly the same y (the three overlapping pills).
+    let pill_top = rc.top + ((rc.bottom - rc.top) - pill_h) / 2;
     let pill = RECT {
         left: rc.left + dip.px(1.0),
-        top: (rc.bottom - pill_h) / 2,
+        top: pill_top,
         right: rc.left + dip.px(1.0) + dip.px(36.0),
-        bottom: (rc.bottom - pill_h) / 2 + pill_h,
+        bottom: pill_top + pill_h,
     };
     let track = if on {
         if pressed {
@@ -1340,6 +1352,7 @@ unsafe fn draw_toggle(
     };
     // The focus ring is stroked at 1x, so it is not part of the supersampled pass.
     aa_shape(
+        hwnd,
         hdc,
         ctl.id,
         &pill,
@@ -3218,10 +3231,10 @@ mod tests {
             // The dialog's own creation paint already filled a slot; start from empty.
             free_ss_buffers();
             SS_BUILDS.with(|c| c.set(0));
-            draw_toggle(dc, &ctl, &p, dip, false, &cards);
+            draw_toggle(hwnd, dc, &ctl, &p, dip, false, &cards);
             let first = SS_BUILDS.with(|c| c.get());
             assert!(first > 0, "the toggle never built a supersampled bitmap");
-            draw_toggle(dc, &ctl, &p, dip, false, &cards);
+            draw_toggle(hwnd, dc, &ctl, &p, dip, false, &cards);
             assert_eq!(
                 SS_BUILDS.with(|c| c.get()),
                 first,
@@ -3229,7 +3242,7 @@ mod tests {
             );
 
             set_toggle(ctl.id, !toggle(ctl.id));
-            draw_toggle(dc, &ctl, &p, dip, false, &cards);
+            draw_toggle(hwnd, dc, &ctl, &p, dip, false, &cards);
             assert_eq!(
                 SS_BUILDS.with(|c| c.get()),
                 first + 1,
@@ -3280,4 +3293,157 @@ mod tests {
         assert!(gap >= row_height(), "toggle rows are only {gap}px apart");
         teardown(hwnd);
     }
+
+    /// The frame must put each control's colour exactly where the layout says it is. A
+    /// sample at the centre of every control's rect reads the buffer back, so a control
+    /// drawn at the wrong coordinates (or one painted over another) fails here.
+    #[test]
+    fn frame_paints_each_control_in_its_own_rect() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let (w, h) = (rc.right, rc.bottom);
+            let window_dc = GetDC(hwnd);
+            let mem = CreateCompatibleDC(window_dc);
+            let bmp = CreateCompatibleBitmap(window_dc, w, h);
+            let _ = ReleaseDC(hwnd, window_dc);
+            let old = SelectObject(mem, HGDIOBJ(bmp.0));
+            paint_frame(hwnd, mem, &rc);
+
+            let p = current_palette();
+            let at = |x: i32, y: i32| {
+                let c = windows::Win32::Graphics::Gdi::GetPixel(mem, x, y);
+                (c.0 & 0xFF) as u32 | (c.0 & 0xFF00) | (c.0 & 0xFF0000)
+            };
+            for ctl in layout(hwnd) {
+                let (cx, cy) = (
+                    (ctl.rect.left + ctl.rect.right) / 2,
+                    (ctl.rect.top + ctl.rect.bottom) / 2,
+                );
+                match ctl.kind {
+                    Kind::Card => {
+                        // The centre of a card is behind its own list, so sample the caption row.
+                        let y = ctl.rect.top + dip_of().px(10.0);
+                        let seen = at(cx, y);
+                        assert_eq!(seen, p.card, "card {} centre is not the card colour", ctl.id);
+                    }
+                    Kind::Toggle => {
+                        // Sample the track, never the knob: the knob sits on the left when
+                        // the toggle is off and on the right when it is on.
+                        let on = toggle(ctl.id);
+                        let x = if on {
+                            ctl.rect.left + dip_of().px(5.0)
+                        } else {
+                            ctl.rect.left + dip_of().px(32.0)
+                        };
+                        let y = (ctl.rect.top + ctl.rect.bottom) / 2;
+                        let seen = at(x, y);
+                        let want = if on { p.accent } else { p.well };
+                        assert_eq!(
+                            seen, want,
+                            "toggle {} pill is not drawn at its rect {x},{y}", ctl.id
+                        );
+                    }
+                    // A list is filled with rows and a field with text, so the body colour is
+                    // counted over the rect instead of trusted from one pixel.
+                    Kind::List | Kind::Edit => {
+                        let mut same = 0;
+                        let mut total = 0;
+                        for y in (ctl.rect.top + 2..ctl.rect.bottom - 2).step_by(5) {
+                            for x in (ctl.rect.left + 2..ctl.rect.right - 2).step_by(5) {
+                                total += 1;
+                                if at(x, y) == p.well {
+                                    same += 1;
+                                }
+                            }
+                        }
+                        assert!(
+                            total > 0 && same * 2 > total,
+                            "{} {} body covers {same}/{total} of its rect",
+                            if ctl.kind == Kind::List { "list" } else { "field" },
+                            ctl.id
+                        );
+                    }
+                    Kind::Button => {
+                        let primary = ctl.id == ID_BTN_SAVE_CLOSE;
+                        let want = if primary { p.accent } else { p.card };
+                        // The label covers part of the rect, so count the fill over the whole
+                        // button instead of trusting one pixel.
+                        let mut same = 0;
+                        let mut total = 0;
+                        for y in (ctl.rect.top + 6..ctl.rect.bottom - 6).step_by(3) {
+                            for x in (ctl.rect.left + 6..ctl.rect.right - 6).step_by(3) {
+                                total += 1;
+                                if at(x, y) == want {
+                                    same += 1;
+                                }
+                            }
+                        }
+                        assert!(
+                            total > 0 && same * 2 > total,
+                            "button {} fill covers {same}/{total} of its rect, wanted {want:#08x}",
+                            ctl.id
+                        );
+                    }
+                    Kind::Label => {}
+                }
+            }
+            // A point no control covers shows the window colour.
+            let bare = (w - dip_of().px(2.0), h - dip_of().px(2.0));
+            assert_eq!(at(bare.0, bare.1), p.window, "bare window pixels");
+
+            SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
+        }
+        teardown(hwnd);
+    }
+
+    /// Writes one painted frame to .tmp/frame.bin (raw BGRA) so the render can be inspected
+    /// offscreen. Development aid only.
+    #[test]
+    #[ignore]
+    fn dump_frame() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let (w, h) = (rc.right, rc.bottom);
+            let window_dc = GetDC(hwnd);
+            let mem = CreateCompatibleDC(window_dc);
+            let bmp = CreateCompatibleBitmap(window_dc, w, h);
+            let _ = ReleaseDC(hwnd, window_dc);
+            let old = SelectObject(mem, HGDIOBJ(bmp.0));
+            paint_frame(hwnd, mem, &rc);
+
+            let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO::default();
+            bmi.bmiHeader.biSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = 0;
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            let _ = windows::Win32::Graphics::Gdi::GetDIBits(
+                mem,
+                bmp,
+                0,
+                h as u32,
+                Some(pixels.as_mut_ptr() as *mut c_void),
+                &mut bmi,
+                windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+            );
+            std::fs::write(".tmp/frame.bin", &pixels).unwrap();
+            std::fs::write(".tmp/frame.size", format!("{w}x{h}")).unwrap();
+
+            SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
+        }
+        teardown(hwnd);
+    }
+
 }

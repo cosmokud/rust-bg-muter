@@ -82,8 +82,10 @@ thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
     // (window, client rect) the last layout pass ran for: a repeated WM_SIZE is a no-op.
     static LAST_LAYOUT: Cell<(isize, i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, -1, -1)) };
-    // Card rects derived from `layout()`, keyed on the same window + client rect.
-    static CARD_RECTS: RefCell<((isize, i32, i32, i32, i32), Vec<RECT>)> =
+    // Control id -> card rect that holds it, derived from `layout()`, keyed on the same
+    // window + client rect. Structural, so a paint can never depend on where a control
+    // currently happens to be.
+    static CARD_MAP: RefCell<((isize, i32, i32, i32, i32), Vec<(i32, Option<RECT>)>)> =
         const { RefCell::new(((0, 0, 0, -1, -1), Vec::new())) };
 }
 
@@ -909,7 +911,7 @@ unsafe fn resize_controls(hwnd: HWND) {
     // Controls that grew keep stale pixels on the strip they just gained, and controls
     // that moved leave their old pixels on the parent, so the final state must be painted
     // before this WM_SIZE returns. RDW_UPDATENOW is affordable here *because* the batch
-    // above is one pass and the LAST_LAYOUT/CARD_RECTS/icon caches keep the paint cheap;
+    // above is one pass and the LAST_LAYOUT/CARD_MAP/icon caches keep the paint cheap;
     // with COMPOSITED it ends each WM_SIZE on one complete buffer instead of leaving the
     // previous geometry on screen.
     let _ = RedrawWindow(
@@ -1045,7 +1047,13 @@ unsafe extern "system" fn window_proc(
             let hdc = HDC(wparam.0 as *mut c_void);
             SetTextColor(hdc, COLORREF(p.text));
             SetBkMode(hdc, TRANSPARENT);
-            LRESULT(with_ui(|u| u.br_card).unwrap_or_default().0 as isize)
+            // Only labels inside a card own the card colour; the rest sit on the window.
+            let brush = if card_of(hwnd, GetDlgCtrlID(HWND(lparam.0 as *mut c_void))).is_some() {
+                with_ui(|u| u.br_card)
+            } else {
+                with_ui(|u| u.br_window)
+            };
+            LRESULT(brush.unwrap_or_default().0 as isize)
         }
         WM_CTLCOLOREDIT => {
             let p = current_palette();
@@ -1128,39 +1136,52 @@ unsafe fn draw_item(lparam: LPARAM) {
     }
 }
 
-/// True if `pt` lies on a card, judged against card rects derived from `layout()` for the
-/// current client rect. Derived, never duplicated: rebuilt only when the key changes, so a
-/// paint costs no GetClientRect + Ctl vec + String allocations per owner-drawn button.
-fn point_on_card(parent: HWND, pt: windows::Win32::Foundation::POINT) -> bool {
+/// Card that holds control `id`, according to `layout()` for the current client rect.
+/// A control's backdrop must come from the layout, never from the rect it currently
+/// occupies: during a live resize the window rects lag the layout, so a rect- or
+/// pixel-based answer flips a button between the card and the window colour mid-drag.
+/// The map is derived from `layout()` (never a second copy of the grid) and rebuilt only
+/// when the client rect changes, so a paint costs one map lookup and one GetClientRect.
+fn card_of(parent: HWND, id: i32) -> Option<RECT> {
     let mut rc = RECT::default();
     unsafe {
         let _ = GetClientRect(parent, &mut rc);
     }
     let key = (parent.0 as isize, rc.left, rc.top, rc.right, rc.bottom);
-    CARD_RECTS.with(|c| {
+    CARD_MAP.with(|c| {
         if c.borrow().0 != key {
-            let rects: Vec<RECT> = layout(parent)
-                .into_iter()
+            let ctls = layout(parent);
+            let cards: Vec<RECT> = ctls
+                .iter()
                 .filter(|x| x.kind == Kind::Card)
                 .map(|x| x.rect)
                 .collect();
-            *c.borrow_mut() = (key, rects);
+            let map: Vec<(i32, Option<RECT>)> = ctls
+                .iter()
+                .map(|x| {
+                    let cx = (x.rect.left + x.rect.right) / 2;
+                    let cy = (x.rect.top + x.rect.bottom) / 2;
+                    let hit = cards
+                        .iter()
+                        .copied()
+                        .find(|r| cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom);
+                    (x.id, hit)
+                })
+                .collect();
+            *c.borrow_mut() = (key, map);
         }
-        let c = c.borrow();
-        c.1.iter()
-            .any(|r| pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom)
+        c.borrow()
+            .1
+            .iter()
+            .find(|(cid, _)| *cid == id)
+            .and_then(|(_, r)| *r)
     })
 }
 
-/// Background surface under a control: the card it overlaps, else the window.
-fn surface_under(parent: HWND, rc: RECT) -> u32 {
+/// Background surface behind control `id`: the card that holds it, else the window.
+fn surface_under(parent: HWND, id: i32) -> u32 {
     let p = current_palette();
-
-    let center = windows::Win32::Foundation::POINT {
-        x: (rc.left + rc.right) / 2,
-        y: (rc.top + rc.bottom) / 2,
-    };
-    if point_on_card(parent, center) {
+    if card_of(parent, id).is_some() {
         p.card
     } else {
         p.window
@@ -1180,7 +1201,7 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
     let small = with_ui(|u| u.font_small).unwrap_or(HFONT(std::ptr::null_mut()));
 
     let parent = GetParent(dis.hwndItem).unwrap_or_default();
-    od_controls::fill(dis.hDC, &rc, surface_under(parent, rc));
+    od_controls::fill(dis.hDC, &rc, surface_under(parent, dis.CtlID as i32));
 
     let (fill, fg, border) = if primary {
         let f = if pressed {
@@ -2021,6 +2042,38 @@ mod tests {
             format!("{} - Settings", crate::tray::APP_NAME),
             "Rust Background Muter - Settings"
         );
+    }
+
+    /// A button's backdrop is decided by the layout, so it cannot flip between the card and
+    /// the window colour while a resize is still in flight. Every control on a card must
+    /// answer the card, and every control outside one the window.
+    #[test]
+    fn control_surfaces_follow_the_layout_not_the_window_rects() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        let ctls = layout(hwnd);
+        let cards: Vec<RECT> = ctls
+            .iter()
+            .filter(|c| c.kind == Kind::Card)
+            .map(|c| c.rect)
+            .collect();
+        for ctl in &ctls {
+            if ctl.kind == Kind::Card {
+                continue;
+            }
+            let cx = (ctl.rect.left + ctl.rect.right) / 2;
+            let cy = (ctl.rect.top + ctl.rect.bottom) / 2;
+            let on_card = cards
+                .iter()
+                .any(|r| cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom);
+            assert_eq!(
+                card_of(hwnd, ctl.id).is_some(),
+                on_card,
+                "control {} backdrop does not match the layout",
+                ctl.id
+            );
+        }
+        teardown(hwnd);
     }
 
     /// A card that covers its children takes the hit test, the focus and the clicks.

@@ -2120,7 +2120,14 @@ unsafe fn clipboard_paste(hwnd: HWND, id: i32) {
             Some(String::from_utf16_lossy(slice))
         });
     let _ = CloseClipboard();
-    if let Some(text) = text {
+    let Some(text) = text else { return };
+    // A single-line field drops line breaks, and the numeric field keeps digits only,
+    // so pasting can never put something `save` would have to reject into the box.
+    let text: String = text
+        .chars()
+        .filter(|c| *c >= ' ' && (!numeric_field(id) || c.is_ascii_digit()))
+        .collect();
+    if !text.is_empty() {
         insert_at_caret(id, &text);
         after_field_edit(hwnd, id);
     }

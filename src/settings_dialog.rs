@@ -20,8 +20,8 @@ use std::sync::{Arc, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, FillRect, InvalidateRect, RedrawWindow,
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, SetBkColor,
+    BeginPaint, CreateFontW, CreateSolidBrush, EndPaint, InvalidateRect, RedrawWindow,
+    RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, SetBkColor,
     SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
     DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
@@ -82,8 +82,8 @@ thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
     // (window, client rect) the last layout pass ran for: a repeated WM_SIZE is a no-op.
     static LAST_LAYOUT: Cell<(isize, i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, -1, -1)) };
-    // Card rects derived from `layout()`, keyed on the same window + client rect.
-    static CARD_RECTS: RefCell<((isize, i32, i32, i32, i32), Vec<RECT>)> =
+    // Card rects + the control ids that fall inside each one, derived from `layout()` only.
+    static CARD_MAP: RefCell<((isize, i32, i32, i32, i32), Vec<(RECT, Vec<i32>)>)> =
         const { RefCell::new(((0, 0, 0, -1, -1), Vec::new())) };
 }
 
@@ -719,7 +719,9 @@ unsafe fn create_controls(hwnd: HWND) {
         let (class, style) = match ctl.kind {
             Kind::Card => (
                 od_controls::CLASS_CARD,
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                // WS_CLIPCHILDREN: the card's own paint must not overwrite a child that
+                // already painted in this pass (owner-draw rows sit on the card).
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
             ),
             Kind::Toggle => (
                 od_controls::CLASS_TOGGLE,
@@ -909,14 +911,16 @@ unsafe fn resize_controls(hwnd: HWND) {
     // Controls that grew keep stale pixels on the strip they just gained, and controls
     // that moved leave their old pixels on the parent, so the final state must be painted
     // before this WM_SIZE returns. RDW_UPDATENOW is affordable here *because* the batch
-    // above is one pass and the LAST_LAYOUT/CARD_RECTS/icon caches keep the paint cheap;
+    // above is one pass and the LAST_LAYOUT/CARD_MAP/icon caches keep the paint cheap;
     // with COMPOSITED it ends each WM_SIZE on one complete buffer instead of leaving the
     // previous geometry on screen.
+    // Nothing erases: every surface is fully painted through the off-screen path, so
+    // RDW_ERASE would only add a system background flash before our own frame.
     let _ = RedrawWindow(
         hwnd,
         None,
         None,
-        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
     );
 }
 
@@ -942,7 +946,9 @@ unsafe extern "system" fn list_resize_subclass(
 ) -> LRESULT {
     let result = DefSubclassProc(hwnd, msg, wparam, lparam);
     match msg {
-        WM_SIZE => {
+        // A scroll (wheel, thumb, keyboard) moves rows under the clip and shifts the
+        // h-scroll thumb band: invalidate the whole list so no stale row survives it.
+        WM_SIZE | WM_VSCROLL | WM_HSCROLL | WM_MOUSEWHEEL => {
             let _ = InvalidateRect(hwnd, None, false);
             result
         }
@@ -963,20 +969,16 @@ unsafe fn attach_list_resize_repaint(hwnd: HWND) {
     );
 }
 
-/// Window background. A memory DC was measured at ~2.5 MB resident for the full
-/// client area, and WS_CLIPCHILDREN + WM_ERASEBKGND=1 already keeps child paints from
-/// flickering, so the flat fill is drawn straight to the window DC.
+/// Window background. Drawn through the off-screen buffer like every other surface: a
+/// direct fill of `rcPaint` shows the previous frame's pixels for the rest of the update.
 unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     if rc.right > 0 && rc.bottom > 0 {
-        FillRect(
-            hdc,
-            &ps.rcPaint,
-            HBRUSH(with_ui(|u| u.br_window).unwrap_or_default().0),
-        );
+        let p = current_palette();
+        od_controls::dib(hwnd, hdc, (0, 0), (rc.right, rc.bottom), p.window, |_mem, _| {});
     }
     let _ = EndPaint(hwnd, &ps);
 }
@@ -1045,7 +1047,13 @@ unsafe extern "system" fn window_proc(
             let hdc = HDC(wparam.0 as *mut c_void);
             SetTextColor(hdc, COLORREF(p.text));
             SetBkMode(hdc, TRANSPARENT);
-            LRESULT(with_ui(|u| u.br_card).unwrap_or_default().0 as isize)
+            // A STATIC label inherits the card only when its own layout rect sits on one;
+            // labels elsewhere (above the footer buttons) keep the window colour.
+            let ctl = GetDlgCtrlID(HWND(lparam.0 as *mut c_void));
+            let on_card = card_of(hwnd, ctl).is_some();
+            LRESULT(with_ui(|u| if on_card { u.br_card } else { u.br_window })
+                .unwrap_or_default()
+                .0 as isize)
         }
         WM_CTLCOLOREDIT => {
             let p = current_palette();
@@ -1078,6 +1086,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            od_controls::release(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -1111,11 +1120,6 @@ unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
     resize_controls(hwnd);
 }
 
-unsafe fn draw_item_bg(hdc: HDC, rc: RECT) {
-    let p = current_palette();
-    od_controls::fill(hdc, &rc, p.well);
-}
-
 unsafe fn draw_item(lparam: LPARAM) {
     let dis = lparam.0 as *const DRAWITEMSTRUCT;
     let Some(dis) = dis.as_ref() else { return };
@@ -1128,39 +1132,51 @@ unsafe fn draw_item(lparam: LPARAM) {
     }
 }
 
-/// True if `pt` lies on a card, judged against card rects derived from `layout()` for the
-/// current client rect. Derived, never duplicated: rebuilt only when the key changes, so a
-/// paint costs no GetClientRect + Ctl vec + String allocations per owner-drawn button.
-fn point_on_card(parent: HWND, pt: windows::Win32::Foundation::POINT) -> bool {
+/// Id of the card whose layout rect contains control `id`'s own layout rect, for the
+/// current client rect. Structural, not pixel-tested: during a resize DRAWITEM can fire
+/// with the control already moved and the parent not yet repainted, so asking the painted
+/// pixels whether a control is "on a card" answers differently per frame - that was the
+/// light/dark band behind owner-drawn buttons. Derived from `layout()` only, never a
+/// duplicate grid, and rebuilt only when the window size key changes.
+fn card_of(parent: HWND, id: i32) -> Option<RECT> {
     let mut rc = RECT::default();
     unsafe {
         let _ = GetClientRect(parent, &mut rc);
     }
     let key = (parent.0 as isize, rc.left, rc.top, rc.right, rc.bottom);
-    CARD_RECTS.with(|c| {
+    CARD_MAP.with(|c| {
         if c.borrow().0 != key {
-            let rects: Vec<RECT> = layout(parent)
-                .into_iter()
+            let ctls = layout(parent);
+            let cards: Vec<(RECT, Vec<i32>)> = ctls
+                .iter()
                 .filter(|x| x.kind == Kind::Card)
-                .map(|x| x.rect)
+                .map(|card| {
+                    let outer = card.rect;
+                    let inside: Vec<i32> = ctls
+                        .iter()
+                        .filter(|x| x.kind != Kind::Card)
+                        .filter(|x| {
+                            x.rect.left >= outer.left
+                                && x.rect.right <= outer.right
+                                && x.rect.top >= outer.top
+                                && x.rect.bottom <= outer.bottom
+                        })
+                        .map(|x| x.id)
+                        .collect();
+                    (outer, inside)
+                })
                 .collect();
-            *c.borrow_mut() = (key, rects);
+            *c.borrow_mut() = (key, cards);
         }
         let c = c.borrow();
-        c.1.iter()
-            .any(|r| pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom)
+        c.1.iter().find(|(_, ids)| ids.contains(&id)).map(|(r, _)| *r)
     })
 }
 
-/// Background surface under a control: the card it overlaps, else the window.
-fn surface_under(parent: HWND, rc: RECT) -> u32 {
+/// Background surface under a control: the card it sits on, else the window.
+fn surface_under(parent: HWND, ctl_id: i32) -> u32 {
     let p = current_palette();
-
-    let center = windows::Win32::Foundation::POINT {
-        x: (rc.left + rc.right) / 2,
-        y: (rc.top + rc.bottom) / 2,
-    };
-    if point_on_card(parent, center) {
+    if card_of(parent, ctl_id).is_some() {
         p.card
     } else {
         p.window
@@ -1180,7 +1196,7 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
     let small = with_ui(|u| u.font_small).unwrap_or(HFONT(std::ptr::null_mut()));
 
     let parent = GetParent(dis.hwndItem).unwrap_or_default();
-    od_controls::fill(dis.hDC, &rc, surface_under(parent, rc));
+    let surface = surface_under(parent, dis.CtlID as i32);
 
     let (fill, fg, border) = if primary {
         let f = if pressed {
@@ -1208,104 +1224,131 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
         right: rc.right - s(2.0),
         bottom: rc.bottom - s(3.0),
     };
-    od_controls::round(dis.hDC, &inner, s(6.0), fill, border);
-    od_controls::text(
+    // One frame per control: fill, outline and label land in the buffer, then flip as one.
+    od_controls::dib(
+        dis.hwndItem,
         dis.hDC,
-        &inner,
-        &label,
-        small,
-        fg,
-        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS,
+        (rc.left, rc.top),
+        (rc.right - rc.left, rc.bottom - rc.top),
+        surface,
+        |mem, _| {
+            od_controls::round(mem, &inner, s(6.0), fill, border);
+            od_controls::text(
+                mem,
+                &inner,
+                &label,
+                small,
+                fg,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS,
+            );
+        },
     );
 }
 
 unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
-    // itemID is u32: the (UINT)-1 empty-row sentinel arrives as u32::MAX.
-    if dis.itemID == u32::MAX {
-        // LB_SETITEMHEIGHT / empty list: paint the empty row so the well keeps its color.
-        draw_item_bg(dis.hDC, dis.rcItem);
-        return;
-    }
     let p = current_palette();
     let dip = dip_of();
     let s = |v: f32| dip.px(v);
     let rc = dis.rcItem;
-    let selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+    // itemID is u32: the (UINT)-1 empty-row sentinel arrives as u32::MAX.
+    let empty = dis.itemID == u32::MAX;
+    let selected = !empty && (dis.itemState.0 & ODS_SELECTED.0) != 0;
     let focused = selected && ((dis.itemState.0 & ODS_FOCUS.0) != 0 || GetFocus() == dis.hwndItem);
 
     let bg = if selected {
         od_controls::mix(p.well, p.accent, 0.30)
-    } else if od_controls::hot_item(dis.hwndItem) == dis.itemID as isize {
+    } else if !empty && od_controls::hot_item(dis.hwndItem) == dis.itemID as isize {
         p.hover
     } else {
         p.well
     };
-    od_controls::fill(dis.hDC, &rc, bg);
-    if focused {
-        od_controls::round(dis.hDC, &rc, s(4.0), bg, Some(p.accent));
-    }
 
-    let len = SendMessageW(
-        dis.hwndItem,
-        LB_GETTEXTLEN,
-        WPARAM(dis.itemID as usize),
-        LPARAM(0),
-    )
-    .0 as usize;
-    if len == 0 {
-        return;
-    }
-    let mut buf: Vec<u16> = vec![0; len + 1];
-    SendMessageW(
-        dis.hwndItem,
-        LB_GETTEXT,
-        WPARAM(dis.itemID as usize),
-        LPARAM(buf.as_mut_ptr() as isize),
-    );
-    let text = String::from_utf16_lossy(&buf[..len]);
-
-    let icon_size = s(16.0);
-    let pid = SendMessageW(
-        dis.hwndItem,
-        LB_GETITEMDATA,
-        WPARAM(dis.itemID as usize),
-        LPARAM(0),
-    )
-    .0;
-    let icon = row_icon(pid.max(0) as u32, &text);
-
-    let text_left;
-    if let Some(icon) = icon {
-        let y = rc.top + ((rc.bottom - rc.top) - icon_size) / 2;
-        let _ = DrawIconEx(
-            dis.hDC,
-            rc.left + s(6.0),
-            y,
-            icon,
-            icon_size,
-            icon_size,
-            0,
-            HBRUSH::default(),
-            DI_NORMAL,
-        );
-        text_left = rc.left + s(6.0) + icon_size + s(8.0);
+    let len = if empty {
+        0
     } else {
-        text_left = rc.left + s(8.0);
-    }
-
-    let text_rc = RECT {
-        left: text_left,
-        top: rc.top,
-        right: rc.right - s(4.0),
-        bottom: rc.bottom,
+        SendMessageW(
+            dis.hwndItem,
+            LB_GETTEXTLEN,
+            WPARAM(dis.itemID as usize),
+            LPARAM(0),
+        )
+        .0 as usize
     };
-    od_controls::text(
+    let text = if len == 0 {
+        String::new()
+    } else {
+        let mut buf: Vec<u16> = vec![0; len + 1];
+        SendMessageW(
+            dis.hwndItem,
+            LB_GETTEXT,
+            WPARAM(dis.itemID as usize),
+            LPARAM(buf.as_mut_ptr() as isize),
+        );
+        String::from_utf16_lossy(&buf[..len])
+    };
+
+    // Row icon; the empty row has no process, so it skips the lookup.
+    let icon_size = s(16.0);
+    let icon = if empty {
+        None
+    } else {
+        let pid = SendMessageW(
+            dis.hwndItem,
+            LB_GETITEMDATA,
+            WPARAM(dis.itemID as usize),
+            LPARAM(0),
+        )
+        .0;
+        row_icon(pid.max(0) as u32, &text)
+    };
+    let text_left = match icon {
+        Some(_) => rc.left + s(6.0) + icon_size + s(8.0),
+        None => rc.left + s(8.0),
+    };
+
+    // A row is one frame: background, selection outline, icon and label are drawn into the
+    // buffer and flipped together, so no partial row can be shown between two scrolls.
+    od_controls::dib(
+        dis.hwndItem,
         dis.hDC,
-        &text_rc,
-        &text,
-        ui_font(),
-        p.text,
-        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
+        (rc.left, rc.top),
+        (rc.right - rc.left, rc.bottom - rc.top),
+        bg,
+        |mem, _| {
+            if focused {
+                od_controls::round(mem, &rc, s(4.0), bg, Some(p.accent));
+            }
+            if let Some(icon) = icon {
+                let y = rc.top + ((rc.bottom - rc.top) - icon_size) / 2;
+                let _ = DrawIconEx(
+                    mem,
+                    rc.left + s(6.0),
+                    y,
+                    icon,
+                    icon_size,
+                    icon_size,
+                    0,
+                    HBRUSH::default(),
+                    DI_NORMAL,
+                );
+            }
+            if text.is_empty() {
+                return;
+            }
+            od_controls::text(
+                mem,
+                &RECT {
+                    left: text_left,
+                    top: rc.top,
+                    right: rc.right - s(4.0),
+                    bottom: rc.bottom,
+                },
+                &text,
+                ui_font(),
+                p.text,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        },
     );
 }
 
@@ -2073,6 +2116,16 @@ mod tests {
             assert_eq!(SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0, 1);
 
             assert_no_overlaps(hwnd);
+            // Surface colour is structural (layout, not pixels), so it cannot flip mid-resize.
+            for (id, on_card) in [
+                (ID_LABEL_SEARCH, true),
+                (ID_LIST_DETECTED, true),
+                (ID_CHECK_ENABLED, true),
+                (ID_BTN_SAVE_CLOSE, false),
+                (ID_BTN_EDIT_CONFIG, false),
+            ] {
+                assert_eq!(card_of(hwnd, id).is_some(), on_card, "control {id} surface");
+            }
             // The same grid at 150%: scale the client area with the DIP, as a DPI change does.
             let (mut client, mut window) = (RECT::default(), RECT::default());
             let _ = GetClientRect(hwnd, &mut client);

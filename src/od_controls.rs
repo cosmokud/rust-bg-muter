@@ -13,10 +13,11 @@ use std::ffi::c_void;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, DrawTextW, Ellipse, EndPaint, FillRect, GetStockObject, InvalidateRect, RoundRect,
-    SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, DRAW_TEXT_FORMAT, DC_BRUSH,
-    DC_PEN, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ,
-    NULL_BRUSH, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteObject, DrawTextW, Ellipse,
+    EndPaint, FillRect, GetDC, GetStockObject, InvalidateRect, ReleaseDC, RoundRect, SelectObject,
+    SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, DRAW_TEXT_FORMAT, DC_BRUSH, DC_PEN,
+    DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
+    NULL_BRUSH, PAINTSTRUCT, SRCCOPY, TRANSPARENT, SetViewportOrgEx,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, VK_RETURN, VK_SPACE,
@@ -160,12 +161,119 @@ unsafe fn track_leave(hwnd: HWND) {
     let _ = TrackMouseEvent(&mut tme);
 }
 
-unsafe fn paint_banner(hwnd: HWND, f: impl FnOnce(HDC, &RECT)) {
+struct Buffer {
+    mem: HDC,
+    bmp: HBITMAP,
+    w: i32,
+    h: i32,
+}
+
+thread_local! {
+    // One off-screen buffer per window, so a frame that paints the dialog and every child
+    // never rebuilds a buffer per control. GDI objects are created only on a size change.
+    static BUFFERS: RefCell<HashMap<isize, Buffer>> = RefCell::new(HashMap::new());
+}
+
+/// Paints `size` into a cached off-screen buffer owned by `hwnd`, then flips it to `target`
+/// at `at` with one BitBlt/SRCCOPY; `f` gets the memory DC and a rect whose origin is the
+/// buffer's. The target DC's clip (BeginPaint's update region) still clips the flip, so a
+/// partial update stays partial. Every surface we paint goes through here: a direct write
+/// to the window DC shows the old pixels of that band for one frame.
+///
+/// # Safety
+/// `hwnd` must be a live window and `target` a valid DC.
+pub unsafe fn dib(
+    hwnd: HWND,
+    target: HDC,
+    at: (i32, i32),
+    size: (i32, i32),
+    erase: u32,
+    f: impl FnOnce(HDC, &RECT),
+) {
+    if size.0 <= 0 || size.1 <= 0 {
+        return;
+    }
+    let key = hwnd.0 as isize;
+    let mem = BUFFERS.with(|b| {
+        let mut map = b.borrow_mut();
+        let slot = map.entry(key).or_insert_with(|| Buffer {
+            mem: HDC::default(),
+            bmp: HBITMAP::default(),
+            w: 0,
+            h: 0,
+        });
+        let stale = slot.bmp.0.is_null() || slot.w != size.0 || slot.h != size.1;
+        if stale {
+            let win_dc = GetDC(hwnd);
+            if slot.mem.0.is_null() {
+                slot.mem = CreateCompatibleDC(win_dc);
+            }
+            let bmp = CreateCompatibleBitmap(win_dc, size.0, size.1);
+            ReleaseDC(hwnd, win_dc);
+            if !slot.bmp.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(slot.bmp.0));
+            }
+            slot.bmp = bmp;
+            slot.w = size.0;
+            slot.h = size.1;
+        }
+        slot.mem
+    });
+    if mem.0.is_null() {
+        return;
+    }
+    let rc = RECT {
+        left: 0,
+        top: 0,
+        right: size.0,
+        bottom: size.1,
+    };
+    // Client-space rect handed to `f`: the viewport origin is shifted to `at`, so callers
+    // can draw entirely in their own client coordinates, exactly as on the window DC.
+    let client = RECT {
+        left: at.0,
+        top: at.1,
+        right: at.0 + size.0,
+        bottom: at.1 + size.1,
+    };
+    BUFFERS.with(|b| {
+        let bmp = b.borrow().get(&key).map(|s| s.bmp).unwrap_or_default();
+        let old = SelectObject(mem, HGDIOBJ(bmp.0));
+        // Start from the flat surface colour: the buffer is reused, so every pixel the
+        // callback leaves unpainted must not show the previous frame.
+        fill(mem, &rc, erase);
+        let _ = SetViewportOrgEx(mem, at.0, at.1, None);
+        f(mem, &client);
+        // 0,0 origin for the flip so the source and destination spaces are 1:1.
+        let _ = SetViewportOrgEx(mem, 0, 0, None);
+        let _ = BitBlt(target, at.0, at.1, size.0, size.1, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+    });
+}
+
+/// Frees the off-screen buffer of `hwnd` on WM_NCDESTROY, or a closed window keeps its
+/// bitmap (and the size it was built for) for the life of the thread.
+///
+/// # Safety
+/// `hwnd` must be a window that painted through `dib`.
+pub unsafe fn release(hwnd: HWND) {
+    let slot = BUFFERS.with(|b| b.borrow_mut().remove(&(hwnd.0 as isize)));
+    if let Some(slot) = slot {
+        if !slot.bmp.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(slot.bmp.0));
+        }
+        if !slot.mem.0.is_null() {
+            let _ = windows::Win32::Graphics::Gdi::DeleteDC(slot.mem);
+        }
+    }
+}
+
+unsafe fn paint_banner(hwnd: HWND, erase: u32, f: impl FnOnce(HDC, &RECT)) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
-    f(hdc, &rc);
+    dib(hwnd, hdc, (0, 0), (rc.right, rc.bottom), erase, f);
     let _ = EndPaint(hwnd, &ps);
 }
 
@@ -233,10 +341,8 @@ unsafe fn paint_toggle(hwnd: HWND) {
         None => (false, false, false),
     };
 
-    paint_banner(hwnd, |hdc, rc| {
-        // Toggles sit on the settings card.
-        fill(hdc, rc, p.card);
-
+    // Toggles sit on the settings card.
+    paint_banner(hwnd, p.card, |hdc, rc| {
         let pill_h = dip.px(18.0);
         let pill = RECT {
             left: rc.left + dip.px(1.0),
@@ -326,6 +432,7 @@ unsafe extern "system" fn toggle_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 drop(Box::from_raw(t));
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
+            release(hwnd);
             LRESULT(0)
         }
         BM_SETCHECK => {
@@ -401,8 +508,7 @@ unsafe extern "system" fn card_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             let p = current_palette();
             let dip = Dip::at(hwnd);
             let font = crate::settings_dialog::ui_font();
-            paint_banner(hwnd, |hdc, rc| {
-                fill(hdc, rc, p.window);
+            paint_banner(hwnd, p.window, |hdc, rc| {
                 let card = RECT {
                     left: rc.left + dip.px(1.0),
                     top: rc.top + dip.px(1.0),
@@ -524,6 +630,9 @@ unsafe extern "system" fn hover_subclass(
             }
         }
         WM_NCDESTROY => {
+            // Owner-drawn BUTTONs and LISTBOXes paint through the buffer cache: free it
+            // here, the only place that sees these controls die.
+            release(hwnd);
             let _ = RemoveWindowSubclass(hwnd, Some(hover_subclass), HOVER_SUBCLASS_ID);
             HOVER.with(|h| {
                 h.borrow_mut().remove(&(hwnd.0 as isize));

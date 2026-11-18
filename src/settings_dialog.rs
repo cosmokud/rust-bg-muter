@@ -89,11 +89,7 @@ const MIN_WINDOW_HEIGHT: f32 = 560.0;
 thread_local! {
     static DIALOG_STATE: RefCell<Option<DialogState>> = const { RefCell::new(None) };
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
-    // Control id -> card rect that holds it, derived from `layout()` and keyed on the
-    // window + client rect. Structural, so a paint can never depend on where a control
-    // currently happens to be, and one paint pass reuses it instead of re-deriving.
-    static CARD_MAP: RefCell<((isize, i32, i32, i32, i32), Vec<(i32, Option<RECT>)>)> =
-        const { RefCell::new(((0, 0, 0, -1, -1), Vec::new())) };
+
 }
 
 struct DialogState {
@@ -1058,47 +1054,6 @@ unsafe fn draw_card(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip) {
             DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS,
         );
     }
-}
-
-/// Card that holds control `id`, according to `layout()` for the current client rect.
-/// A control's backdrop must come from the layout, never from the rect it currently
-/// occupies: during a live resize the window rects lag the layout, so a rect- or
-/// pixel-based answer flips a button between the card and the window colour mid-drag.
-/// The map is derived from `layout()` (never a second copy of the grid) and rebuilt only
-/// when the client rect changes, so a paint costs one map lookup and one GetClientRect.
-fn card_of(parent: HWND, id: i32) -> Option<RECT> {
-    let mut rc = RECT::default();
-    unsafe {
-        let _ = GetClientRect(parent, &mut rc);
-    }
-    let key = (parent.0 as isize, rc.left, rc.top, rc.right, rc.bottom);
-    CARD_MAP.with(|c| {
-        if c.borrow().0 != key {
-            let ctls = layout(parent);
-            let cards: Vec<RECT> = ctls
-                .iter()
-                .filter(|x| x.kind == Kind::Card)
-                .map(|x| x.rect)
-                .collect();
-            let map: Vec<(i32, Option<RECT>)> =
-                ctls.iter()
-                    .map(|x| {
-                        let cx = (x.rect.left + x.rect.right) / 2;
-                        let cy = (x.rect.top + x.rect.bottom) / 2;
-                        let hit = cards.iter().copied().find(|r| {
-                            cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom
-                        });
-                        (x.id, hit)
-                    })
-                    .collect();
-            *c.borrow_mut() = (key, map);
-        }
-        c.borrow()
-            .1
-            .iter()
-            .find(|(cid, _)| *cid == id)
-            .and_then(|(_, r)| *r)
-    })
 }
 
 /// Background behind a control: the card its centre lands on, else the window. Both come
@@ -2680,9 +2635,7 @@ unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
         ui.font = HFONT(shared.font as *mut c_void);
         ui.font_small = HFONT(shared.font_small as *mut c_void);
     });
-    // Row height and every rect follow `dip_of()`, so the cached card map is dropped and
-    // the next paint rebuilds it at the new scale.
-    CARD_MAP.with(|c| c.borrow_mut().0 = (0, 0, 0, -1, -1));
+
     // A caret created for the old DPI keeps its old size until recreated.
     if CARET_ON.with(|c| c.replace(false)) {
         let _ = DestroyCaret();
@@ -2817,16 +2770,14 @@ mod tests {
             .filter(|c| c.kind == Kind::Card)
             .map(|c| c.rect)
             .collect();
-        for ctl in &ctls {
-            if ctl.kind == Kind::Card {
-                continue;
-            }
+        for ctl in ctls.iter().filter(|c| c.kind != Kind::Card) {
             let (cx, cy) = center(ctl.rect);
             let on_card = cards
                 .iter()
                 .any(|r| cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom);
+            let surface = surface_of(ctl.rect, &cards);
             assert_eq!(
-                card_of(hwnd, ctl.id).is_some(),
+                surface == current_palette().card,
                 on_card,
                 "control {} backdrop does not match the layout",
                 ctl.id

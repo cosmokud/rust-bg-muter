@@ -25,10 +25,6 @@ pub struct Config {
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
 
-    /// Whether to start minimized to system tray
-    #[serde(default = "default_start_minimized")]
-    pub start_minimized: bool,
-
     /// Whether to minimize to tray instead of closing
     #[serde(default = "default_minimize_to_tray")]
     pub minimize_to_tray: bool,
@@ -62,10 +58,6 @@ fn default_poll_interval() -> u64 {
     500 // 500ms polling interval - balances responsiveness with CPU efficiency
 }
 
-fn default_start_minimized() -> bool {
-    false
-}
-
 fn default_minimize_to_tray() -> bool {
     true
 }
@@ -81,7 +73,6 @@ impl Default for Config {
             always_muted_apps: HashSet::new(),
             muting_enabled: true,
             poll_interval_ms: 500,
-            start_minimized: false,
             minimize_to_tray: true,
             minimize_button_to_tray: true,
             start_with_windows: false,

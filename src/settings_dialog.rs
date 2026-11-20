@@ -59,7 +59,6 @@ const ID_BTN_ADD_ALWAYS_MUTED: i32 = 115;
 const ID_BTN_REMOVE_ALWAYS_MUTED: i32 = 116;
 const ID_BTN_REFRESH: i32 = 105;
 const ID_CHECK_ENABLED: i32 = 106;
-const ID_CHECK_START_MINIMIZED: i32 = 107;
 const ID_CHECK_START_WINDOWS: i32 = 108;
 const ID_EDIT_POLL_INTERVAL: i32 = 109;
 const ID_BTN_SAVE_CLOSE: i32 = 110;
@@ -721,20 +720,11 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         s(22.0),
     );
     push(
-        ID_CHECK_START_MINIMIZED,
-        Kind::Toggle,
-        "Start Minimized to Tray",
-        margin + s(16.0),
-        settings_y + s(50.0),
-        s(200.0),
-        s(22.0),
-    );
-    push(
         ID_CHECK_START_WINDOWS,
         Kind::Toggle,
         "Start with Windows",
         margin + s(16.0),
-        settings_y + s(74.0),
+        settings_y + s(50.0),
         s(200.0),
         s(22.0),
     );
@@ -2042,7 +2032,6 @@ unsafe fn load_settings_to_field(hwnd: HWND) {
             let muting_enabled = s.muting_enabled.load(Ordering::Relaxed);
 
             set_toggle(ID_CHECK_ENABLED, muting_enabled);
-            set_toggle(ID_CHECK_START_MINIMIZED, config.start_minimized);
             set_toggle(ID_CHECK_START_WINDOWS, config.start_with_windows);
             set_field(ID_EDIT_POLL_INTERVAL, config.poll_interval_ms.to_string());
         }
@@ -2237,7 +2226,6 @@ unsafe fn save_settings(hwnd: HWND) {
             let mut config = s.config.write();
 
             let muting_checked = toggle(ID_CHECK_ENABLED);
-            let start_minimized_checked = toggle(ID_CHECK_START_MINIMIZED);
             let start_windows_checked = toggle(ID_CHECK_START_WINDOWS);
 
             let poll_interval: u64 = field_text(ID_EDIT_POLL_INTERVAL)
@@ -2247,7 +2235,6 @@ unsafe fn save_settings(hwnd: HWND) {
                 .clamp(100, 2000);
 
             config.muting_enabled = muting_checked;
-            config.start_minimized = start_minimized_checked;
             config.poll_interval_ms = poll_interval;
 
             if config.start_with_windows != start_windows_checked {
@@ -3503,7 +3490,7 @@ mod tests {
             .filter(|c| c.kind == Kind::Toggle)
             .map(|c| c.rect)
             .collect();
-        assert_eq!(toggles.len(), 3, "three toggles");
+        assert_eq!(toggles.len(), 2, "two toggles");
         for (i, a) in toggles.iter().enumerate() {
             assert!(
                 a.top >= card.top && a.bottom <= card.bottom && a.left >= card.left

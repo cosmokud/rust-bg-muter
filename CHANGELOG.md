@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- App icons are cached in `icon-cache.bin` beside `config.json`, so an app that is not running keeps its icon in the detected, exclusion and always-muted lists instead of losing it.
 - `Edit Config` button in the settings dialog, left of `Save`: saves the dialog and opens `config.json` in the default editor.
 - `Rust Background Muter` as the application name, shown in the tray tooltip (`- Active` / `- Disabled`), the settings window title, the login command, the executable's product metadata and the installer.
 

@@ -13,6 +13,7 @@
 
 use crate::audio::AudioManager;
 use crate::config::Config;
+use crate::icon_cache;
 use crate::od_controls::{self, to_wide};
 use crate::startup;
 use crate::theme::{apply_chrome, Dip, Palette};
@@ -865,6 +866,10 @@ static MISSING_PATHS: OnceLock<Mutex<HashMap<String, ()>>> = OnceLock::new();
 
 /// Small icon for a list row. `pid` is the real process (detected list); otherwise the
 /// text is a process name, so the first running process with that name supplies the path.
+///
+/// An icon extracted from a live executable is also stored in `icon_cache`, and read back
+/// from there when the app has no running process: a closed app keeps its icon in the
+/// exclusion and always-muted lists.
 unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
     let name = match text.find(" (PID: ") {
         Some(cut) => &text[..cut],
@@ -882,7 +887,8 @@ unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
             return hit.map(|i| HICON(i as *mut c_void));
         }
         let path = process_image_path(pid).or_else(|| path_for_name(name));
-        let icon = icon_of_path(path.as_deref().unwrap_or(name));
+        let icon = icon_of_path(path.as_deref().unwrap_or(name))
+            .or_else(|| icon_cache::icon_for(name));
         ICON_OF_PID
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -899,7 +905,8 @@ unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
         return hit.map(|i| HICON(i as *mut c_void));
     }
     let path = path_for_name(name);
-    let icon = icon_of_path(path.as_deref().unwrap_or(name));
+    let icon = icon_of_path(path.as_deref().unwrap_or(name))
+        .or_else(|| icon_cache::icon_for(name));
     ICON_OF_NAME
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -929,6 +936,8 @@ unsafe fn icon_of_path(path: &str) -> Option<HICON> {
         return None;
     }
     icons.lock().insert(path.to_string(), icon.0 as isize);
+    // Stored for the runs where this app is closed and its path cannot be resolved.
+    icon_cache::remember(path, icon);
     Some(icon)
 }
 

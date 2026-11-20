@@ -2509,7 +2509,16 @@ unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM) {
     }
     // Hovered row of a list.
     if let Some(ctl) = ctls.iter().find(|c| c.id == hit && c.kind == Kind::List) {
-        let index = with_list(ctl.id, |l| row_at(ctl.rect, y, l.top, l.rows.len()));
+        // The scrollbar band belongs to the bar, not to the row the point covers.
+        let index = with_list(ctl.id, |l| {
+            let band = scrollbar_track(ctl.rect, l.rows.len())
+                .is_some_and(|t| x >= t.left && y >= t.top && y < t.bottom);
+            if band {
+                None
+            } else {
+                row_at(ctl.rect, y, l.top, l.rows.len())
+            }
+        });
         changed |= with_list(ctl.id, |l| {
             let before = l.hot;
             l.hot = index;

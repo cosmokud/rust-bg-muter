@@ -15,11 +15,12 @@ use windows::Win32::System::Registry::{
 };
 
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-/// Name this app registers its login command under.
-const VALUE_NAME: &str = "Rust Background Muter";
-/// Names an earlier release registered. They are removed whenever the setting is
+/// Name this app registers its login command under. Run value names are app
+/// identifiers, not display text: no spaces, PascalCase.
+const VALUE_NAME: &str = "RustBackgroundMuter";
+/// Names earlier releases registered. They are removed whenever the setting is
 /// applied, so a rename never leaves a second login command behind.
-const LEGACY_VALUE_NAMES: &[&str] = &["Background Muter"];
+const LEGACY_VALUE_NAMES: &[&str] = &["Rust Background Muter", "Background Muter"];
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     OsStr::new(s)
@@ -79,13 +80,20 @@ pub fn set_run_at_startup(enabled: bool) -> Result<(), Box<dyn Error>> {
 
         unsafe { RegSetValueExW(key, PCWSTR(value_name.as_ptr()), 0, REG_SZ, Some(data_u8)).ok() }
     } else {
-        unsafe {
-            let code: WIN32_ERROR = RegDeleteValueW(key, PCWSTR(value_name.as_ptr()));
-            if code == ERROR_SUCCESS || code == ERROR_FILE_NOT_FOUND {
-                Ok(())
-            } else {
-                Err(windows::core::Error::from_win32())
+        // Also drop legacy values: the loop above only runs on enable, and leaving
+        // one behind would keep the app launching at login after it was disabled.
+        let mut error: Option<WIN32_ERROR> = None;
+        for name in std::iter::once(VALUE_NAME).chain(LEGACY_VALUE_NAMES.iter().copied()) {
+            let wide = to_wide_null(name);
+            let code = unsafe { RegDeleteValueW(key, PCWSTR(wide.as_ptr())) };
+            if code != ERROR_SUCCESS && code != ERROR_FILE_NOT_FOUND && error.is_none() {
+                error = Some(code);
             }
+        }
+
+        match error {
+            None => Ok(()),
+            Some(_) => Err(windows::core::Error::from_win32()),
         }
     };
 

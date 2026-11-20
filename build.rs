@@ -52,6 +52,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=assets/icon.svg");
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=assets/icon.ico");
 
@@ -200,7 +201,9 @@ fn generate_ico(png_path: &Path, ico_path: &Path) -> Result<(), Box<dyn std::err
     let img = image::open(png_path)?;
 
     // Common Windows icon sizes. Including multiple sizes prevents blurry scaling.
-    let sizes: &[u32] = &[256, 64, 48, 32, 16];
+    // Same sizes the checked-in assets/icon.ico carries, so a build without that file still
+    // gets a bitmap per slot instead of one stretched everywhere.
+    let sizes: &[u32] = &[256, 128, 96, 64, 48, 40, 32, 24, 20, 16];
     let mut icon_dir = IconDir::new(ResourceType::Icon);
 
     for &size in sizes {

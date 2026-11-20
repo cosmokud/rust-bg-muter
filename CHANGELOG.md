@@ -12,6 +12,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- The application icon is one SVG design (`assets/icon.svg`), rendered by `scripts/gen-icons.py` into the ICO the exe, installer and uninstaller embed, with a bitmap per notification-area, taskbar and Alt+Tab size instead of one stretched image. The tray icon now comes from that resource rather than a single resized PNG.
 - Installing over a copy published as `Background Muter` updates it in place: the old uninstall registration, shortcuts and login command are removed rather than left beside the new ones.
 
 ## [0.1.2] - 2026-05-19

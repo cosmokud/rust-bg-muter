@@ -19,8 +19,11 @@ pub const APP_NAME: &str = "Rust Background Muter";
 /// Stable label: the check mark, not the wording, shows the state.
 const TOGGLE_LABEL: &str = "Muting";
 
-/// Embedded icon bytes
+/// Embedded icon bytes, the fallback for a build whose ICO resource is missing.
 const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
+
+/// Resource id of the icon `build.rs` embeds, the same one `theme::apply_app_icon` loads.
+const APP_ICON_ID: u16 = 1;
 
 /// Commands from tray interactions
 #[derive(Debug, Clone, Copy)]
@@ -191,8 +194,17 @@ fn tooltip_for(muting_enabled: bool) -> String {
     format!("{APP_NAME} - {state}")
 }
 
-/// Loads the tray icon from embedded PNG
+/// Loads the tray icon: the ICO resource first, since it carries a bitmap for every
+/// notification-area size and Windows picks the one this DPI needs. A single PNG is
+/// stretched at anything above 100%, which is a blurred tray icon on most machines.
 fn load_tray_icon() -> Result<Icon, Box<dyn std::error::Error>> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
+    if let Ok(icon) = Icon::from_resource(APP_ICON_ID, Some((size, size))) {
+        return Ok(icon);
+    }
+
     let img = image::load_from_memory(ICON_BYTES)?
         .resize(32, 32, image::imageops::FilterType::Triangle) // Faster than Lanczos
         .to_rgba8();

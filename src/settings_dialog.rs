@@ -185,6 +185,8 @@ thread_local! {
     static HOT: Cell<i32> = const { Cell::new(0) };
     // Button/toggle held down by the current mouse drag, 0 = none.
     static PRESSED: Cell<i32> = const { Cell::new(0) };
+    // List whose scrollbar thumb is being dragged: (list id, y grab offset in the thumb).
+    static GRABBED: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     static FOCUS: Cell<Focus> = const { Cell::new(Focus::None) };
     static CARET_ON: Cell<bool> = const { Cell::new(false) };
 }
@@ -1541,6 +1543,52 @@ fn scrollbar_width() -> i32 {
     dip_of().px(10.0)
 }
 
+/// The scrollbar band of a list; None when every row already fits.
+fn scrollbar_track(rc: RECT, rows: usize) -> Option<RECT> {
+    (rows > visible_rows(rc)).then(|| {
+        let dip = dip_of();
+        RECT {
+            left: rc.right - scrollbar_width(),
+            top: rc.top + dip.px(2.0),
+            right: rc.right - dip.px(2.0),
+            bottom: rc.bottom - dip.px(2.0),
+        }
+    })
+}
+
+/// Thumb rect inside `track` for the scroll position `top`; the paint and the drag
+/// share it, so the grabbed pixel is the drawn pixel.
+fn scrollbar_thumb(track: RECT, top: usize, rows: usize, visible: usize) -> RECT {
+    let track_h = (track.bottom - track.top).max(1);
+    let thumb_h =
+        ((visible as f32 / rows as f32) * track_h as f32).max(dip_of().px(12.0) as f32) as i32;
+    let max_top = rows.saturating_sub(visible);
+    let offset = if max_top == 0 {
+        0
+    } else {
+        (track_h - thumb_h) * top as i32 / max_top as i32
+    };
+    RECT {
+        top: track.top + offset,
+        bottom: track.top + offset + thumb_h,
+        ..track
+    }
+}
+
+/// Row `top` that puts the thumb's top edge at the grab offset `grab` inside the track.
+fn scrollbar_top(track: RECT, grab: i32, rows: usize, visible: usize) -> usize {
+    let track_h = (track.bottom - track.top).max(1);
+    let thumb_h = scrollbar_thumb(track, 0, rows, visible).bottom - track.top;
+    let span = track_h - thumb_h;
+    if span <= 0 {
+        return 0;
+    }
+    let width = rows.saturating_sub(visible);
+    let travel = (grab - track.top).clamp(0, span) as i64;
+    let top = (travel * width as i64 * 2 + span as i64) / (span as i64 * 2);
+    (top as usize).min(width)
+}
+
 unsafe fn draw_list(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip, window_focused: bool) {
     let rc = ctl.rect;
     od_controls::fill(hdc, &rc, p.well);
@@ -1553,12 +1601,7 @@ unsafe fn draw_list(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip, window_focused: 
     LISTS.with(|lists| {
         let lists = lists.borrow();
         let Some(lv) = lists.get(&ctl.id) else { return };
-        let overflow = lv.rows.len() > visible;
-        let right = if overflow {
-            rc.right - scrollbar_width()
-        } else {
-            rc.right
-        };
+        let right = scrollbar_track(rc, lv.rows.len()).map_or(rc.right, |t| t.left);
         for idx in lv.top..(lv.top + visible).min(lv.rows.len()) {
             let row = &lv.rows[idx];
             let row_rc = RECT {
@@ -1614,32 +1657,10 @@ unsafe fn draw_list(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip, window_focused: 
             );
         }
 
-        if overflow {
-            let track = RECT {
-                left: rc.right - scrollbar_width(),
-                top: rc.top + dip.px(2.0),
-                right: rc.right - dip.px(2.0),
-                bottom: rc.bottom - dip.px(2.0),
-            };
+        if let Some(track) = scrollbar_track(rc, lv.rows.len()) {
             od_controls::fill(hdc, &track, p.hairline);
-            let track_h = (track.bottom - track.top).max(1);
-            let thumb_h = ((visible as f32 / lv.rows.len() as f32) * track_h as f32)
-                .max(dip.px(12.0) as f32) as i32;
-            let max_top = lv.rows.len().saturating_sub(visible);
-            let offset = if max_top == 0 {
-                0
-            } else {
-                (track_h - thumb_h) * lv.top as i32 / max_top as i32
-            };
-            od_controls::fill(
-                hdc,
-                &RECT {
-                    top: track.top + offset,
-                    bottom: track.top + offset + thumb_h,
-                    ..track
-                },
-                p.secondary,
-            );
+            let thumb = scrollbar_thumb(track, lv.top, lv.rows.len(), visible);
+            od_controls::fill(hdc, &thumb, p.secondary);
         }
     });
     let _ = RestoreDC(hdc, saved);
@@ -1703,6 +1724,52 @@ fn select_row(hwnd: HWND, id: i32, idx: usize) {
     let visible = visible_rows(ctl.rect);
     with_list(id, |l| l.sel = Some(idx));
     reveal(id, idx, visible);
+}
+
+/// List whose scrollbar covers point (x, y): the whole band, thumb or not.
+fn list_at_scrollbar(hwnd: HWND, x: i32, y: i32) -> Option<(i32, RECT, RECT)> {
+    layout(hwnd).into_iter().find_map(|c| {
+        if c.kind != Kind::List {
+            return None;
+        }
+        let track = scrollbar_track(c.rect, with_list(c.id, |l| l.rows.len()))?;
+        (x >= track.left && x < track.right && y >= track.top && y < track.bottom)
+            .then_some((c.id, c.rect, track))
+    })
+}
+
+/// Press on a list scrollbar: `(list id, grab offset)` when the thumb was hit, `(list
+/// id, None)` after a bare track press paged one screen toward the pointer.
+fn scrollbar_press(hwnd: HWND, x: i32, y: i32) -> Option<(i32, Option<i32>)> {
+    let (id, rc, track) = list_at_scrollbar(hwnd, x, y)?;
+    let visible = visible_rows(rc);
+    let (top, rows) = with_list(id, |l| (l.top, l.rows.len()));
+    let thumb = scrollbar_thumb(track, top, rows, visible);
+    if y >= thumb.top && y < thumb.bottom {
+        return Some((id, Some(y - thumb.top)));
+    }
+    let page = visible.saturating_sub(1).max(1);
+    let next = if y < thumb.top {
+        top.saturating_sub(page)
+    } else {
+        (top + page).min(rows.saturating_sub(visible))
+    };
+    with_list(id, |l| l.top = next);
+    Some((id, None))
+}
+
+/// Thumb drag: keep the grabbed offset, clamp the row to the content.
+unsafe fn drag_thumb(hwnd: HWND, y: i32) {
+    let (id, grab) = GRABBED.with(|g| g.get());
+    let Some(ctl) = ctl_of(hwnd, id) else { return };
+    let Some(track) = scrollbar_track(ctl.rect, with_list(id, |l| l.rows.len())) else {
+        return;
+    };
+    let visible = visible_rows(ctl.rect);
+    with_list(id, |l| {
+        l.top = scrollbar_top(track, y - grab, l.rows.len(), visible);
+    });
+    repaint(hwnd);
 }
 
 /// Field caret from a client x: nearest char boundary, measured through the same
@@ -2414,6 +2481,11 @@ unsafe fn flip_toggle(hwnd: HWND, id: i32) {
 
 unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM) {
     let (x, y) = point_of(lparam);
+    // A held scrollbar thumb owns the drag: it scrolls, it does not select rows.
+    if GRABBED.with(|g| g.get()).0 != 0 {
+        drag_thumb(hwnd, y);
+        return;
+    }
     // Dragging out of a field after pressing in it extends the selection.
     let pressed = PRESSED.with(|p| p.get());
     if let Focus::Field(id) = focus() {
@@ -2470,6 +2542,15 @@ unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM) {
 
 unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM) {
     let (x, y) = point_of(lparam);
+    if let Some((id, grab)) = scrollbar_press(hwnd, x, y) {
+        set_focus_value(Focus::List(id));
+        GRABBED.with(|g| g.set((id, grab.unwrap_or(0))));
+        PRESSED.with(|p| p.set(0));
+        HOT.with(|h| h.set(0));
+        SetCapture(hwnd);
+        refocus(hwnd);
+        return;
+    }
     let hit = hit_test(&layout(hwnd), x, y);
     PRESSED.with(|p| p.set(hit));
     HOT.with(|h| h.set(hit));
@@ -2519,9 +2600,10 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM) {
 unsafe fn mouse_up(hwnd: HWND, lparam: LPARAM) {
     let (x, y) = point_of(lparam);
     let pressed = PRESSED.with(|p| p.replace(0));
+    let grabbed = GRABBED.with(|g| g.replace((0, 0))).0 != 0;
     let _ = ReleaseCapture();
     let released_on = hit_test(&layout(hwnd), x, y);
-    if pressed != 0 && released_on == pressed {
+    if pressed != 0 && released_on == pressed && !grabbed {
         match kind_of(hwnd, pressed) {
             Some(Kind::Button) => activate_button(hwnd, pressed),
             Some(Kind::Toggle) => flip_toggle(hwnd, pressed),
@@ -2969,6 +3051,7 @@ mod tests {
         SS_BUILDS.with(|c| c.set(0));
         HOT.with(|h| h.set(0));
         PRESSED.with(|p| p.set(0));
+        GRABBED.with(|g| g.set((0, 0)));
         set_focus_value(Focus::None);
         LAST_CLICK.with(|c| c.set((0, 0, 0, 0, 0)));
     }
@@ -3209,6 +3292,57 @@ mod tests {
         teardown(hwnd);
     }
 
+    /// The scrollbar band is a control, not a gap between rows: pressing the thumb drags
+    /// the scroll, pressing the bare track pages, and neither selects a row.
+    #[test]
+    fn scrollbar_thumb_drags_and_track_pages() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            let ctl = ctl_of(hwnd, ID_LIST_DETECTED).unwrap();
+            let visible = visible_rows(ctl.rect);
+            let rows: Vec<Row> = (0..visible + 10)
+                .map(|i| Row {
+                    text: format!("app{}.exe", i),
+                    data: 0,
+                })
+                .collect();
+            with_list(ID_LIST_DETECTED, |l| l.set_rows(rows, visible));
+            let track = scrollbar_track(ctl.rect, visible + 10).expect("no scrollbar");
+            let x = (track.left + track.right) / 2;
+
+            let thumb = scrollbar_thumb(track, 0, visible + 10, visible);
+            let (id, grab) = scrollbar_press(hwnd, x, thumb.top + 2).expect("thumb press");
+            assert_eq!(id, ID_LIST_DETECTED);
+            assert_eq!(grab, Some(2), "thumb press lost the grab offset");
+            assert_eq!(with_list(id, |l| l.top), 0, "thumb press jumped the scroll");
+            assert_eq!(list_sel(id), None, "thumb press selected a row");
+
+            GRABBED.with(|g| g.set((id, grab.unwrap())));
+            drag_thumb(hwnd, track.bottom + 40);
+            assert_eq!(
+                with_list(id, |l| l.top),
+                10,
+                "the drag did not reach the last screen"
+            );
+            drag_thumb(hwnd, track.top - 40);
+            assert_eq!(
+                with_list(id, |l| l.top),
+                0,
+                "the drag did not reach the top"
+            );
+            GRABBED.with(|g| g.set((0, 0)));
+
+            let below = track.bottom - 1;
+            assert!(scrollbar_press(hwnd, x, below).is_some(), "track press");
+            assert!(
+                with_list(id, |l| l.top) > 0,
+                "a press below the thumb did not page down"
+            );
+        }
+        teardown(hwnd);
+    }
+
     /// Every WM_SIZE must end on one complete frame and must not lose list content: a
     /// resize repaints the rows it already has, it does not drop them.
     #[test]
@@ -3333,7 +3467,6 @@ mod tests {
         teardown(hwnd);
     }
 
- 
     /// Every control must land inside the card that owns it, and no row may collide with
     /// another. A pill painted away from its row (all three at one height) is exactly the
     /// class of bug a wrong scale or a wrong origin introduces, so pin the numbers down.

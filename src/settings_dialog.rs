@@ -72,7 +72,13 @@ const ID_GRP_EXCLUDED: i32 = 119;
 const ID_GRP_ALWAYS_MUTED: i32 = 120;
 const ID_LABEL_SEARCH: i32 = 121;
 const ID_LABEL_MS: i32 = 122;
-const ID_LABEL_RANGE: i32 = 123;
+/// Poll interval stepper: two split buttons on the field's right edge.
+const ID_BTN_POLL_UP: i32 = 124;
+const ID_BTN_POLL_DOWN: i32 = 125;
+/// One arrow press moves the poll interval by this much.
+const POLL_STEP_MS: u64 = 100;
+const POLL_MIN_MS: u64 = 100;
+const POLL_MAX_MS: u64 = 2000;
 const ID_LABEL_CONFIG: i32 = 124;
 const ID_LABEL_PATH: i32 = 125;
 const ID_EDIT_FILTER_EXCLUDED: i32 = 127;
@@ -508,6 +514,9 @@ enum Kind {
     Edit,
     List,
     Card,
+    /// One arrow of the poll interval's up/down pair: a button with an arrow glyph, drawn
+    /// flat on the field's well instead of as a card-coloured button.
+    Stepper,
 }
 
 struct Ctl {
@@ -733,37 +742,48 @@ fn layout(hwnd: HWND) -> Vec<Ctl> {
         ID_LABEL_POLL,
         Kind::Label,
         "Poll Interval:",
-        width - s(268.0),
-        settings_y + s(32.0),
+        margin + s(16.0),
+        settings_y + s(78.0),
         s(90.0),
         s(20.0),
     );
+    // Steppers share the field's rect: the field is drawn inset on the left, the buttons
+    // split the right 40px and the arrows sit inside them.
     push(
         ID_EDIT_POLL_INTERVAL,
         Kind::Edit,
         "",
-        width - s(176.0),
-        settings_y + s(30.0),
-        s(60.0),
+        margin + s(112.0),
+        settings_y + s(74.0),
+        s(140.0),
         s(24.0),
+    );
+    push(
+        ID_BTN_POLL_UP,
+        Kind::Stepper,
+        "\u{25B2}",
+        margin + s(234.0),
+        settings_y + s(74.0),
+        s(16.0),
+        s(12.0),
+    );
+    push(
+        ID_BTN_POLL_DOWN,
+        Kind::Stepper,
+        "\u{25BC}",
+        margin + s(234.0),
+        settings_y + s(86.0),
+        s(16.0),
+        s(12.0),
     );
     push(
         ID_LABEL_MS,
         Kind::Label,
         "ms",
-        width - s(108.0),
-        settings_y + s(32.0),
+        margin + s(256.0),
+        settings_y + s(78.0),
         s(25.0),
         s(20.0),
-    );
-    push(
-        ID_LABEL_RANGE,
-        Kind::Label,
-        "Range: 100-2000 ms",
-        width - s(268.0),
-        settings_y + s(58.0),
-        s(180.0),
-        s(18.0),
     );
     push(
         ID_LABEL_CONFIG,
@@ -1209,11 +1229,53 @@ unsafe fn paint_frame(hwnd: HWND, hdc: HDC, rc: &RECT) {
                 DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
             ),
             Kind::Button => draw_button(hdc, ctl, &p, dip, window_focused, &cards),
+            Kind::Stepper => draw_stepper(hdc, ctl, &p, window_focused),
             Kind::Toggle => draw_toggle(hwnd, hdc, ctl, &p, dip, window_focused, &cards),
             Kind::Edit => draw_field(hdc, ctl, &p, dip, window_focused),
             Kind::List => draw_list(hdc, ctl, &p, dip, window_focused),
         }
     }
+}
+
+/// Arrow column reserved on the right of a stepper field's inner text area: the field's
+/// border padding plus the arrows' own width, so text never runs under a glyph.
+const POLL_STEPPER_W: f32 = 18.0;
+
+/// Text area of a field: its rect inset by the border padding, minus the stepper column
+/// when it has one. Paint, the caret and its scroll all measure through this one rect.
+fn field_inner(ctl: &Ctl) -> RECT {
+    let dip = dip_of();
+    let mut inner = inset(ctl.rect, dip.px(6.0), dip.px(2.0));
+    if is_stepper_field(ctl.id) {
+        inner.right -= dip.px(POLL_STEPPER_W);
+    }
+    inner
+}
+
+fn is_stepper_field(id: i32) -> bool {
+    id == ID_EDIT_POLL_INTERVAL
+}
+
+/// Poll interval after one arrow press: ±`POLL_STEP_MS` from the box's current value, kept
+/// inside the range `save_settings` clamps to. Unparsable text starts from the default,
+/// so the first press always leaves a usable number behind.
+fn stepped_poll(current: u64, up: bool) -> u64 {
+    let next = if up {
+        current.saturating_add(POLL_STEP_MS)
+    } else {
+        current.saturating_sub(POLL_STEP_MS)
+    };
+    next.clamp(POLL_MIN_MS, POLL_MAX_MS)
+}
+
+unsafe fn step_poll_interval(hwnd: HWND, up: bool) {
+    let current = field_text(ID_EDIT_POLL_INTERVAL)
+        .trim()
+        .parse()
+        .unwrap_or(500);
+    set_field(ID_EDIT_POLL_INTERVAL, stepped_poll(current, up).to_string());
+    repaint(hwnd);
+    update_caret(hwnd);
 }
 
 fn inset(rc: RECT, dx: i32, dy: i32) -> RECT {
@@ -1314,6 +1376,30 @@ unsafe fn draw_button(
         small,
         fg,
         DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS,
+    );
+}
+
+/// Arrow of the poll interval spinner: flat on the field's well, glyph tinted so hover and
+/// press are visible without moving the box.
+unsafe fn draw_stepper(hdc: HDC, ctl: &Ctl, p: &Palette, window_focused: bool) {
+    let rc = ctl.rect;
+    let hot = HOT.with(|h| h.get()) == ctl.id;
+    let pressed = PRESSED.with(|p| p.get()) == ctl.id;
+    let focused = window_focused && matches!(focus(), Focus::Button(f) if f == ctl.id);
+    od_controls::fill(hdc, &rc, if pressed { p.pressed } else if hot { p.hover } else { p.well });
+    let color = if pressed || hot || focused {
+        p.accent
+    } else {
+        p.secondary
+    };
+    let small = with_ui(|u| u.font_small).unwrap_or(HFONT(std::ptr::null_mut()));
+    od_controls::text(
+        hdc,
+        &rc,
+        &ctl.text,
+        small,
+        color,
+        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
     );
 }
 
@@ -1452,8 +1538,7 @@ fn field_scroll(inner: &RECT, caret_rel: i32) -> i32 {
 /// Paint and SetCaretPos share this, so the drawn caret can never disagree with the
 /// measured text.
 unsafe fn field_caret(hwnd: HWND, ctl: &Ctl) -> (i32, i32) {
-    let dip = dip_of();
-    let inner = inset(ctl.rect, dip.px(6.0), dip.px(2.0));
+    let inner = field_inner(ctl);
     let hdc = GetDC(hwnd);
     let font = ui_font();
     let (scroll, x) = with_field(ctl.id, |f| {
@@ -1467,14 +1552,11 @@ unsafe fn field_caret(hwnd: HWND, ctl: &Ctl) -> (i32, i32) {
 
 unsafe fn draw_field(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip, window_focused: bool) {
     let focused = window_focused && matches!(focus(), Focus::Field(f) if f == ctl.id);
-    od_controls::round(
-        hdc,
-        &ctl.rect,
-        dip.px(4.0),
-        p.well,
-        Some(if focused { p.accent } else { p.hairline }),
-    );
-    let inner = inset(ctl.rect, dip.px(6.0), dip.px(2.0));
+    let rc = ctl.rect;
+    // Behind the steppers the box keeps its own well: the field draws under them, so the
+    // pair only has to paint its arrows.
+    od_controls::round(hdc, &rc, dip.px(4.0), p.well, Some(if focused { p.accent } else { p.hairline }));
+    let inner = field_inner(ctl);
     let font = ui_font();
     let (text, selection) = with_field(ctl.id, |f| (f.text.clone(), f.selection()));
     if text.is_empty() {
@@ -1774,8 +1856,7 @@ unsafe fn drag_thumb(hwnd: HWND, y: i32) {
 /// Field caret from a client x: nearest char boundary, measured through the same
 /// horizontal scroll the paint uses.
 unsafe fn caret_from_x(hwnd: HWND, ctl: &Ctl, x: i32) -> usize {
-    let dip = dip_of();
-    let inner = inset(ctl.rect, dip.px(6.0), dip.px(2.0));
+    let inner = field_inner(ctl);
     let (text, caret) = with_field(ctl.id, |f| (f.text.clone(), f.caret));
     let prefix_len = caret;
     let font = ui_font();
@@ -2086,6 +2167,8 @@ unsafe fn handle_command(hwnd: HWND, control_id: i32, notification: u16) {
         ID_BTN_SAVE_ONLY => {
             save_settings(hwnd);
         }
+        ID_BTN_POLL_UP => step_poll_interval(hwnd, true),
+        ID_BTN_POLL_DOWN => step_poll_interval(hwnd, false),
         ID_BTN_RESET_MIXER => {
             reset_mixer(hwnd);
         }
@@ -2425,6 +2508,7 @@ unsafe fn after_field_edit(hwnd: HWND, id: i32) {
 fn focus_target(kind: Kind, id: i32) -> Focus {
     match kind {
         Kind::Button => Focus::Button(id),
+        Kind::Stepper => Focus::Button(id),
         Kind::Toggle => Focus::Toggle(id),
         Kind::Edit => Focus::Field(id),
         _ => Focus::List(id),
@@ -2437,7 +2521,7 @@ fn tab_order(hwnd: HWND) -> Vec<Focus> {
     layout(hwnd)
         .into_iter()
         .filter_map(|c| match c.kind {
-            Kind::Button | Kind::Toggle | Kind::Edit | Kind::List => {
+            Kind::Button | Kind::Stepper | Kind::Toggle | Kind::Edit | Kind::List => {
                 Some(focus_target(c.kind, c.id))
             }
             _ => None,
@@ -2584,7 +2668,7 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM) {
             refocus(hwnd);
             click_list_row(hwnd, hit, x, y, index);
         }
-        Some(Kind::Button) => {
+        Some(Kind::Button) | Some(Kind::Stepper) => {
             set_focus_value(Focus::Button(hit));
             SetCapture(hwnd);
             refocus(hwnd);
@@ -2610,7 +2694,7 @@ unsafe fn mouse_up(hwnd: HWND, lparam: LPARAM) {
     let released_on = hit_test(&layout(hwnd), x, y);
     if pressed != 0 && released_on == pressed && !grabbed {
         match kind_of(hwnd, pressed) {
-            Some(Kind::Button) => activate_button(hwnd, pressed),
+            Some(Kind::Button) | Some(Kind::Stepper) => activate_button(hwnd, pressed),
             Some(Kind::Toggle) => flip_toggle(hwnd, pressed),
             _ => {}
         }
@@ -3069,16 +3153,19 @@ mod tests {
     ];
 
     /// No control may sit on another, or a click lands on the wrong one. A card contains
-    /// its children by design, so only pairs with exactly one card are exempt.
+    /// its children by design, so only pairs with exactly one card are exempt, and so is a
+    /// stepper arrow, which is meant to sit on its field's well.
     fn assert_no_overlaps(hwnd: HWND) {
-        let rects: Vec<(i32, RECT)> = layout(hwnd).into_iter().map(|c| (c.id, c.rect)).collect();
-        for (i, (id_a, a)) in rects.iter().enumerate() {
-            for (id_b, b) in rects.iter().skip(i + 1) {
+        let ctls = layout(hwnd);
+        let rects: Vec<(i32, Kind, RECT)> = ctls.iter().map(|c| (c.id, c.kind, c.rect)).collect();
+        for (i, (id_a, kind_a, a)) in rects.iter().enumerate() {
+            for (id_b, kind_b, b) in rects.iter().skip(i + 1) {
                 let overlap =
                     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
                 let containment = CARDS.contains(id_a) != CARDS.contains(id_b);
+                let stepped = matches!((kind_a, kind_b), (Kind::Stepper, Kind::Edit) | (Kind::Edit, Kind::Stepper));
                 assert!(
-                    !overlap || containment,
+                    !overlap || containment || stepped,
                     "controls {id_a} and {id_b} overlap"
                 );
             }
@@ -3157,6 +3244,35 @@ mod tests {
         }
         assert_eq!(hit_test(&ctls, 0, 0), 0, "bare window hit a control");
         assert_no_overlaps(hwnd);
+        teardown(hwnd);
+    }
+
+    /// The poll interval arrows move the box by 100ms a press and clamp to the range the
+    /// save clamps to, so a click can never leave a value the save would silently change.
+    #[test]
+    fn poll_steppers_step_by_100_and_clamp() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            set_field(ID_EDIT_POLL_INTERVAL, "500".to_string());
+            handle_command(hwnd, ID_BTN_POLL_UP, 0);
+            assert_eq!(field_text(ID_EDIT_POLL_INTERVAL), "600");
+            handle_command(hwnd, ID_BTN_POLL_DOWN, 0);
+            assert_eq!(field_text(ID_EDIT_POLL_INTERVAL), "500");
+
+            set_field(ID_EDIT_POLL_INTERVAL, "1950".to_string());
+            handle_command(hwnd, ID_BTN_POLL_UP, 0);
+            assert_eq!(field_text(ID_EDIT_POLL_INTERVAL), "2000", "no clamp at the top");
+
+            set_field(ID_EDIT_POLL_INTERVAL, "150".to_string());
+            handle_command(hwnd, ID_BTN_POLL_DOWN, 0);
+            assert_eq!(field_text(ID_EDIT_POLL_INTERVAL), "100", "no clamp at the bottom");
+
+            // An empty box still steps to a usable number instead of losing the press.
+            set_field(ID_EDIT_POLL_INTERVAL, String::new());
+            handle_command(hwnd, ID_BTN_POLL_UP, 0);
+            assert_eq!(field_text(ID_EDIT_POLL_INTERVAL), "600");
+        }
         teardown(hwnd);
     }
 
@@ -3604,6 +3720,11 @@ mod tests {
                         );
                     }
                     Kind::Label => {}
+                    // An arrow paints on the field's well, tinted either secondary or accent
+                    // when hot, so only the field colour is certain here.
+                    Kind::Stepper => {
+                        assert_eq!(at(cx, ctl.rect.top + 1), p.well, "stepper {} top", ctl.id);
+                    }
                 }
             }
             // A point no control covers shows the window colour.

@@ -3590,7 +3590,11 @@ mod tests {
         let hwnd = make_dialog();
         unsafe {
             set_focus_value(Focus::Field(ID_EDIT_FILTER_EXCLUDED));
-            let send = |vk: u16| SendMessageW(hwnd, WM_KEYDOWN, WPARAM(vk as usize), LPARAM(0));
+            // Modifiers come in explicitly: WM_KEYDOWN asks the real keyboard, and a key
+            // held down on the desktop would turn a plain backspace into a word delete and
+            // make this test fail for a reason it does not describe.
+            let send = |vk: u16| key_with(hwnd, vk, false, false);
+            let post = |vk: u16| SendMessageW(hwnd, WM_KEYDOWN, WPARAM(vk as usize), LPARAM(0));
             let text = || field_text(ID_EDIT_FILTER_EXCLUDED);
             let caret_to = |c: usize| {
                 with_field(ID_EDIT_FILTER_EXCLUDED, |f| {

@@ -6,8 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::Arc;
+use crate::process;
 use windows::core::Interface;
-use windows::Win32::Foundation::{CloseHandle, FALSE, TRUE};
+use windows::Win32::Foundation::{FALSE, TRUE};
 use windows::Win32::Media::Audio::{
     eCommunications, eConsole, eMultimedia, eRender, IAudioSessionControl2,
     IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
@@ -16,12 +17,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
-use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
-use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-};
-use windows::core::PWSTR;
+
 
 /// Represents an audio session with minimal metadata
 #[derive(Debug, Clone)]
@@ -233,7 +229,7 @@ fn collect_sessions_for_device(
                         let mut process_name = if pid == 0 {
                             "System Sounds".to_string()
                         } else {
-                            get_process_name_cached(pid)
+                            display_name_of(pid)
                         };
 
                         let display_name =
@@ -278,54 +274,15 @@ fn collect_sessions_for_device(
     Ok(())
 }
 
-/// Gets the process name from a PID with minimal overhead
-/// Uses multiple fallback methods to handle system processes like Explorer.exe
-fn get_process_name_cached(pid: u32) -> String {
-    unsafe {
-        // First try: PROCESS_QUERY_INFORMATION | PROCESS_VM_READ with K32GetModuleFileNameExW
-        if let Ok(handle) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) {
-            let mut buffer = [0u16; 260];
-            let len = K32GetModuleFileNameExW(handle, None, &mut buffer);
-            let _ = CloseHandle(handle);
-            if len > 0 {
-                let path = OsString::from_wide(&buffer[..len as usize]);
-                if let Some(path_str) = path.to_str() {
-                    if let Some(name) = std::path::Path::new(path_str).file_name() {
-                        return normalize_system_process_name(name.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-
-        // Second try: PROCESS_QUERY_LIMITED_INFORMATION with QueryFullProcessImageNameW
-        // This works for system processes like Explorer.exe where the first method fails
-        if let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) {
-            let mut buffer = [0u16; 260];
-            let mut size = buffer.len() as u32;
-            if QueryFullProcessImageNameW(
-                handle,
-                PROCESS_NAME_WIN32,
-                PWSTR(buffer.as_mut_ptr()),
-                &mut size,
-            )
-            .is_ok()
-            {
-                let _ = CloseHandle(handle);
-                if size > 0 {
-                    let path = OsString::from_wide(&buffer[..size as usize]);
-                    if let Some(path_str) = path.to_str() {
-                        if let Some(name) = std::path::Path::new(path_str).file_name() {
-                            return normalize_system_process_name(name.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            } else {
-                let _ = CloseHandle(handle);
-            }
-        }
+/// Display name of a session's process, normalized for the lists.
+///
+/// A pid whose name cannot be read at all is the system sound session, which is what is
+/// left when no process owns the audio.
+fn display_name_of(pid: u32) -> String {
+    match process::name(pid) {
+        Some(name) => normalize_system_process_name(name),
+        None => "System Sounds".to_string(),
     }
-    // If we can't detect the process, it's likely a system sound
-    "System Sounds".to_string()
 }
 
 /// Normalizes known system processes to "System Sounds" for cleaner display

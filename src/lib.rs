@@ -20,4 +20,4 @@ pub mod tray;
 pub use audio::AudioManager;
 pub use config::Config;
 pub use muter::MuterEngine;
-pub use process::{get_foreground_pid, ProcessInfo};
+pub use process::get_foreground_pid;

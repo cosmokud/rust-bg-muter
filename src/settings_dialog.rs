@@ -930,7 +930,7 @@ unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
         {
             return hit.map(|i| HICON(i as *mut c_void));
         }
-        let path = process_image_path(pid).or_else(|| path_for_name(name));
+        let path = crate::process::path(pid).or_else(|| path_for_name(name));
         let icon = icon_of_path(path.as_deref().unwrap_or(name))
             .or_else(|| icon_cache::icon_for(name));
         ICON_OF_PID
@@ -985,25 +985,6 @@ unsafe fn icon_of_path(path: &str) -> Option<HICON> {
     Some(icon)
 }
 
-/// Full exe path of a running process, capped so a dead PID costs one syscall.
-unsafe fn process_image_path(pid: u32) -> Option<String> {
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-    let mut buf = [0u16; 260];
-    let mut size = buf.len() as u32;
-    let ok = QueryFullProcessImageNameW(
-        process,
-        PROCESS_NAME_WIN32,
-        windows::core::PWSTR(buf.as_mut_ptr()),
-        &mut size,
-    )
-    .is_ok();
-    let _ = windows::Win32::Foundation::CloseHandle(process);
-    (ok && size > 0).then(|| String::from_utf16_lossy(&buf[..size as usize]))
-}
 // GDI has no antialiasing, so curved edges are supersampled: the shape is rasterized at
 // AA_SUPERSAMPLE x into a small off-screen bitmap and downscaled with HALFTONE (a box
 // average of the covered pixels) -> sub-pixel pill edges and a smooth knob.
@@ -1960,13 +1941,8 @@ unsafe fn refocus(hwnd: HWND) {
 }
 
 /// Exe path for a process named `name` that is no longer running (it was excluded or
-/// always-muted earlier). One toolhelp snapshot per miss, cached per name.
+/// always-muted earlier). One process-list walk per miss, cached per name.
 unsafe fn path_for_name(name: &str) -> Option<String> {
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
-
     let wanted = name.to_lowercase();
     if MISSING_PATHS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1976,26 +1952,7 @@ unsafe fn path_for_name(name: &str) -> Option<String> {
         return None;
     }
 
-    let mut found: Option<u32> = None;
-    if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
-        while ok {
-            let exe = String::from_utf16_lossy(&entry.szExeFile);
-            let exe = exe.trim_end_matches('\0').to_lowercase();
-            if exe == wanted {
-                found = Some(entry.th32ProcessID);
-                break;
-            }
-            ok = Process32NextW(snapshot, &mut entry).is_ok();
-        }
-        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
-    }
-
-    let path = found.and_then(|process| process_image_path(process));
+    let path = crate::process::pid_of(&wanted).and_then(crate::process::path);
     if path.is_none() {
         // Not running: remember the miss so a repaint never walks the process list again.
         MISSING_PATHS

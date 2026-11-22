@@ -173,25 +173,55 @@ enum Focus {
     Toggle(i32),
 }
 
+/// Everything the dialog's model holds: the text of each field, the rows and scroll of each
+/// list, the two toggles, which control is hot or held down, which scrollbar thumb is being
+/// dragged, the focus and whether a caret exists.
+///
+/// One owner, so "who changed the selection" has one answer, and a reset is one assignment.
+/// The stores inside keep their own `RefCell` and the scalars are `Cell`s, so `model()` can
+/// hand out an immutable borrow and an accessor may call another: a single mutable borrow of
+/// the whole model is exactly the shape that aborted this dialog in release builds.
+struct DialogModel {
+    fields: RefCell<HashMap<i32, Field>>,
+    lists: RefCell<HashMap<i32, ListView>>,
+    toggles: RefCell<HashMap<i32, bool>>,
+    /// Hot control id, 0 = none; the hot row of a list lives in that list's `ListView`.
+    hot: Cell<i32>,
+    /// Button/toggle held down by the current mouse drag, 0 = none.
+    pressed: Cell<i32>,
+    /// List whose scrollbar thumb is being dragged: (list id, y grab offset in the thumb).
+    grabbed: Cell<(i32, i32)>,
+    focus: Cell<Focus>,
+    caret_on: Cell<bool>,
+}
+
+impl Default for DialogModel {
+    fn default() -> Self {
+        Self {
+            fields: RefCell::new(HashMap::new()),
+            lists: RefCell::new(HashMap::new()),
+            toggles: RefCell::new(HashMap::new()),
+            hot: Cell::new(0),
+            pressed: Cell::new(0),
+            grabbed: Cell::new((0, 0)),
+            focus: Cell::new(Focus::None),
+            caret_on: Cell::new(false),
+        }
+    }
+}
+
 thread_local! {
-    static FIELDS: RefCell<HashMap<i32, Field>> = RefCell::new(HashMap::new());
-    static LISTS: RefCell<HashMap<i32, ListView>> = RefCell::new(HashMap::new());
-    static TOGGLES: RefCell<HashMap<i32, bool>> = RefCell::new(HashMap::new());
-    // Hot control id, 0 = none; the hot row of a list lives in that list's `ListView`.
-    static HOT: Cell<i32> = const { Cell::new(0) };
-    // Button/toggle held down by the current mouse drag, 0 = none.
-    static PRESSED: Cell<i32> = const { Cell::new(0) };
-    // List whose scrollbar thumb is being dragged: (list id, y grab offset in the thumb).
-    static GRABBED: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
-    static FOCUS: Cell<Focus> = const { Cell::new(Focus::None) };
-    static CARET_ON: Cell<bool> = const { Cell::new(false) };
+    static MODEL: RefCell<DialogModel> = RefCell::new(DialogModel::default());
+}
+
+/// Runs `f` against the dialog's model. The borrow is shared, and each store inside has its
+/// own, so an accessor called from inside another one is safe.
+fn model<R>(f: impl FnOnce(&DialogModel) -> R) -> R {
+    MODEL.with(|model| f(&model.borrow()))
 }
 
 fn with_field<R>(id: i32, f: impl FnOnce(&mut Field) -> R) -> R {
-    FIELDS.with(|fields| {
-        let mut fields = fields.borrow_mut();
-        f(fields.entry(id).or_default())
-    })
+    model(|m| f(m.fields.borrow_mut().entry(id).or_default()))
 }
 
 fn field_text(id: i32) -> String {
@@ -204,10 +234,7 @@ fn set_field(id: i32, text: String) {
 }
 
 fn with_list<R>(id: i32, f: impl FnOnce(&mut ListView) -> R) -> R {
-    LISTS.with(|lists| {
-        let mut lists = lists.borrow_mut();
-        f(lists.entry(id).or_default())
-    })
+    model(|m| f(m.lists.borrow_mut().entry(id).or_default()))
 }
 
 fn list_sel(id: i32) -> Option<usize> {
@@ -215,19 +242,68 @@ fn list_sel(id: i32) -> Option<usize> {
 }
 
 fn toggle(id: i32) -> bool {
-    TOGGLES.with(|t| t.borrow().get(&id).copied().unwrap_or(false))
+    model(|m| m.toggles.borrow().get(&id).copied().unwrap_or(false))
 }
 
 fn set_toggle(id: i32, on: bool) {
-    TOGGLES.with(|t| t.borrow_mut().insert(id, on));
+    model(|m| {
+        m.toggles.borrow_mut().insert(id, on);
+    });
 }
 
 fn focus() -> Focus {
-    FOCUS.with(|f| f.get())
+    model(|m| m.focus.get())
 }
 
 fn set_focus_value(focus: Focus) {
-    FOCUS.with(|f| f.set(focus));
+    model(|m| m.focus.set(focus));
+}
+
+fn hot() -> i32 {
+    model(|m| m.hot.get())
+}
+
+fn set_hot(id: i32) {
+    model(|m| m.hot.set(id));
+}
+
+fn pressed() -> i32 {
+    model(|m| m.pressed.get())
+}
+
+fn set_pressed(id: i32) {
+    model(|m| m.pressed.set(id));
+}
+
+/// Clears the held control, returning the one that was held.
+fn take_pressed() -> i32 {
+    model(|m| m.pressed.replace(0))
+}
+
+fn grabbed() -> (i32, i32) {
+    model(|m| m.grabbed.get())
+}
+
+fn set_grabbed(grab: (i32, i32)) {
+    model(|m| m.grabbed.set(grab));
+}
+
+/// Clears the dragged thumb, returning what was dragged.
+fn take_grabbed() -> (i32, i32) {
+    model(|m| m.grabbed.replace((0, 0)))
+}
+
+fn caret_on() -> bool {
+    model(|m| m.caret_on.get())
+}
+
+fn set_caret_on(on: bool) {
+    model(|m| m.caret_on.set(on));
+}
+
+/// Clears the caret flag, returning whether a caret was up.
+fn take_caret_on() -> bool {
+    model(|m| m.caret_on.replace(false))
 }
 
 /// GDI resources for one dialog; freed when it closes. Fonts and brushes live in the
@@ -1331,8 +1407,8 @@ unsafe fn draw_button(
     let rc = ctl.rect;
     let id = ctl.id;
     let primary = id == ID_BTN_SAVE_CLOSE;
-    let hot = HOT.with(|h| h.get()) == id;
-    let pressed = PRESSED.with(|p| p.get()) == id;
+    let hot = hot() == id;
+    let pressed = pressed() == id;
     let focused = window_focused && matches!(focus(), Focus::Button(f) if f == id);
     let small = with_ui(|u| u.font_small).unwrap_or(HFONT(std::ptr::null_mut()));
 
@@ -1379,8 +1455,8 @@ unsafe fn draw_button(
 /// press are visible without moving the box.
 unsafe fn draw_stepper(hdc: HDC, ctl: &Ctl, p: &Palette, window_focused: bool) {
     let rc = ctl.rect;
-    let hot = HOT.with(|h| h.get()) == ctl.id;
-    let pressed = PRESSED.with(|p| p.get()) == ctl.id;
+    let hot = hot() == ctl.id;
+    let pressed = pressed() == ctl.id;
     let focused = window_focused && matches!(focus(), Focus::Button(f) if f == ctl.id);
     od_controls::fill(hdc, &rc, if pressed { p.pressed } else if hot { p.hover } else { p.well });
     let color = if pressed || hot || focused {
@@ -1410,8 +1486,8 @@ unsafe fn draw_toggle(
 ) {
     let rc = ctl.rect;
     let on = toggle(ctl.id);
-    let hot = HOT.with(|h| h.get()) == ctl.id;
-    let pressed = PRESSED.with(|p| p.get()) == ctl.id;
+    let hot = hot() == ctl.id;
+    let pressed = pressed() == ctl.id;
     // A toggle shows no focus ring, so its state is only (on, hot, pressed): `focused` stays
     // out of the supersample key, and a repaint of the same state reuses its bitmap.
     let focused = false;
@@ -1675,8 +1751,8 @@ unsafe fn draw_list(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip, window_focused: 
     let saved = SaveDC(hdc);
     let _ = IntersectClipRect(hdc, rc.left, rc.top, rc.right, rc.bottom);
 
-    LISTS.with(|lists| {
-        let lists = lists.borrow();
+    model(|m| {
+        let lists = m.lists.borrow();
         let Some(lv) = lists.get(&ctl.id) else { return };
         let right = scrollbar_track(rc, lv.rows.len()).map_or(rc.right, |t| t.left);
         for idx in lv.top..(lv.top + visible).min(lv.rows.len()) {
@@ -1837,7 +1913,7 @@ fn scrollbar_press(hwnd: HWND, x: i32, y: i32) -> Option<(i32, Option<i32>)> {
 
 /// Thumb drag: keep the grabbed offset, clamp the row to the content.
 unsafe fn drag_thumb(hwnd: HWND, y: i32) {
-    let (id, grab) = GRABBED.with(|g| g.get());
+    let (id, grab) = grabbed();
     let Some(ctl) = ctl_of(hwnd, id) else { return };
     let Some(track) = scrollbar_track(ctl.rect, with_list(id, |l| l.rows.len())) else {
         return;
@@ -1892,9 +1968,9 @@ unsafe fn update_caret(hwnd: HWND) {
     };
     let dip = dip_of();
     let line = (ctl.rect.bottom - ctl.rect.top - dip.px(4.0)).max(1);
-    if !CARET_ON.with(|c| c.get()) {
+    if !caret_on() {
         let _ = CreateCaret(hwnd, HBITMAP::default(), dip.px(1.0).max(1), line);
-        CARET_ON.with(|c| c.set(true));
+        set_caret_on(true);
     }
     let (x, top) = field_caret(hwnd, &ctl);
     let _ = SetCaretPos(x, top);
@@ -1910,7 +1986,7 @@ unsafe fn update_caret(hwnd: HWND) {
 unsafe fn hide_caret(hwnd: HWND) {
     let _ = HideCaret(hwnd);
     // DestroyCaret is thread-global, so the flag, not the window, decides.
-    if CARET_ON.with(|c| c.replace(false)) {
+    if take_caret_on() {
         let _ = DestroyCaret();
     }
 }
@@ -2496,12 +2572,12 @@ unsafe fn flip_toggle(hwnd: HWND, id: i32) {
 unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM) {
     let (x, y) = point_of(lparam);
     // A held scrollbar thumb owns the drag: it scrolls, it does not select rows.
-    if GRABBED.with(|g| g.get()).0 != 0 {
+    if grabbed().0 != 0 {
         drag_thumb(hwnd, y);
         return;
     }
     // Dragging out of a field after pressing in it extends the selection.
-    let pressed = PRESSED.with(|p| p.get());
+    let pressed = pressed();
     if let Focus::Field(id) = focus() {
         if pressed == id {
             if let Some(ctl) = ctl_of(hwnd, id) {
@@ -2515,10 +2591,10 @@ unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM) {
     }
     let ctls = layout(hwnd);
     let hit = hit_test(&ctls, x, y);
-    let hot_id = HOT.with(|h| h.get());
+    let hot_id = hot();
     let mut changed = false;
     if hit != hot_id {
-        HOT.with(|h| h.set(hit));
+        set_hot(hit);
         changed = true;
     }
     // Hovered row of a list.
@@ -2567,16 +2643,16 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM) {
     let (x, y) = point_of(lparam);
     if let Some((id, grab)) = scrollbar_press(hwnd, x, y) {
         set_focus_value(Focus::List(id));
-        GRABBED.with(|g| g.set((id, grab.unwrap_or(0))));
-        PRESSED.with(|p| p.set(0));
-        HOT.with(|h| h.set(0));
+        set_grabbed((id, grab.unwrap_or(0)));
+        set_pressed(0);
+        set_hot(0);
         SetCapture(hwnd);
         refocus(hwnd);
         return;
     }
     let hit = hit_test(&layout(hwnd), x, y);
-    PRESSED.with(|p| p.set(hit));
-    HOT.with(|h| h.set(hit));
+    set_pressed(hit);
+    set_hot(hit);
     match kind_of(hwnd, hit) {
         Some(Kind::Edit) => {
             set_focus_value(Focus::Field(hit));
@@ -2625,8 +2701,8 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM) {
 /// Button or toggle released inside itself: run its command, then repaint the result.
 unsafe fn mouse_up(hwnd: HWND, lparam: LPARAM) {
     let (x, y) = point_of(lparam);
-    let pressed = PRESSED.with(|p| p.replace(0));
-    let grabbed = GRABBED.with(|g| g.replace((0, 0))).0 != 0;
+    let pressed = take_pressed();
+    let grabbed = take_grabbed().0 != 0;
     let _ = ReleaseCapture();
     let released_on = hit_test(&layout(hwnd), x, y);
     if pressed != 0 && released_on == pressed && !grabbed {
@@ -2955,9 +3031,9 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         msg if msg == CONTROLS_MOUSELEAVE => {
-            HOT.with(|h| h.set(0));
-            LISTS.with(|l| {
-                for list in l.borrow_mut().values_mut() {
+            set_hot(0);
+            model(|m| {
+                for list in m.lists.borrow_mut().values_mut() {
                     list.hot = None;
                 }
             });
@@ -3048,7 +3124,7 @@ unsafe fn reinit_for_dpi(hwnd: HWND, dpi: u32) {
     });
 
     // A caret created for the old DPI keeps its old size until recreated.
-    if CARET_ON.with(|c| c.replace(false)) {
+    if take_caret_on() {
         let _ = DestroyCaret();
     }
     repaint(hwnd);
@@ -3110,17 +3186,11 @@ mod tests {
     /// Control state is thread-local, so a test must not inherit the state of the dialog
     /// it just closed.
     fn reset_controls() {
-        FIELDS.with(|f| f.borrow_mut().clear());
-        LISTS.with(|l| l.borrow_mut().clear());
-        TOGGLES.with(|t| t.borrow_mut().clear());
+        MODEL.with(|m| *m.borrow_mut() = DialogModel::default());
         BACK.with(|b| b.borrow_mut().clear());
         unsafe { free_ss_buffers() };
         #[cfg(test)]
         SS_BUILDS.with(|c| c.set(0));
-        HOT.with(|h| h.set(0));
-        PRESSED.with(|p| p.set(0));
-        GRABBED.with(|g| g.set((0, 0)));
-        set_focus_value(Focus::None);
         LAST_CLICK.with(|c| c.set((0, 0, 0, 0, 0)));
     }
 
@@ -3418,7 +3488,7 @@ mod tests {
             assert_eq!(with_list(id, |l| l.top), 0, "thumb press jumped the scroll");
             assert_eq!(list_sel(id), None, "thumb press selected a row");
 
-            GRABBED.with(|g| g.set((id, grab.unwrap())));
+            set_grabbed((id, grab.unwrap()));
             drag_thumb(hwnd, track.bottom + 40);
             assert_eq!(
                 with_list(id, |l| l.top),
@@ -3431,7 +3501,7 @@ mod tests {
                 0,
                 "the drag did not reach the top"
             );
-            GRABBED.with(|g| g.set((0, 0)));
+            set_grabbed((0, 0));
 
             let below = track.bottom - 1;
             assert!(scrollbar_press(hwnd, x, below).is_some(), "track press");
@@ -3566,13 +3636,15 @@ mod tests {
             send(VK_BACK.0);
             assert_eq!(text(), "delta", "backspace kept the selection");
 
-            // Keys a field does not use must not reach DefWindowProc.
+            // Keys a field does not use must not reach DefWindowProc. These arrive the way
+            // the queue delivers them, modifiers and all: none of the three is sensitive
+            // to them.
             for vk in [
                 windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0,
                 VK_PRIOR.0,
                 VK_NEXT.0,
             ] {
-                send(vk);
+                post(vk);
             }
             assert!(IsWindow(hwnd).as_bool(), "a key closed the dialog");
             assert_eq!(text(), "delta");

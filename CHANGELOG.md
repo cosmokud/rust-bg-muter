@@ -33,6 +33,8 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Backspace, Delete and every text edit in a settings field crashed the whole app: the delete helpers re-entered the field store they were already holding (`RefCell already borrowed`), which aborts the process in release builds. Field editing now runs once, in place.
+- Field keys a native edit box handles now behave: Ctrl+Backspace/Ctrl+Delete take a word, Ctrl+Left/Ctrl+Right jump by word, Shift+Delete clears the selection without touching the clipboard, Ctrl+Insert copies and Shift+Insert pastes, double click selects a word, and Escape and the scroll keys no longer reach `DefWindowProc` while a field has focus.
 - Tests no longer write the user's configuration file.
 
 ## [0.1.1] - 2026-03-03

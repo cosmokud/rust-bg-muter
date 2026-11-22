@@ -44,8 +44,8 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-    VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -2359,53 +2359,79 @@ fn insert_at_caret(id: i32, insert: &str) {
     })
 }
 
+/// Delete the selection, else `[a, b)`; the caret lands on the start.
+/// Takes the borrowed field: calling back into `with_field` here would re-borrow the
+/// thread-local map, panic with `RefCell already borrowed`, and abort the whole app
+/// (release builds set `panic = "abort"`).
+fn delete_span(f: &mut Field, a: usize, b: usize) -> bool {
+    let (start, end) = f.selection();
+    let (lo, hi) = if start != end { (start, end) } else { (a, b) };
+    if lo >= hi {
+        return false;
+    }
+    let (x, y) = (byte_index(&f.text, lo), byte_index(&f.text, hi));
+    f.text.replace_range(x..y, "");
+    f.caret = lo;
+    f.anchor = lo;
+    true
+}
+
 fn delete_selection(id: i32) -> bool {
     with_field(id, |f| {
         let (start, end) = f.selection();
-        if start == end {
-            return false;
-        }
-        let (a, b) = (byte_index(&f.text, start), byte_index(&f.text, end));
-        f.text.replace_range(a..b, "");
-        f.caret = start;
-        f.anchor = start;
-        true
+        delete_span(f, start, end)
     })
 }
 
-fn backspace(id: i32) -> bool {
+fn backspace(id: i32, word: bool) -> bool {
     with_field(id, |f| {
-        if delete_selection(id) {
-            return true;
-        }
         let caret = f.caret;
-        if caret == 0 {
-            return false;
-        }
-        let a = byte_index(&f.text, caret - 1);
-        let b = byte_index(&f.text, caret);
-        f.text.replace_range(a..b, "");
-        f.caret = caret - 1;
-        f.anchor = f.caret;
-        true
+        let a = if word {
+            word_left(&f.text, caret)
+        } else {
+            caret.saturating_sub(1)
+        };
+        delete_span(f, a, caret)
     })
 }
 
-fn delete_forward(id: i32) -> bool {
+fn delete_forward(id: i32, word: bool) -> bool {
     with_field(id, |f| {
-        if delete_selection(id) {
-            return true;
-        }
         let caret = f.caret;
-        if caret >= f.text.chars().count() {
-            return false;
-        }
-        let a = byte_index(&f.text, caret);
-        let b = byte_index(&f.text, caret + 1);
-        f.text.replace_range(a..b, "");
-        f.anchor = f.caret;
-        true
+        let len = f.text.chars().count();
+        let b = if word {
+            word_right(&f.text, caret)
+        } else {
+            (caret + 1).min(len)
+        };
+        delete_span(f, caret, b)
     })
+}
+
+/// Start of the word left of `caret`: skips spaces, then the run of non-spaces.
+fn word_left(text: &str, caret: usize) -> usize {
+    let head: Vec<char> = text.chars().take(caret).collect();
+    let mut i = head.len();
+    while i > 0 && head[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !head[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+/// End of the word right of `caret`, the way a native edit box lands it.
+fn word_right(text: &str, caret: usize) -> usize {
+    let tail: Vec<char> = text.chars().skip(caret).collect();
+    let mut i = 0;
+    while i < tail.len() && tail[i].is_whitespace() {
+        i += 1;
+    }
+    while i < tail.len() && !tail[i].is_whitespace() {
+        i += 1;
+    }
+    caret + i
 }
 
 fn select_all(id: i32) {
@@ -2420,6 +2446,25 @@ fn selected_slice(id: i32) -> Option<String> {
         let (start, end) = f.selection();
         (start != end).then(|| f.text.chars().skip(start).take(end - start).collect())
     })
+}
+
+/// Text plus its selection, for the double click that selects a word under the pointer.
+unsafe fn select_word_at(hwnd: HWND, id: i32, x: i32) {
+    let Some(ctl) = ctl_of(hwnd, id) else { return };
+    let caret = caret_from_x(hwnd, &ctl, x);
+    with_field(id, |f| {
+        let chars: Vec<char> = f.text.chars().collect();
+        let mut a = caret.min(chars.len());
+        let mut b = a;
+        while a > 0 && !chars[a - 1].is_whitespace() {
+            a -= 1;
+        }
+        while b < chars.len() && !chars[b].is_whitespace() {
+            b += 1;
+        }
+        f.anchor = a;
+        f.caret = b;
+    });
 }
 
 unsafe fn clipboard_open(hwnd: HWND) -> bool {
@@ -2460,6 +2505,14 @@ unsafe fn clipboard_cut(hwnd: HWND, id: i32) {
     }
 }
 
+/// Delete the selection with no clipboard round trip: Ctrl+C is the only key that may
+/// touch the registry contents.
+unsafe fn cut_without_clipboard(hwnd: HWND, id: i32) {
+    if delete_selection(id) {
+        after_field_edit(hwnd, id);
+    }
+}
+
 unsafe fn clipboard_paste(hwnd: HWND, id: i32) {
     use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
@@ -2469,8 +2522,11 @@ unsafe fn clipboard_paste(hwnd: HWND, id: i32) {
     let text = GetClipboardData(CF_UNICODETEXT.0 as u32)
         .ok()
         .and_then(|handle| {
-            let ptr = GlobalLock(windows::Win32::Foundation::HGLOBAL(handle.0)) as *const u16;
+            let block = windows::Win32::Foundation::HGLOBAL(handle.0);
+            let ptr = GlobalLock(block) as *const u16;
             if ptr.is_null() {
+                // A null lock still has to be released, or the owner cannot free it.
+                let _ = GlobalUnlock(block);
                 return None;
             }
             let mut len = 0;
@@ -2478,7 +2534,7 @@ unsafe fn clipboard_paste(hwnd: HWND, id: i32) {
                 len += 1;
             }
             let slice = std::slice::from_raw_parts(ptr, len);
-            let _ = GlobalUnlock(windows::Win32::Foundation::HGLOBAL(handle.0));
+            let _ = GlobalUnlock(block);
             Some(String::from_utf16_lossy(slice))
         });
     let _ = CloseClipboard();
@@ -2646,7 +2702,10 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM) {
     match kind_of(hwnd, hit) {
         Some(Kind::Edit) => {
             set_focus_value(Focus::Field(hit));
-            if let Some(ctl) = ctl_of(hwnd, hit) {
+            if is_double_click(hit, x, y) {
+                // A second press inside the double-click time selects the word instead.
+                select_word_at(hwnd, hit, x);
+            } else if let Some(ctl) = ctl_of(hwnd, hit) {
                 let caret = caret_from_x(hwnd, &ctl, x);
                 with_field(hit, |f| {
                     f.caret = caret;
@@ -2704,18 +2763,30 @@ unsafe fn mouse_up(hwnd: HWND, lparam: LPARAM) {
     }
 }
 
-// Last list click: (tick, x, y, list id, row) - a second click inside the double-click
-// time on the same row is what the list's LBN_DBLCLK used to report.
+// Last click: (tick, x, y, control id, row). A second press inside the double-click time,
+// close by and on the same control, is the double click; rows share it with fields, so
+// `row` is -1 for a field.
 thread_local! {
     static LAST_CLICK: Cell<(u32, i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0, 0)) };
 }
 
-// The class carries no CS_DBLCLKS, so the dialog decides a double click itself: the
-// second press on the same row within the system double-click time moves the row.
+// The class carries no CS_DBLCLKS, so the dialog decides a double click itself.
+unsafe fn is_double_click(id: i32, x: i32, y: i32) -> bool {
+    let now = GetTickCount();
+    let previous = LAST_CLICK.with(|c| c.replace((now, x, y, id, -1)));
+    let within_time = windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime();
+    let near = (x - previous.1).abs() <= GetSystemMetrics(SM_CXDOUBLECLK)
+        && (y - previous.2).abs() <= GetSystemMetrics(SM_CYDOUBLECLK);
+    previous.3 == id && near && now.saturating_sub(previous.0) <= within_time
+}
+
+/// The second press on a row inside the double-click time is what its LBN_DBLCLK used to
+/// report; the press that starts the pair records it.
 unsafe fn click_list_row(hwnd: HWND, id: i32, x: i32, y: i32, index: Option<usize>) {
     let now = GetTickCount();
     let previous = LAST_CLICK.with(|c| c.get());
-    LAST_CLICK.with(|c| c.set((now, x, y, id, index.map_or(-1, |i| i as i32))));
+    let row = index.map_or(-1, |i| i as i32);
+    LAST_CLICK.with(|c| c.set((now, x, y, id, row)));
     let Some(index) = index else { return };
     let within_time = windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime();
     let near = (x - previous.1).abs() <= GetSystemMetrics(SM_CXDOUBLECLK)
@@ -2796,13 +2867,22 @@ unsafe fn key_field(hwnd: HWND, id: i32, vk: u16, shift: bool, ctrl: bool) -> bo
     let mut moved = false;
     with_field(id, |f| {
         let caret = f.caret;
+        let text = f.text.clone();
         match vk {
             v if v == VK_LEFT.0 => {
-                f.caret = if ctrl { 0 } else { caret.saturating_sub(1) };
+                f.caret = if ctrl {
+                    word_left(&text, caret)
+                } else {
+                    caret.saturating_sub(1)
+                };
                 moved = true;
             }
             v if v == VK_RIGHT.0 => {
-                f.caret = if ctrl { len } else { (caret + 1).min(len) };
+                f.caret = if ctrl {
+                    word_right(&text, caret)
+                } else {
+                    (caret + 1).min(len)
+                };
                 moved = true;
             }
             v if v == VK_HOME.0 => {
@@ -2820,8 +2900,8 @@ unsafe fn key_field(hwnd: HWND, id: i32, vk: u16, shift: bool, ctrl: bool) -> bo
         }
     });
     match vk {
-        v if v == VK_BACK.0 => edited = backspace(id),
-        v if v == VK_DELETE.0 => edited = delete_forward(id),
+        v if v == VK_BACK.0 => edited = backspace(id, ctrl),
+        v if v == VK_DELETE.0 => edited = delete_forward(id, ctrl),
         _ => {}
     }
     if edited {
@@ -2837,11 +2917,18 @@ unsafe fn key_field(hwnd: HWND, id: i32, vk: u16, shift: bool, ctrl: bool) -> bo
 unsafe fn key_down(hwnd: HWND, vk: u16) {
     let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
     let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+    key_with(hwnd, vk, ctrl, shift);
+}
+
+/// The key handler itself; modifiers come in rather than being read from the system,
+/// so a test can drive Ctrl+key without touching the user's keyboard.
+unsafe fn key_with(hwnd: HWND, vk: u16, ctrl: bool, shift: bool) {
     match focus() {
         Focus::Field(id) => {
             if ctrl && vk == 'A' as u16 {
                 select_all(id);
                 repaint(hwnd);
+                update_caret(hwnd);
                 return;
             }
             if ctrl && vk == 'C' as u16 {
@@ -2856,6 +2943,19 @@ unsafe fn key_down(hwnd: HWND, vk: u16) {
                 clipboard_paste(hwnd, id);
                 return;
             }
+            // The edit-box shortcuts that keep the clipboard intact.
+            if shift && vk == VK_DELETE.0 {
+                cut_without_clipboard(hwnd, id);
+                return;
+            }
+            if ctrl && vk == VK_INSERT.0 {
+                clipboard_copy(hwnd, id);
+                return;
+            }
+            if shift && vk == VK_INSERT.0 {
+                clipboard_paste(hwnd, id);
+                return;
+            }
             // Enter/Ctrl+Enter on a field is the dialog's default action.
             if vk == VK_RETURN.0 {
                 activate_button(hwnd, ID_BTN_SAVE_CLOSE);
@@ -2865,9 +2965,9 @@ unsafe fn key_down(hwnd: HWND, vk: u16) {
                 cycle_focus(hwnd, shift);
                 return;
             }
-            if key_field(hwnd, id, vk, shift, ctrl) {
-                return;
-            }
+            // Every key that reaches a field stops here: Escape must not run the close
+            // accelerator, and the scroll keys must not reach DefWindowProc either.
+            key_field(hwnd, id, vk, shift, ctrl);
         }
         Focus::List(id) => {
             if vk == VK_TAB.0 {
@@ -3530,6 +3630,104 @@ mod tests {
             assert!(a.is_some(), "explorer.exe row drew no icon");
             assert!(b.is_none(), "a missing exe name drew an icon");
         }
+    }
+
+    /// Backspace on a field used to panic with `RefCell already borrowed` and abort the
+    /// app: deleting re-entered the field store it was already holding. Delete, forward
+    /// delete, the word-wise variants and the no-op edges must all edit in place.
+    #[test]
+    fn editing_keys_edit_without_reentering_the_field_store() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            set_focus_value(Focus::Field(ID_EDIT_FILTER_EXCLUDED));
+            let send = |vk: u16| SendMessageW(hwnd, WM_KEYDOWN, WPARAM(vk as usize), LPARAM(0));
+            let text = || field_text(ID_EDIT_FILTER_EXCLUDED);
+            let caret_to = |c: usize| {
+                with_field(ID_EDIT_FILTER_EXCLUDED, |f| {
+                    f.caret = c;
+                    f.anchor = c;
+                })
+            };
+
+            for ch in ['a', 'b', 'c'] {
+                SendMessageW(hwnd, WM_CHAR, WPARAM(ch as usize), LPARAM(0));
+            }
+            assert_eq!(text(), "abc");
+
+            send(VK_BACK.0);
+            assert_eq!(text(), "ab", "backspace");
+            caret_to(0);
+            send(VK_DELETE.0);
+            assert_eq!(text(), "b", "delete forward");
+
+            // The edges are no-ops, not crashes.
+            caret_to(0);
+            send(VK_BACK.0);
+            assert_eq!(text(), "b", "backspace at caret 0");
+            caret_to(1);
+            send(VK_DELETE.0);
+            assert_eq!(text(), "b", "delete at end");
+
+            // Word-wise Ctrl+Backspace and Ctrl+Delete.
+            set_field(ID_EDIT_FILTER_EXCLUDED, "beta gamma".to_string());
+            caret_to(10);
+            key_with(hwnd, VK_BACK.0, true, false);
+            assert_eq!(text(), "beta ", "Ctrl+Backspace took one char");
+            caret_to(0);
+            key_with(hwnd, VK_DELETE.0, true, false);
+            assert_eq!(text(), " ", "Ctrl+Delete took one char");
+
+            // A selection is deleted whole by either key.
+            set_field(ID_EDIT_FILTER_EXCLUDED, "gamma delta".to_string());
+            with_field(ID_EDIT_FILTER_EXCLUDED, |f| {
+                f.anchor = 0;
+                f.caret = 6;
+            });
+            send(VK_BACK.0);
+            assert_eq!(text(), "delta", "backspace kept the selection");
+
+            // Keys a field does not use must not reach DefWindowProc.
+            for vk in [
+                windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0,
+                VK_PRIOR.0,
+                VK_NEXT.0,
+            ] {
+                send(vk);
+            }
+            assert!(IsWindow(hwnd).as_bool(), "a key closed the dialog");
+            assert_eq!(text(), "delta");
+        }
+        teardown(hwnd);
+    }
+
+    /// The usual edit-box shortcuts: Ctrl+A selects everything and one Delete or
+    /// Backspace then clears the box, leaving the dialog open.
+    #[test]
+    fn field_shortcuts_select_and_clear() {
+        let _serial = serial();
+        let hwnd = make_dialog();
+        unsafe {
+            set_focus_value(Focus::Field(ID_EDIT_SEARCH));
+            set_field(ID_EDIT_SEARCH, "alpha".to_string());
+
+            key_with(hwnd, 'A' as u16, true, false);
+            assert_eq!(
+                with_field(ID_EDIT_SEARCH, |f| f.selection()),
+                (0, 5),
+                "Ctrl+A did not select the text"
+            );
+            assert_eq!(field_text(ID_EDIT_SEARCH), "alpha", "Ctrl+A typed");
+
+            // A select-all of an empty field selects nothing rather than panicking.
+            key_with(hwnd, VK_DELETE.0, false, false);
+            assert_eq!(field_text(ID_EDIT_SEARCH), "");
+            key_with(hwnd, 'A' as u16, true, false);
+            key_with(hwnd, VK_BACK.0, false, false);
+            assert_eq!(field_text(ID_EDIT_SEARCH), "");
+            assert!(IsWindow(hwnd).as_bool());
+        }
+        teardown(hwnd);
     }
 
     /// Repainting an unchanged toggle must reuse its supersampled bitmap; a state change

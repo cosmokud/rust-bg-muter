@@ -13,6 +13,7 @@
 
 use crate::audio::AudioManager;
 use crate::config::Config;
+use crate::field::Field;
 use crate::icon_cache;
 use crate::od_controls::{self, to_wide};
 use crate::startup;
@@ -124,22 +125,6 @@ struct DialogState {
     last_refresh: Option<Instant>,
 }
 
-/// One editable field: text plus a selection. `caret`/`anchor` are char indices, not
-/// bytes, so editing never splits a surrogate pair.
-#[derive(Clone, Default)]
-struct Field {
-    text: String,
-    caret: usize,
-    anchor: usize,
-}
-
-impl Field {
-    /// Selection as (start, end), caret-first order.
-    fn selection(&self) -> (usize, usize) {
-        (self.caret.min(self.anchor), self.caret.max(self.anchor))
-    }
-}
-
 #[derive(Clone, Default, PartialEq)]
 struct Row {
     text: String,
@@ -215,11 +200,7 @@ fn field_text(id: i32) -> String {
 
 /// Replace field text, caret at the end, selection collapsed.
 fn set_field(id: i32, text: String) {
-    with_field(id, |f| {
-        f.text = text;
-        f.caret = f.text.chars().count();
-        f.anchor = f.caret;
-    });
+    with_field(id, |f| f.set_text(text));
 }
 
 fn with_list<R>(id: i32, f: impl FnOnce(&mut ListView) -> R) -> R {
@@ -2357,131 +2338,11 @@ fn numeric_field(id: i32) -> bool {
     id == ID_EDIT_POLL_INTERVAL
 }
 
-fn byte_index(text: &str, char_idx: usize) -> usize {
-    text.char_indices()
-        .nth(char_idx)
-        .map_or(text.len(), |(i, _)| i)
-}
-
-/// Replace the selection (or, collapsed, insert at the caret) with `insert`.
-fn insert_at_caret(id: i32, insert: &str) {
-    with_field(id, |f| {
-        let (start, end) = f.selection();
-        let (a, b) = (byte_index(&f.text, start), byte_index(&f.text, end));
-        let mut next = f.text.clone();
-        next.replace_range(a..b, insert);
-        f.text = next;
-        f.caret = start + insert.chars().count();
-        f.anchor = f.caret;
-    })
-}
-
-/// Delete the selection, else `[a, b)`; the caret lands on the start.
-/// Takes the borrowed field: calling back into `with_field` here would re-borrow the
-/// thread-local map, panic with `RefCell already borrowed`, and abort the whole app
-/// (release builds set `panic = "abort"`).
-fn delete_span(f: &mut Field, a: usize, b: usize) -> bool {
-    let (start, end) = f.selection();
-    let (lo, hi) = if start != end { (start, end) } else { (a, b) };
-    if lo >= hi {
-        return false;
-    }
-    let (x, y) = (byte_index(&f.text, lo), byte_index(&f.text, hi));
-    f.text.replace_range(x..y, "");
-    f.caret = lo;
-    f.anchor = lo;
-    true
-}
-
-fn delete_selection(id: i32) -> bool {
-    with_field(id, |f| {
-        let (start, end) = f.selection();
-        delete_span(f, start, end)
-    })
-}
-
-fn backspace(id: i32, word: bool) -> bool {
-    with_field(id, |f| {
-        let caret = f.caret;
-        let a = if word {
-            word_left(&f.text, caret)
-        } else {
-            caret.saturating_sub(1)
-        };
-        delete_span(f, a, caret)
-    })
-}
-
-fn delete_forward(id: i32, word: bool) -> bool {
-    with_field(id, |f| {
-        let caret = f.caret;
-        let len = f.text.chars().count();
-        let b = if word {
-            word_right(&f.text, caret)
-        } else {
-            (caret + 1).min(len)
-        };
-        delete_span(f, caret, b)
-    })
-}
-
-/// Start of the word left of `caret`: skips spaces, then the run of non-spaces.
-fn word_left(text: &str, caret: usize) -> usize {
-    let head: Vec<char> = text.chars().take(caret).collect();
-    let mut i = head.len();
-    while i > 0 && head[i - 1].is_whitespace() {
-        i -= 1;
-    }
-    while i > 0 && !head[i - 1].is_whitespace() {
-        i -= 1;
-    }
-    i
-}
-
-/// End of the word right of `caret`, the way a native edit box lands it.
-fn word_right(text: &str, caret: usize) -> usize {
-    let tail: Vec<char> = text.chars().skip(caret).collect();
-    let mut i = 0;
-    while i < tail.len() && tail[i].is_whitespace() {
-        i += 1;
-    }
-    while i < tail.len() && !tail[i].is_whitespace() {
-        i += 1;
-    }
-    caret + i
-}
-
-fn select_all(id: i32) {
-    with_field(id, |f| {
-        f.anchor = 0;
-        f.caret = f.text.chars().count();
-    });
-}
-
-fn selected_slice(id: i32) -> Option<String> {
-    with_field(id, |f| {
-        let (start, end) = f.selection();
-        (start != end).then(|| f.text.chars().skip(start).take(end - start).collect())
-    })
-}
-
 /// Text plus its selection, for the double click that selects a word under the pointer.
 unsafe fn select_word_at(hwnd: HWND, id: i32, x: i32) {
     let Some(ctl) = ctl_of(hwnd, id) else { return };
     let caret = caret_from_x(hwnd, &ctl, x);
-    with_field(id, |f| {
-        let chars: Vec<char> = f.text.chars().collect();
-        let mut a = caret.min(chars.len());
-        let mut b = a;
-        while a > 0 && !chars[a - 1].is_whitespace() {
-            a -= 1;
-        }
-        while b < chars.len() && !chars[b].is_whitespace() {
-            b += 1;
-        }
-        f.anchor = a;
-        f.caret = b;
-    });
+    with_field(id, |f| f.select_word_at(caret));
 }
 
 unsafe fn clipboard_open(hwnd: HWND) -> bool {
@@ -2492,7 +2353,7 @@ unsafe fn clipboard_open(hwnd: HWND) -> bool {
 unsafe fn clipboard_copy(hwnd: HWND, id: i32) {
     use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, SetClipboardData};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
-    let Some(text) = selected_slice(id) else {
+    let Some(text) = with_field(id, |f| f.selected_text()) else {
         return;
     };
     if !clipboard_open(hwnd) {
@@ -2517,7 +2378,7 @@ unsafe fn clipboard_copy(hwnd: HWND, id: i32) {
 
 unsafe fn clipboard_cut(hwnd: HWND, id: i32) {
     clipboard_copy(hwnd, id);
-    if delete_selection(id) {
+    if with_field(id, |f| f.delete_selection()) {
         after_field_edit(hwnd, id);
     }
 }
@@ -2525,7 +2386,7 @@ unsafe fn clipboard_cut(hwnd: HWND, id: i32) {
 /// Delete the selection with no clipboard round trip: Ctrl+C is the only key that may
 /// touch the registry contents.
 unsafe fn cut_without_clipboard(hwnd: HWND, id: i32) {
-    if delete_selection(id) {
+    if with_field(id, |f| f.delete_selection()) {
         after_field_edit(hwnd, id);
     }
 }
@@ -2563,7 +2424,7 @@ unsafe fn clipboard_paste(hwnd: HWND, id: i32) {
         .filter(|c| *c >= ' ' && (!numeric_field(id) || c.is_ascii_digit()))
         .collect();
     if !text.is_empty() {
-        insert_at_caret(id, &text);
+        with_field(id, |f| f.insert(&text));
         after_field_edit(hwnd, id);
     }
 }
@@ -2885,11 +2746,10 @@ unsafe fn key_field(hwnd: HWND, id: i32, vk: u16, shift: bool, ctrl: bool) -> bo
     let mut moved = false;
     with_field(id, |f| {
         let caret = f.caret;
-        let text = f.text.clone();
         match vk {
             v if v == VK_LEFT.0 => {
                 f.caret = if ctrl {
-                    word_left(&text, caret)
+                    f.word_left(caret)
                 } else {
                     caret.saturating_sub(1)
                 };
@@ -2897,7 +2757,7 @@ unsafe fn key_field(hwnd: HWND, id: i32, vk: u16, shift: bool, ctrl: bool) -> bo
             }
             v if v == VK_RIGHT.0 => {
                 f.caret = if ctrl {
-                    word_right(&text, caret)
+                    f.word_right(caret)
                 } else {
                     (caret + 1).min(len)
                 };
@@ -2918,8 +2778,8 @@ unsafe fn key_field(hwnd: HWND, id: i32, vk: u16, shift: bool, ctrl: bool) -> bo
         }
     });
     match vk {
-        v if v == VK_BACK.0 => edited = backspace(id, ctrl),
-        v if v == VK_DELETE.0 => edited = delete_forward(id, ctrl),
+        v if v == VK_BACK.0 => edited = with_field(id, |f| f.backspace(ctrl)),
+        v if v == VK_DELETE.0 => edited = with_field(id, |f| f.delete_forward(ctrl)),
         _ => {}
     }
     if edited {
@@ -2944,7 +2804,7 @@ unsafe fn key_with(hwnd: HWND, vk: u16, ctrl: bool, shift: bool) {
     match focus() {
         Focus::Field(id) => {
             if ctrl && vk == 'A' as u16 {
-                select_all(id);
+                with_field(id, |f| f.select_all());
                 repaint(hwnd);
                 update_caret(hwnd);
                 return;
@@ -3030,7 +2890,7 @@ unsafe fn char_input(hwnd: HWND, wparam: WPARAM) {
     if numeric_field(id) && !ch.is_ascii_digit() {
         return;
     }
-    insert_at_caret(id, &ch.to_string());
+    with_field(id, |f| f.insert(&ch.to_string()));
     after_field_edit(hwnd, id);
 }
 

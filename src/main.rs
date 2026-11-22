@@ -8,6 +8,7 @@
 mod audio;
 mod config;
 mod confirm_dialog;
+mod field;
 mod icon_cache;
 mod mixer_reset;
 mod muter;

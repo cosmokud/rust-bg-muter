@@ -39,7 +39,7 @@ tray-icon = "0.19"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Serialization for config
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 
 # Cross-thread communication (lightweight)

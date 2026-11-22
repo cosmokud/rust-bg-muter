@@ -5,17 +5,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// List of excluded process names (e.g., "spotify.exe")
+    ///
+    /// Shared behind an `Arc`: every reader that needs the rules to survive a lock drop - the
+    /// muting cycle, the dialog's list refresh - clones the handle, not the names, and a
+    /// write copies the set once (`Arc::make_mut`).
     #[serde(default)]
-    pub excluded_apps: HashSet<String>,
+    pub excluded_apps: Arc<HashSet<String>>,
 
     /// List of apps that should always be muted (even when foreground)
     #[serde(default)]
-    pub always_muted_apps: HashSet<String>,
+    pub always_muted_apps: Arc<HashSet<String>>,
 
     /// Whether the muting functionality is enabled
     #[serde(default = "default_enabled")]
@@ -69,8 +74,8 @@ fn default_minimize_button_to_tray() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            excluded_apps: HashSet::new(),
-            always_muted_apps: HashSet::new(),
+            excluded_apps: Arc::default(),
+            always_muted_apps: Arc::default(),
             muting_enabled: true,
             poll_interval_ms: 500,
             minimize_to_tray: true,
@@ -188,7 +193,7 @@ impl Config {
     /// Adds an app to the exclusion list without touching the config file: the dialog keeps
     /// every list edit in memory and the file is written once, by `save_settings`.
     pub fn insert_excluded_app(&mut self, app_name: &str) {
-        self.excluded_apps.insert(app_name.to_lowercase());
+        Arc::make_mut(&mut self.excluded_apps).insert(app_name.to_lowercase());
     }
 
     /// Removes an app from the exclusion list
@@ -199,7 +204,7 @@ impl Config {
 
     /// Removes an app from the exclusion list without touching the config file.
     pub fn remove_excluded_app_in_memory(&mut self, app_name: &str) {
-        self.excluded_apps.remove(&app_name.to_lowercase());
+        Arc::make_mut(&mut self.excluded_apps).remove(&app_name.to_lowercase());
     }
 
     /// Checks if an app is in the exclusion list
@@ -216,7 +221,7 @@ impl Config {
 
     /// Adds an app to the always-muted list without touching the config file.
     pub fn insert_always_muted_app(&mut self, app_name: &str) {
-        self.always_muted_apps.insert(app_name.to_lowercase());
+        Arc::make_mut(&mut self.always_muted_apps).insert(app_name.to_lowercase());
     }
 
     /// Removes an app from the always-muted list
@@ -227,7 +232,7 @@ impl Config {
 
     /// Removes an app from the always-muted list without touching the config file.
     pub fn remove_always_muted_app_in_memory(&mut self, app_name: &str) {
-        self.always_muted_apps.remove(&app_name.to_lowercase());
+        Arc::make_mut(&mut self.always_muted_apps).remove(&app_name.to_lowercase());
     }
 
     /// Checks if an app is in the always-muted list

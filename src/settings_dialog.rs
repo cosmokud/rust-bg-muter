@@ -2091,7 +2091,7 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
     }
     DIALOG_STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
-            let sessions = s.audio_manager.get_sessions();
+            let sessions = s.audio_manager.snapshot().rows;
 
             let config = s.config.read();
             let excluded = config.excluded_apps.clone();

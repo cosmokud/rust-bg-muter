@@ -250,6 +250,21 @@ impl Config {
     }
 }
 
+/// One lock for every test that touches the per-user config directory or the process-wide
+/// override that points it elsewhere.
+///
+/// The override is an environment variable, so it is shared by the whole test binary: a
+/// test that sets it while another saves a config makes that other test write into the
+/// override's directory, and makes every path resolved afterwards point somewhere else.
+#[cfg(test)]
+pub(crate) fn config_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +307,7 @@ mod tests {
     /// lists a user configured, which is how a run of the test suite emptied them once.
     #[test]
     fn test_inserts_do_not_write_the_config_file() {
+        let _config_dir = config_dir_lock();
         let path = Config::config_path();
         let before = std::fs::read(&path).ok();
         let mut config = Config::default();
@@ -313,6 +329,7 @@ mod tests {
     /// The saving handlers must resolve somewhere throwaway, whatever else is set.
     #[test]
     fn a_test_run_never_resolves_the_users_config() {
+        let _config_dir = config_dir_lock();
         let resolved = Config::config_path();
         assert_ne!(
             resolved,
@@ -326,6 +343,7 @@ mod tests {
     /// as it was: this is the sequence that emptied a real exclusion list once.
     #[test]
     fn a_saving_handler_leaves_the_users_config_untouched() {
+        let _config_dir = config_dir_lock();
         let real = real_config_path();
         let before = std::fs::read(&real).ok();
 
@@ -342,6 +360,7 @@ mod tests {
     /// A file that cannot be parsed is a list to repair, not one to overwrite.
     #[test]
     fn load_keeps_a_file_it_cannot_parse() {
+        let _config_dir = config_dir_lock();
         let dir = Config::config_dir().join("unparseable");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

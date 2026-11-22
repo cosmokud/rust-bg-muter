@@ -1,7 +1,10 @@
 //! Core muting logic module
-//! Implements the background muting algorithm with minimal overhead
+//!
+//! The policy is one decision table (`decide`) applied to one reading of the mixer at a
+//! time (`apply`). Nothing here holds an audio interface: the reading is plain rows, and
+//! `AudioManager` is the only thing that writes a mute back.
 
-use crate::audio::AudioManager;
+use crate::audio::{AudioManager, AudioSession, Snapshot};
 use crate::config::Config;
 use crate::process::get_foreground_pid;
 use parking_lot::RwLock;
@@ -9,17 +12,79 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// How long a state with no session behind it is kept, so a row does not flicker out of
+/// the detected list the moment an app stops playing.
+const STALE_AFTER: Duration = Duration::from_secs(30);
+
 /// Represents the state of an audio-producing application
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct AppAudioState {
     pub pid: u32,
     pub process_name: String,
     pub display_name: String,
     pub is_muted_by_us: bool,
-    pub original_mute_state: bool,
     pub last_seen: Instant,
     pub is_active: bool,
+}
+
+/// What one cycle should do to one session's mute state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Mute,
+    Unmute,
+    Leave,
+}
+
+/// The whole policy, as a pure function of one session, the rule sets and the foreground
+/// app: always-muted beats excluded beats foreground beats background, and anything the
+/// rules say nothing about is left as the user had it.
+///
+/// `muted_by_us` is whether this engine muted the session, so a rule only ever undoes its
+/// own mute - a session muted by the user stays muted when muting is switched off.
+pub fn decide(
+    row: &AudioSession,
+    config: &Config,
+    foreground: Option<u32>,
+    own_pid: u32,
+    muted_by_us: bool,
+) -> Action {
+    if !config.muting_enabled {
+        return if muted_by_us {
+            Action::Unmute
+        } else {
+            Action::Leave
+        };
+    }
+    if row.process_id == own_pid {
+        return Action::Leave;
+    }
+
+    // One lowercased name per session: the rule sets are stored lowercased.
+    let name = row.process_name.to_lowercase();
+    if config.always_muted_apps.contains(&name) {
+        // Stays muted even while it is the foreground app.
+        return if row.is_muted {
+            Action::Leave
+        } else {
+            Action::Mute
+        };
+    }
+    if config.excluded_apps.contains(&name) {
+        return if muted_by_us {
+            Action::Unmute
+        } else {
+            Action::Leave
+        };
+    }
+    if foreground == Some(row.process_id) {
+        // The active app is audible even if something else muted it.
+        return Action::Unmute;
+    }
+    if row.is_muted {
+        Action::Leave
+    } else {
+        Action::Mute
+    }
 }
 
 /// The core muting engine - optimized for minimal CPU usage
@@ -27,14 +92,12 @@ pub struct MuterEngine {
     audio_manager: Arc<AudioManager>,
     config: Arc<RwLock<Config>>,
     app_states: HashMap<u32, AppAudioState>,
-    muted_pids: HashSet<u32>,
     own_pid: u32,
     last_foreground_pid: Option<u32>,
     last_session_refresh: Instant,
     session_refresh_interval: Duration,
 }
 
-#[allow(dead_code)]
 impl MuterEngine {
     /// Creates a new MuterEngine
     pub fn new(config: Arc<RwLock<Config>>) -> Result<Self, Box<dyn std::error::Error>> {
@@ -44,7 +107,6 @@ impl MuterEngine {
             audio_manager,
             config,
             app_states: HashMap::new(),
-            muted_pids: HashSet::new(),
             own_pid: std::process::id(),
             last_foreground_pid: None,
             last_session_refresh: Instant::now(),
@@ -57,232 +119,151 @@ impl MuterEngine {
         self.audio_manager.clone()
     }
 
-    /// Updates the engine state and applies muting logic
-    /// Optimized: only refreshes audio sessions periodically, not every poll
+    /// One poll: read the foreground window, then run a cycle if anything moved. An idle
+    /// poll returns before it copies anything out of the config.
     pub fn update(&mut self) -> Result<UpdateResult, Box<dyn std::error::Error>> {
-        // Get current foreground PID
         let foreground_pid = get_foreground_pid();
-        let previous_foreground_pid = self.last_foreground_pid;
-        let foreground_changed = foreground_pid != previous_foreground_pid;
-        self.last_foreground_pid = foreground_pid;
+        let foreground_changed = foreground_pid != self.last_foreground_pid;
 
-        // Only refresh audio sessions periodically OR when foreground changes
-        let should_refresh = foreground_changed
-            || self.last_session_refresh.elapsed() >= self.session_refresh_interval;
-
-        if !should_refresh {
-            // Nothing changed: the poll returns before it copies the rule sets, so an idle
-            // app allocates nothing per tick.
+        if !foreground_changed
+            && self.last_session_refresh.elapsed() < self.session_refresh_interval
+        {
             return Ok(UpdateResult {
                 foreground_pid,
                 foreground_changed: false,
                 active_sessions: self.app_states.len(),
-                muted_count: self.muted_pids.len(),
+                muted_count: self.muted_count(),
             });
         }
 
-        let config = self.config.read();
-        let muting_enabled = config.muting_enabled;
-        let excluded_apps = config.excluded_apps.clone();
-        let always_muted_apps = config.always_muted_apps.clone();
-        drop(config);
-
-        // Refresh audio sessions (expensive COM operation)
+        // Refresh audio sessions (expensive COM operation), then decide on what it read.
         self.last_session_refresh = Instant::now();
-        let sessions = self.audio_manager.get_sessions();
+        let snapshot = self.audio_manager.snapshot();
+        Ok(self.apply(&snapshot, foreground_pid))
+    }
 
-        // Track which PIDs we've seen this update
-        let mut seen_pids = HashSet::new();
+    /// One cycle against a given reading of the mixer and foreground app: the decisions and
+    /// the writes they imply. This is the whole engine minus the clock and the COM read,
+    /// which is what makes the policy testable without a mixer.
+    pub fn apply(&mut self, snapshot: &Snapshot, foreground_pid: Option<u32>) -> UpdateResult {
+        let previous_foreground_pid = self.last_foreground_pid;
+        let foreground_changed = foreground_pid != previous_foreground_pid;
+        self.last_foreground_pid = foreground_pid;
 
-        // Update app states from audio sessions
-        for session in &sessions {
-            seen_pids.insert(session.process_id);
+        let config = self.config.read();
+        let audio = self.audio_manager.clone();
 
-            let is_foreground = foreground_pid == Some(session.process_id);
-            // One lowercased name per session, not one per rule set: the rule sets are
-            // already lowercased, so this is the only allocation the lookup needs.
-            let name = session.process_name.to_lowercase();
-            let is_excluded = excluded_apps.contains(&name);
-            let is_always_muted = always_muted_apps.contains(&name);
-            let is_own_process = session.process_id == self.own_pid;
+        // A reading that came back empty is a failed reading, not an empty mixer: the
+        // cached states stand in for it, with their mute state as far as it is known, so a
+        // transient COM failure cannot silently unmute what this engine muted.
+        let cached: Vec<AudioSession> = if snapshot.is_empty() {
+            self.cached_rows(previous_foreground_pid)
+        } else {
+            Vec::new()
+        };
+        let rows: &[AudioSession] = if cached.is_empty() {
+            &snapshot.rows
+        } else {
+            &cached
+        };
 
-            let app_state = self
+        let mut seen_pids = HashSet::with_capacity(rows.len());
+        for row in rows {
+            seen_pids.insert(row.process_id);
+
+            let state = self
                 .app_states
-                .entry(session.process_id)
+                .entry(row.process_id)
                 .or_insert_with(|| AppAudioState {
-                    pid: session.process_id,
-                    process_name: session.process_name.clone(),
-                    display_name: session.display_name.clone(),
+                    pid: row.process_id,
+                    process_name: row.process_name.clone(),
+                    display_name: row.display_name.clone(),
                     is_muted_by_us: false,
-                    original_mute_state: session.is_muted,
                     last_seen: Instant::now(),
                     is_active: true,
                 });
 
-            app_state.last_seen = Instant::now();
-            app_state.is_active = true;
-            app_state.display_name = session.display_name.clone();
+            state.last_seen = Instant::now();
+            state.is_active = true;
 
-            // Apply muting logic if enabled
-            if muting_enabled && !is_own_process {
-                // Priority 1: Always-muted apps stay muted even when foreground.
-                if is_always_muted {
-                    if !session.is_muted {
-                        app_state.original_mute_state = session.is_muted;
-                        let _ = self.audio_manager.mute_process(session.process_id);
-                        app_state.is_muted_by_us = true;
-                        self.muted_pids.insert(session.process_id);
-                    }
-                } else if is_excluded {
-                    // Excluded apps are always audible; if we muted them earlier, undo it.
-                    if app_state.is_muted_by_us {
-                        let _ = self.audio_manager.unmute_process(session.process_id);
-                        app_state.is_muted_by_us = false;
-                        self.muted_pids.remove(&session.process_id);
-                    }
-                } else if is_foreground {
-                    // Always try to unmute the foreground app, even if it was muted externally.
-                    let _ = self.audio_manager.unmute_process(session.process_id);
-                    app_state.is_muted_by_us = false;
-                    self.muted_pids.remove(&session.process_id);
-                } else {
-                    // Mute background app (only if currently unmuted)
-                    if !session.is_muted {
-                        app_state.original_mute_state = session.is_muted;
-                        let _ = self.audio_manager.mute_process(session.process_id);
-                        app_state.is_muted_by_us = true;
-                        self.muted_pids.insert(session.process_id);
-                    }
+            let muted_by_us = state.is_muted_by_us;
+            match decide(row, &config, foreground_pid, self.own_pid, muted_by_us) {
+                Action::Mute => {
+                    let _ = audio.mute_process(row.process_id);
+                    state.is_muted_by_us = true;
                 }
-            } else if !muting_enabled {
-                // Muting disabled: unmute anything we previously muted.
-                if app_state.is_muted_by_us {
-                    let _ = self.audio_manager.unmute_process(session.process_id);
-                    app_state.is_muted_by_us = false;
-                    self.muted_pids.remove(&session.process_id);
+                Action::Unmute => {
+                    let _ = audio.unmute_process(row.process_id);
+                    state.is_muted_by_us = false;
                 }
+                Action::Leave => {}
             }
         }
 
-        // Handle foreground change for cached sessions (when we didn't refresh)
-        if foreground_changed && sessions.is_empty() {
-            for (pid, state) in &mut self.app_states {
-                if !state.is_active {
-                    continue;
-                }
-
-                let is_foreground = foreground_pid == Some(*pid);
-                let name = state.process_name.to_lowercase();
-                let is_excluded = excluded_apps.contains(&name);
-                let is_always_muted = always_muted_apps.contains(&name);
-
-                if muting_enabled && *pid != self.own_pid {
-                    if is_always_muted {
-                        let _ = self.audio_manager.mute_process(*pid);
-                        state.is_muted_by_us = true;
-                        self.muted_pids.insert(*pid);
-                    } else if is_excluded {
-                        if state.is_muted_by_us {
-                            let _ = self.audio_manager.unmute_process(*pid);
-                            state.is_muted_by_us = false;
-                            self.muted_pids.remove(pid);
-                        }
-                    } else if is_foreground {
-                        let _ = self.audio_manager.unmute_process(*pid);
-                        state.is_muted_by_us = false;
-                        self.muted_pids.remove(pid);
-                    } else {
-                        // Avoid muting every background PID here (we don't have fresh mute state).
-                        // Only newly-mute the PID that just lost focus, plus anything we already muted.
-                        let should_mute = state.is_muted_by_us || previous_foreground_pid == Some(*pid);
-                        if should_mute {
-                            let _ = self.audio_manager.mute_process(*pid);
-                            state.is_muted_by_us = true;
-                            self.muted_pids.insert(*pid);
-                        }
-                    }
-                } else if !muting_enabled {
-                    if state.is_muted_by_us {
-                        let _ = self.audio_manager.unmute_process(*pid);
-                        state.is_muted_by_us = false;
-                        self.muted_pids.remove(pid);
-                    }
-                }
+        // Unseen apps: inactive, and unmuted once if the mute was ours. Their session is
+        // gone, so the write only matters for a process that is still alive.
+        let now = Instant::now();
+        self.app_states.retain(|pid, state| {
+            if seen_pids.contains(pid) {
+                return true;
             }
-        }
+            state.is_active = false;
+            if state.is_muted_by_us {
+                let _ = audio.unmute_process(*pid);
+                state.is_muted_by_us = false;
+            }
+            now.duration_since(state.last_seen) <= STALE_AFTER
+        });
 
-        // Mark unseen apps as inactive and clean up old entries (less frequently)
-        if should_refresh {
-            let now = Instant::now();
-            let cleanup_threshold = Duration::from_secs(30);
-
-            self.app_states.retain(|pid, state| {
-                if !seen_pids.contains(pid) {
-                    state.is_active = false;
-
-                    // Unmute if we were muting this app
-                    if state.is_muted_by_us {
-                        let _ = self.audio_manager.unmute_process(*pid);
-                        self.muted_pids.remove(pid);
-                    }
-
-                    // Remove if not seen for too long
-                    if now.duration_since(state.last_seen) > cleanup_threshold {
-                        return false;
-                    }
-                }
-                true
-            });
-        }
-
-        Ok(UpdateResult {
+        UpdateResult {
             foreground_pid,
             foreground_changed,
             active_sessions: self.app_states.len(),
-            muted_count: self.muted_pids.len(),
-        })
+            muted_count: self.muted_count(),
+        }
     }
 
-    /// Gets the current app states
-    pub fn get_app_states(&self) -> Vec<AppAudioState> {
-        self.app_states.values().cloned().collect()
-    }
-
-    /// Gets active audio sessions
-    pub fn get_active_sessions(&self) -> Vec<AppAudioState> {
+    /// Active states as rows, for the cycle that has no fresh reading to work from.
+    fn cached_rows(&self, previous_foreground_pid: Option<u32>) -> Vec<AudioSession> {
         self.app_states
             .values()
-            .filter(|s| s.is_active)
-            .cloned()
+            .filter(|state| state.is_active)
+            .map(|state| AudioSession {
+                process_id: state.pid,
+                process_name: state.process_name.clone(),
+                display_name: state.display_name.clone(),
+                // "Unknown" is read as muted when the mute is ours or the app just lost
+                // focus, so deciding again cannot unmute an app we muted.
+                is_muted: state.is_muted_by_us || previous_foreground_pid == Some(state.pid),
+            })
             .collect()
     }
 
     /// Unmutes all apps that we muted
     pub fn unmute_all(&mut self) {
-        for pid in self.muted_pids.drain() {
-            let _ = self.audio_manager.unmute_process(pid);
-        }
-
+        let audio = self.audio_manager.clone();
         for state in self.app_states.values_mut() {
-            state.is_muted_by_us = false;
+            if state.is_muted_by_us {
+                let _ = audio.unmute_process(state.pid);
+                state.is_muted_by_us = false;
+            }
         }
-    }
-
-    /// Forces a refresh of audio sessions
-    pub fn force_refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.audio_manager.refresh_sessions()?;
-        self.last_session_refresh = Instant::now();
-        Ok(())
     }
 
     /// Gets the number of currently muted apps
     pub fn muted_count(&self) -> usize {
-        self.muted_pids.len()
+        self.app_states
+            .values()
+            .filter(|state| state.is_muted_by_us)
+            .count()
     }
 
     /// Checks if a specific PID is muted by us
+    #[allow(dead_code)]
     pub fn is_muted_by_us(&self, pid: u32) -> bool {
-        self.muted_pids.contains(&pid)
+        self.app_states
+            .get(&pid)
+            .is_some_and(|state| state.is_muted_by_us)
     }
 }
 
@@ -301,4 +282,143 @@ pub struct UpdateResult {
     pub foreground_changed: bool,
     pub active_sessions: usize,
     pub muted_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(pid: u32, name: &str, muted: bool) -> AudioSession {
+        AudioSession {
+            process_id: pid,
+            process_name: name.to_string(),
+            display_name: name.to_string(),
+            is_muted: muted,
+        }
+    }
+
+    fn rules(excluded: &[&str], always_muted: &[&str]) -> Config {
+        let mut config = Config::default();
+        for name in excluded {
+            config.insert_excluded_app(name);
+        }
+        for name in always_muted {
+            config.insert_always_muted_app(name);
+        }
+        config
+    }
+
+    const OWN_PID: u32 = 99;
+
+    /// The purpose of the app in one assertion: the active app is audible and the rest are
+    /// muted, whoever muted them before.
+    #[test]
+    fn the_foreground_app_is_audible_and_the_rest_are_muted() {
+        let config = rules(&[], &[]);
+        assert_eq!(
+            decide(&row(1, "game.exe", false), &config, Some(1), OWN_PID, false),
+            Action::Unmute
+        );
+        assert_eq!(
+            decide(&row(1, "game.exe", true), &config, Some(1), OWN_PID, true),
+            Action::Unmute
+        );
+        assert_eq!(
+            decide(&row(2, "music.exe", false), &config, Some(1), OWN_PID, false),
+            Action::Mute
+        );
+    }
+
+    /// Always-muted outranks the foreground rule; excluded outranks it in the other
+    /// direction, and neither touches a mute it does not own.
+    #[test]
+    fn rule_sets_outrank_the_foreground() {
+        let config = rules(&["spotify.exe"], &["steam.exe"]);
+        assert_eq!(
+            decide(&row(3, "Steam.exe", false), &config, Some(3), OWN_PID, false),
+            Action::Mute,
+            "an always-muted app must stay muted while focused"
+        );
+        assert_eq!(
+            decide(&row(4, "Spotify.exe", true), &config, Some(1), OWN_PID, false),
+            Action::Leave,
+            "a mute we do not own is the user's"
+        );
+        assert_eq!(
+            decide(&row(4, "spotify.exe", true), &config, Some(1), OWN_PID, true),
+            Action::Unmute
+        );
+    }
+
+    /// Turning muting off undoes this engine's mutes and nothing else.
+    #[test]
+    fn disabling_muting_only_undoes_our_own_mutes() {
+        let config = Config {
+            muting_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            decide(&row(2, "music.exe", true), &config, Some(1), OWN_PID, true),
+            Action::Unmute
+        );
+        assert_eq!(
+            decide(&row(2, "music.exe", true), &config, Some(1), OWN_PID, false),
+            Action::Leave
+        );
+    }
+
+    /// The engine itself, over a fabricated reading: no mixer, no window, no clock.
+    #[test]
+    fn a_cycle_decides_over_the_reading_it_is_given() {
+        let engine_config = Arc::new(RwLock::new(rules(&["spotify.exe"], &[])));
+        let mut engine = MuterEngine::new(engine_config).expect("engine");
+        let snapshot = Snapshot {
+            rows: vec![
+                row(1, "game.exe", false),
+                row(2, "music.exe", false),
+                row(3, "spotify.exe", false),
+                row(4, "steam.exe", false),
+            ],
+        };
+
+        let result = engine.apply(&snapshot, Some(1));
+        assert_eq!(result.active_sessions, 4);
+        assert!(result.foreground_changed);
+
+        let muted = |pid: u32| engine.is_muted_by_us(pid);
+        assert!(!muted(1), "the foreground app was muted");
+        assert!(muted(2), "a background app stayed audible");
+        assert!(!muted(3), "an excluded app was muted");
+        assert!(muted(4));
+        assert_eq!(engine.muted_count(), 2);
+
+        // The same reading again is a no-op: nothing is re-decided in a way that writes.
+        let again = engine.apply(&snapshot, Some(1));
+        assert!(!again.foreground_changed);
+        assert_eq!(again.muted_count, 2);
+
+        engine.unmute_all();
+        assert_eq!(engine.muted_count(), 0);
+    }
+
+    /// An empty reading is a failed one: the cached states decide, so an app that loses its
+    /// session - or a COM hiccup - does not resurrect a mute this engine made.
+    #[test]
+    fn an_empty_reading_keeps_our_mutes_in_place() {
+        let engine_config = Arc::new(RwLock::new(Config::default()));
+        let mut engine = MuterEngine::new(engine_config).expect("engine");
+        engine.apply(
+            &Snapshot {
+                rows: vec![row(1, "game.exe", false), row(2, "music.exe", false)],
+            },
+            Some(1),
+        );
+        assert!(engine.is_muted_by_us(2));
+
+        // Focus moves to an app with no session while the mixer cannot be read: the muted
+        // app keeps the mute this engine owns, and nothing is unmuted by accident.
+        engine.apply(&Snapshot::default(), Some(3));
+        assert!(engine.is_muted_by_us(2), "the mute we own was dropped");
+        assert!(!engine.is_muted_by_us(1));
+    }
 }

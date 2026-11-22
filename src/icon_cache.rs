@@ -427,6 +427,9 @@ mod tests {
     /// icon that was stored while it ran.
     #[test]
     fn a_remembered_icon_comes_back_without_the_process() {
+        // The cache lives beside the config, whose directory another test can point
+        // elsewhere while this one is resolving it.
+        let _config_dir = crate::config::config_dir_lock();
         let name = "remember-test.exe";
         unsafe {
             remember(name, own_icon());

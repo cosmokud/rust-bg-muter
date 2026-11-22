@@ -32,6 +32,19 @@ pub struct AudioSession {
     pub is_muted: bool,
 }
 
+/// One reading of the mixer: plain rows, and no way back into the device. What a caller
+/// does with it is a decision about data, not about audio.
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    pub rows: Vec<AudioSession>,
+}
+
+impl Snapshot {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
 /// Lightweight audio session manager
 /// Minimizes COM overhead by caching volume controls
 pub struct AudioManager {
@@ -56,9 +69,15 @@ impl AudioManager {
         })
     }
 
+    /// Reads every audio session once. This is the only path that touches COM: callers get
+    /// plain rows back, so nothing above this line holds an interface.
+    pub fn snapshot(&self) -> Snapshot {
+        self.try_snapshot().unwrap_or_default()
+    }
+
     /// Refreshes the list of audio sessions
     /// This is the expensive operation - call sparingly
-    pub fn refresh_sessions(&self) -> windows::core::Result<Vec<AudioSession>> {
+    fn try_snapshot(&self) -> windows::core::Result<Snapshot> {
         unsafe {
             // Initialize COM for this thread (idempotent)
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -106,13 +125,8 @@ impl AudioManager {
             let mut sessions_lock = self.sessions.lock();
             *sessions_lock = new_sessions;
 
-            Ok(result)
+            Ok(Snapshot { rows: result })
         }
-    }
-
-    /// Gets all current audio sessions
-    pub fn get_sessions(&self) -> Vec<AudioSession> {
-        self.refresh_sessions().unwrap_or_default()
     }
 
     /// Mutes a specific process by PID (uses cached volume control)

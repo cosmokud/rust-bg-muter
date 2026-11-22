@@ -22,7 +22,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::SIZE;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -117,6 +119,9 @@ struct DialogState {
     filter_detected: String,
     filter_excluded: String,
     filter_always_muted: String,
+    /// When the lists were last read from the mixer; the automatic refreshes a show and an
+    /// activation trigger are throttled against it.
+    last_refresh: Option<Instant>,
 }
 
 /// One editable field: text plus a selection. `caret`/`anchor` are char indices, not
@@ -386,6 +391,7 @@ pub fn open_settings_dialog(
             filter_detected: String::new(),
             filter_excluded: String::new(),
             filter_always_muted: String::new(),
+            last_refresh: None,
         });
     });
 
@@ -519,6 +525,7 @@ enum Kind {
     Stepper,
 }
 
+#[derive(Clone)]
 struct Ctl {
     id: i32,
     kind: Kind,
@@ -526,16 +533,43 @@ struct Ctl {
     rect: RECT,
 }
 
+// Last `layout()` result: the geometry follows the client size and the DPI alone, and
+// every paint, hit test and mouse move asks for it. Rebuilding it allocated a `String`
+// per control per ask - hundreds of allocations a second while the pointer moved.
+// Keyed by (client width, client height, DPI): the one geometry the result depends on.
+type LayoutCache = Option<(i32, i32, u32, Rc<Vec<Ctl>>)>;
+
+thread_local! {
+    static LAYOUT_CACHE: RefCell<LayoutCache> = const { RefCell::new(None) };
+}
+
 /// Single source of truth for control geometry: creation, WM_SIZE and DPI changes all
 /// go through here so the DIP grid cannot drift between paths.
-fn layout(hwnd: HWND) -> Vec<Ctl> {
+fn layout(hwnd: HWND) -> Rc<Vec<Ctl>> {
     let mut rc = RECT::default();
     unsafe {
         let _ = GetClientRect(hwnd, &mut rc);
     }
-    let width = rc.right - rc.left;
-    let height = rc.bottom - rc.top;
-    let s = |v: f32| dip_of().px(v);
+    let (width, height) = (rc.right - rc.left, rc.bottom - rc.top);
+    let dip = dip_of();
+
+    let cached = LAYOUT_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        cache.as_ref().and_then(|(w, h, dpi, ctls)| {
+            (*w == width && *h == height && *dpi == dip.dpi).then(|| ctls.clone())
+        })
+    });
+    if let Some(ctls) = cached {
+        return ctls;
+    }
+
+    let ctls = Rc::new(build_layout(width, height, dip));
+    LAYOUT_CACHE.with(|cache| *cache.borrow_mut() = Some((width, height, dip.dpi, ctls.clone())));
+    ctls
+}
+
+fn build_layout(width: i32, height: i32, dip: Dip) -> Vec<Ctl> {
+    let s = |v: f32| dip.px(v);
 
     let margin = s(12.0);
     let left_panel_width = (width - margin * 3) / 2;
@@ -1217,7 +1251,7 @@ unsafe fn paint_frame(hwnd: HWND, hdc: HDC, rc: &RECT) {
         .map(|c| c.rect)
         .collect();
     // Cards come first in `layout()`, so their children paint over them.
-    for ctl in &ctls {
+    for ctl in ctls.iter() {
         match ctl.kind {
             Kind::Card => draw_card(hdc, ctl, &p, dip),
             Kind::Label => od_controls::text(
@@ -1772,7 +1806,7 @@ fn point_of(lparam: LPARAM) -> (i32, i32) {
 }
 
 fn ctl_of(hwnd: HWND, id: i32) -> Option<Ctl> {
-    layout(hwnd).into_iter().find(|c| c.id == id)
+    layout(hwnd).iter().find(|c| c.id == id).cloned()
 }
 
 fn kind_of(hwnd: HWND, id: i32) -> Option<Kind> {
@@ -1809,7 +1843,7 @@ fn select_row(hwnd: HWND, id: i32, idx: usize) {
 
 /// List whose scrollbar covers point (x, y): the whole band, thumb or not.
 fn list_at_scrollbar(hwnd: HWND, x: i32, y: i32) -> Option<(i32, RECT, RECT)> {
-    layout(hwnd).into_iter().find_map(|c| {
+    layout(hwnd).iter().find_map(|c| {
         if c.kind != Kind::List {
             return None;
         }
@@ -2020,7 +2054,33 @@ unsafe fn refill_named_list(hwnd: HWND, id: i32, names: &[String]) {
     with_list(id, |l| l.set_rows(rows, visible));
 }
 
+/// Minimum gap between the automatic re-reads a show and an activation trigger. Opening
+/// the dialog delivers both within a millisecond, and each one used to re-enumerate every
+/// audio session and rebuild all three lists; a click back into the window comes much
+/// later than this, so it still refreshes.
+const AUTO_REFRESH_MIN_MS: u128 = 200;
+
+/// Automatic re-read, skipped when the lists were just read: showing and activating arrive
+/// together, so one refresh covers both.
+unsafe fn refresh_detected_apps_if_stale(hwnd: HWND) {
+    let recent = DIALOG_STATE.with(|state| {
+        state.borrow().as_ref().is_some_and(|s| {
+            s.last_refresh
+                .is_some_and(|at| at.elapsed().as_millis() < AUTO_REFRESH_MIN_MS)
+        })
+    });
+    if recent {
+        return;
+    }
+    refresh_detected_apps(hwnd);
+}
+
 unsafe fn refresh_detected_apps(hwnd: HWND) {
+    DIALOG_STATE.with(|state| {
+        if let Some(ref mut s) = *state.borrow_mut() {
+            s.last_refresh = Some(Instant::now());
+        }
+    });
     // A fresh scan may now find apps that were gone last time, so retry their icons.
     // PIDs are recycled, so the id-keyed answers go too; path-keyed icons stay.
     if let Some(missing) = MISSING_PATHS.get() {
@@ -2575,7 +2635,7 @@ fn focus_target(kind: Kind, id: i32) -> Focus {
 /// lists them, which is the order a user reads the dialog in.
 fn tab_order(hwnd: HWND) -> Vec<Focus> {
     layout(hwnd)
-        .into_iter()
+        .iter()
         .filter_map(|c| match c.kind {
             Kind::Button | Kind::Stepper | Kind::Toggle | Kind::Edit | Kind::List => {
                 Some(focus_target(c.kind, c.id))
@@ -2807,7 +2867,8 @@ unsafe fn mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
     };
     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
-    let Some(ctl) = layout(hwnd).into_iter().find(|c| {
+    let ctls = layout(hwnd);
+    let Some(ctl) = ctls.iter().find(|c| {
         c.kind == Kind::List
             && pt.x >= c.rect.left
             && pt.x < c.rect.right
@@ -3032,14 +3093,14 @@ unsafe extern "system" fn window_proc(
         }
         WM_SHOWWINDOW => {
             if wparam.0 != 0 {
-                refresh_detected_apps(hwnd);
+                refresh_detected_apps_if_stale(hwnd);
             }
             LRESULT(0)
         }
         WM_ACTIVATE => {
             let state = (wparam.0 & 0xFFFF) as u32;
             if state != WA_INACTIVE {
-                refresh_detected_apps(hwnd);
+                refresh_detected_apps_if_stale(hwnd);
             }
             LRESULT(0)
         }
@@ -3209,6 +3270,7 @@ mod tests {
                 filter_detected: String::new(),
                 filter_excluded: String::new(),
                 filter_always_muted: String::new(),
+                last_refresh: None,
             });
         });
         unsafe { create_dialog_window().expect("settings window") }
@@ -3847,7 +3909,7 @@ mod tests {
                 let c = windows::Win32::Graphics::Gdi::GetPixel(mem, x, y);
                 (c.0 & 0xFF) as u32 | (c.0 & 0xFF00) | (c.0 & 0xFF0000)
             };
-            for ctl in layout(hwnd) {
+            for ctl in layout(hwnd).iter() {
                 let (cx, _cy) = (
                     (ctl.rect.left + ctl.rect.right) / 2,
                     (ctl.rect.top + ctl.rect.bottom) / 2,

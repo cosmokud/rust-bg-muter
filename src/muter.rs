@@ -60,12 +60,6 @@ impl MuterEngine {
     /// Updates the engine state and applies muting logic
     /// Optimized: only refreshes audio sessions periodically, not every poll
     pub fn update(&mut self) -> Result<UpdateResult, Box<dyn std::error::Error>> {
-        let config = self.config.read();
-        let muting_enabled = config.muting_enabled;
-        let excluded_apps = config.excluded_apps.clone();
-        let always_muted_apps = config.always_muted_apps.clone();
-        drop(config);
-
         // Get current foreground PID
         let foreground_pid = get_foreground_pid();
         let previous_foreground_pid = self.last_foreground_pid;
@@ -76,8 +70,9 @@ impl MuterEngine {
         let should_refresh = foreground_changed
             || self.last_session_refresh.elapsed() >= self.session_refresh_interval;
 
-        if !should_refresh && !foreground_changed {
-            // No changes, skip expensive operations
+        if !should_refresh {
+            // Nothing changed: the poll returns before it copies the rule sets, so an idle
+            // app allocates nothing per tick.
             return Ok(UpdateResult {
                 foreground_pid,
                 foreground_changed: false,
@@ -86,14 +81,15 @@ impl MuterEngine {
             });
         }
 
+        let config = self.config.read();
+        let muting_enabled = config.muting_enabled;
+        let excluded_apps = config.excluded_apps.clone();
+        let always_muted_apps = config.always_muted_apps.clone();
+        drop(config);
+
         // Refresh audio sessions (expensive COM operation)
-        let sessions = if should_refresh {
-            self.last_session_refresh = Instant::now();
-            self.audio_manager.get_sessions()
-        } else {
-            // Use cached session info, just update mute states
-            Vec::new()
-        };
+        self.last_session_refresh = Instant::now();
+        let sessions = self.audio_manager.get_sessions();
 
         // Track which PIDs we've seen this update
         let mut seen_pids = HashSet::new();
@@ -103,8 +99,11 @@ impl MuterEngine {
             seen_pids.insert(session.process_id);
 
             let is_foreground = foreground_pid == Some(session.process_id);
-            let is_excluded = excluded_apps.contains(&session.process_name.to_lowercase());
-            let is_always_muted = always_muted_apps.contains(&session.process_name.to_lowercase());
+            // One lowercased name per session, not one per rule set: the rule sets are
+            // already lowercased, so this is the only allocation the lookup needs.
+            let name = session.process_name.to_lowercase();
+            let is_excluded = excluded_apps.contains(&name);
+            let is_always_muted = always_muted_apps.contains(&name);
             let is_own_process = session.process_id == self.own_pid;
 
             let app_state = self
@@ -173,8 +172,9 @@ impl MuterEngine {
                 }
 
                 let is_foreground = foreground_pid == Some(*pid);
-                let is_excluded = excluded_apps.contains(&state.process_name.to_lowercase());
-                let is_always_muted = always_muted_apps.contains(&state.process_name.to_lowercase());
+                let name = state.process_name.to_lowercase();
+                let is_excluded = excluded_apps.contains(&name);
+                let is_always_muted = always_muted_apps.contains(&name);
 
                 if muting_enabled && *pid != self.own_pid {
                     if is_always_muted {

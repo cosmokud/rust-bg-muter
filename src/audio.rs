@@ -13,7 +13,9 @@ use windows::Win32::Media::Audio::{
     IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
     MMDeviceEnumerator,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
+};
 use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION,
@@ -64,11 +66,25 @@ impl AudioManager {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-            // Enumerate sessions from all default render roles for better coverage
+            // Enumerate sessions from all default render roles for better coverage. The
+            // roles resolve to the same endpoint on almost every machine, and a device
+            // walked twice redoes its whole COM enumeration - session count, process id and
+            // process-name lookup per session - for the same answers, so each endpoint is
+            // visited once.
             let mut devices: Vec<IMMDevice> = Vec::new();
+            let mut seen_devices: HashSet<String> = HashSet::new();
             for role in [eConsole, eMultimedia, eCommunications] {
                 if let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, role) {
-                    devices.push(device);
+                    match device_id(&device) {
+                        Some(id) => {
+                            if seen_devices.insert(id) {
+                                devices.push(device);
+                            }
+                        }
+                        // No id to compare against: keep the device rather than drop one
+                        // the other roles did not report.
+                        None => devices.push(device),
+                    }
                 }
             }
 
@@ -135,13 +151,34 @@ impl AudioManager {
     /// hardware, and a reset that quietly turned the speakers to 100% (or unmuted them)
     /// would be a different, louder action than what was asked for.
     pub fn reset_all(&self) -> usize {
-        // A session write is what the user sees in the mixer, and the endpoint above it
-        // is left alone, so the order a session is visited in does not matter.
-        let changed = reset_sessions(&self.sessions);
+        // The cache is emptied into this pass, so every interface is written through while
+        // this function owns its one reference. Going through a raw pointer cloned out of
+        // the cache instead would leave two owners of a single reference, and the first of
+        // them to drop would free an interface the cache still pointed at.
+        let sessions: Vec<ISimpleAudioVolume> = {
+            let mut guard = self.sessions.lock();
+            std::mem::take(&mut *guard)
+                .into_values()
+                .map(|session| session.volume)
+                .collect()
+        };
 
-        // The cached session interfaces now describe a muted mixer; the muter repopulates
-        // them on its next poll, and a stale entry here would be read as the old level.
-        self.sessions.lock().clear();
+        // A session write is what the user sees in the mixer, and the endpoint above it is
+        // left alone, so the order a session is visited in does not matter.
+        let mut changed = 0;
+        for volume in &sessions {
+            let landed = unsafe {
+                let unmuted = volume.SetMute(FALSE, std::ptr::null()).is_ok();
+                let full = volume.SetMasterVolume(1.0, std::ptr::null()).is_ok();
+                unmuted && full
+            };
+            if landed {
+                changed += 1;
+            }
+        }
+
+        // The cache is empty now, describing a mixer the muter has not read yet; it is
+        // repopulated on the next poll.
         changed
     }
 
@@ -161,30 +198,6 @@ impl Default for AudioManager {
     fn default() -> Self {
         Self::new().expect("Failed to create AudioManager")
     }
-}
-
-/// Unmutes every live session and sets it to full volume, across every render device -
-/// not just the default ones, so a session on a secondary output is reset too.
-fn reset_sessions(sessions: &Mutex<HashMap<u32, CachedSession>>) -> usize {
-    let cached: Vec<isize> = {
-        let guard = sessions.lock();
-        guard.values().map(|s| s.volume.as_raw() as isize).collect()
-    };
-    let mut changed = 0;
-    for raw in cached {
-        // The cached interface owns one reference; this one is dropped with `volume`, so
-        // the cache stays valid for the next poll.
-        let volume = unsafe { ISimpleAudioVolume::from_raw(raw as *mut std::ffi::c_void) };
-        let landed = unsafe {
-            let unmuted = volume.SetMute(FALSE, std::ptr::null()).is_ok();
-            let full = volume.SetMasterVolume(1.0, std::ptr::null()).is_ok();
-            unmuted && full
-        };
-        if landed {
-            changed += 1;
-        }
-    }
-    changed
 }
 
 /// Collects sessions for a specific audio device
@@ -329,15 +342,36 @@ fn get_session_display_name(control: &IAudioSessionControl2) -> Option<String> {
         if let Ok(name_ptr) = control.GetDisplayName() {
             if !name_ptr.is_null() {
                 let len = (0..).take_while(|&i| *name_ptr.0.add(i) != 0).count();
-                if len > 0 {
+                let name = if len > 0 {
                     let slice = std::slice::from_raw_parts(name_ptr.0, len);
-                    let name = OsString::from_wide(slice).to_string_lossy().to_string();
-                    if !name.is_empty() && !name.starts_with('@') {
-                        return Some(name);
-                    }
+                    OsString::from_wide(slice).to_string_lossy().to_string()
+                } else {
+                    String::new()
+                };
+                // WASAPI allocates this string with `CoTaskMemAlloc` and hands its
+                // ownership over: not freeing it leaked a block per session per refresh,
+                // which grew the working set for as long as the app ran.
+                CoTaskMemFree(Some(name_ptr.0 as *const std::ffi::c_void));
+                if !name.is_empty() && !name.starts_with('@') {
+                    return Some(name);
                 }
             }
         }
         None
     }
+}
+
+/// Endpoint id of `device`, copied and then freed: `GetId` hands back a
+/// `CoTaskMemAlloc`ed string whose ownership passes to the caller.
+unsafe fn device_id(device: &IMMDevice) -> Option<String> {
+    let id = device.GetId().ok()?;
+    if id.is_null() {
+        return None;
+    }
+    let len = (0..).take_while(|&i| *id.0.add(i) != 0).count();
+    let text = OsString::from_wide(std::slice::from_raw_parts(id.0, len))
+        .to_string_lossy()
+        .to_string();
+    CoTaskMemFree(Some(id.0 as *const std::ffi::c_void));
+    Some(text)
 }

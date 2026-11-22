@@ -40,6 +40,8 @@ pub enum TrayCommand {
 pub struct SystemTray {
     _tray_icon: TrayIcon,
     menu_toggle: CheckMenuItem,
+    /// The way back from disabled, so it is only enabled while muting is off.
+    menu_mute_all: MenuItem,
     command_rx: Receiver<TrayCommand>,
     last_muting_state: bool,
     exit_flag: Arc<AtomicBool>,
@@ -124,6 +126,7 @@ impl SystemTray {
         Ok(Self {
             _tray_icon: tray_icon,
             menu_toggle,
+            menu_mute_all,
             command_rx,
             last_muting_state: muting_enabled,
             exit_flag,
@@ -139,6 +142,9 @@ impl SystemTray {
 
         // Check mark carries the state; the label stays stable.
         self.menu_toggle.set_checked(muting_enabled);
+        // "Mute all now" only exists as the way back from disabled: leaving it disabled
+        // after a toggle-off made the one entry that would undo it unusable until restart.
+        self.menu_mute_all.set_enabled(!muting_enabled);
 
         let tooltip = tooltip_for(muting_enabled);
         let _ = self._tray_icon.set_tooltip(Some(tooltip));

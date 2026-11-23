@@ -26,9 +26,11 @@ The app runs quietly in the system tray, tracks the current foreground process, 
   - Detected audio apps list
   - Search and filtering for detected apps
   - Add/remove flows for Excluded and Always Muted lists
-  - Poll interval configuration (`100`-`2000` ms)
+  - Double-click a row to move an app between the detected, excluded and always-muted lists
+  - Poll interval steppers (`100`-`2000` ms)
   - Start with Windows toggle
-  - Start minimized toggle
+  - `Reset Mixer` to redo the Windows Volume Mixer reset
+  - `Edit Config` to open `config.json` in your editor
 - Persistent configuration in `%APPDATA%\rust-bg-muter\config.json`
 - Automatic unmute cleanup for app-muted sessions on exit
 
@@ -66,7 +68,6 @@ Example:
   "always_muted_apps": ["steam.exe"],
   "muting_enabled": true,
   "poll_interval_ms": 500,
-  "start_minimized": false,
   "minimize_to_tray": true,
   "minimize_button_to_tray": true,
   "start_with_windows": false,
@@ -104,7 +105,14 @@ src/
 ├── muter.rs           # Foreground-aware muting engine and rules
 ├── process.rs         # Foreground process detection
 ├── tray.rs            # Native tray menu and message pump integration
-├── settings_dialog.rs # Native Win32 settings UI
+├── settings_dialog.rs # Native Win32 settings UI: layout, painting, input
+├── field.rs           # Single-line text field editing rules
+├── od_controls.rs     # Ownerdraw paint helpers (toggles, buttons, cards)
+├── theme.rs           # Dialog theming, fonts, brushes, icons
+├── icon_cache.rs      # Per-executable icon extraction and on-disk cache
+├── mixer_reset.rs     # Windows Volume Mixer reset
+├── confirm_dialog.rs  # Native confirmation prompt
+├── shell.rs           # ShellExecute helper (open config in an editor)
 ├── config.rs          # JSON config persistence and defaults
 └── startup.rs         # Windows startup registry integration
 ```

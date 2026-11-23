@@ -209,12 +209,12 @@ fn run_tray_loop(
                         muting_enabled.clone(),
                         audio_manager,
                     );
-                    
+
                     // Sync muting state after dialog closes (user may have changed it)
                     let new_enabled = config.read().muting_enabled;
                     muting_enabled.store(new_enabled, Ordering::SeqCst);
                     tray.update_state(new_enabled);
-                    
+
                     // If muting was disabled, unmute everything
                     if !new_enabled {
                         if let Some(mut eng) = engine.try_write() {
@@ -237,7 +237,6 @@ fn run_tray_loop(
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

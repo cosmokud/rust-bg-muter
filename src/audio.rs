@@ -1,23 +1,21 @@
 //! Windows Audio Session API (WASAPI) module
 //! Provides efficient, low-overhead audio session management.
 
+use crate::process;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::Arc;
-use crate::process;
 use windows::core::Interface;
 use windows::Win32::Foundation::{FALSE, TRUE};
 use windows::Win32::Media::Audio::{
-    eCommunications, eConsole, eMultimedia, eRender, IAudioSessionControl2,
-    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
-    MMDeviceEnumerator,
+    eCommunications, eConsole, eMultimedia, eRender, IAudioSessionControl2, IAudioSessionManager2,
+    IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
-
 
 /// Represents an audio session with minimal metadata
 #[derive(Debug, Clone)]
@@ -232,8 +230,8 @@ fn collect_sessions_for_device(
                             display_name_of(pid)
                         };
 
-                        let display_name =
-                            get_session_display_name(&control2).unwrap_or_else(|| process_name.clone());
+                        let display_name = get_session_display_name(&control2)
+                            .unwrap_or_else(|| process_name.clone());
 
                         if pid != 0
                             && process_name == "System Sounds"
@@ -254,15 +252,14 @@ fn collect_sessions_for_device(
                                 });
                             }
 
-                            if !sessions.contains_key(&pid) {
-                                sessions.insert(
-                                    pid,
-                                    CachedSession {
-                                        volume,
-                                        process_name,
-                                        display_name,
-                                    },
-                                );
+                            if let std::collections::hash_map::Entry::Vacant(slot) =
+                                sessions.entry(pid)
+                            {
+                                slot.insert(CachedSession {
+                                    volume,
+                                    process_name,
+                                    display_name,
+                                });
                             }
                         }
                     }
@@ -291,11 +288,11 @@ fn normalize_system_process_name(name: String) -> String {
 
     // Known Windows system sound processes - these should be tagged as "System Sounds"
     const SYSTEM_SOUND_PROCESSES: &[&str] = &[
-        "audiodg.exe",           // Windows Audio Device Graph Isolation
-        "svchost.exe",           // Service Host (often handles system sounds)
-        "dwm.exe",               // Desktop Window Manager
-        "systemsounds.exe",      // System Sounds
-        "rundll32.exe",          // Often used for playing system sounds
+        "audiodg.exe",      // Windows Audio Device Graph Isolation
+        "svchost.exe",      // Service Host (often handles system sounds)
+        "dwm.exe",          // Desktop Window Manager
+        "systemsounds.exe", // System Sounds
+        "rundll32.exe",     // Often used for playing system sounds
     ];
 
     for sys_proc in SYSTEM_SOUND_PROCESSES {

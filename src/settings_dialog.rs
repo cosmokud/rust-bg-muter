@@ -22,8 +22,8 @@ use parking_lot::{Mutex, RwLock};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use windows::core::PCWSTR;
@@ -32,11 +32,10 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, DeleteDC,
     DeleteObject, EndPaint, GetDC, GetTextExtentPoint32W, IntersectClipRect, InvalidateRect,
-    ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBrushOrgEx, SetStretchBltMode,
-    StretchBlt, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    FF_DONTCARE, FW_NORMAL, HALFTONE, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_TT_PRECIS,
-    PAINTSTRUCT, SRCCOPY,
+    ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchBlt,
+    UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE,
+    FW_NORMAL, HALFTONE, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_TT_PRECIS, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -966,8 +965,8 @@ unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
             return hit.map(|i| HICON(i as *mut c_void));
         }
         let path = crate::process::path(pid).or_else(|| path_for_name(name));
-        let icon = icon_of_path(path.as_deref().unwrap_or(name))
-            .or_else(|| icon_cache::icon_for(name));
+        let icon =
+            icon_of_path(path.as_deref().unwrap_or(name)).or_else(|| icon_cache::icon_for(name));
         ICON_OF_PID
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -984,8 +983,7 @@ unsafe fn row_icon(pid: u32, text: &str) -> Option<HICON> {
         return hit.map(|i| HICON(i as *mut c_void));
     }
     let path = path_for_name(name);
-    let icon = icon_of_path(path.as_deref().unwrap_or(name))
-        .or_else(|| icon_cache::icon_for(name));
+    let icon = icon_of_path(path.as_deref().unwrap_or(name)).or_else(|| icon_cache::icon_for(name));
     ICON_OF_NAME
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -1039,9 +1037,12 @@ type Shapes<'a> = &'a [(Shape, RECT, i32, u32)];
 /// pair identifies the colours too; the rect carries the DPI-scaled geometry.
 type SsKey = (i32, [i32; 4], u32, bool, bool, bool, bool, bool, u32);
 
+/// One cached buffer: the key it holds, the memory DC, the bitmap selected into it, its size.
+type SsSlot = (SsKey, HDC, HBITMAP, i32, i32);
+
 // One slot per control: state permutations would otherwise pile up megabytes of bitmaps.
 thread_local! {
-    static SS: RefCell<HashMap<i32, (SsKey, HDC, HBITMAP, i32, i32)>> = RefCell::new(HashMap::new());
+    static SS: RefCell<HashMap<i32, SsSlot>> = RefCell::new(HashMap::new());
 }
 
 // Creation count, so a test can prove a repaint of an unchanged toggle reuses the bitmap.
@@ -1056,6 +1057,9 @@ thread_local! {
 /// it instead, averaged down with everything else.
 /// `bg` is the flat surface behind `rc`; the rounded corners show it through.
 /// `state` is (on, hot, pressed, focused) and only selects the cache slot.
+// 8 distinct drawing inputs, and a single call site: a struct would be built only to be
+// destructured again.
+#[allow(clippy::too_many_arguments)]
 unsafe fn aa_shape(
     hwnd: HWND,
     hdc: HDC,
@@ -1100,13 +1104,7 @@ unsafe fn aa_shape(
 }
 
 /// Memory DC holding `shapes` at AA_SUPERSAMPLE scale over `bg`, created once per `key`.
-unsafe fn ss_buffer(
-    hwnd: HWND,
-    key: &SsKey,
-    rc: &RECT,
-    bg: u32,
-    shapes: Shapes,
-) -> Option<HDC> {
+unsafe fn ss_buffer(hwnd: HWND, key: &SsKey, rc: &RECT, bg: u32, shapes: Shapes) -> Option<HDC> {
     SS.with(|ss| {
         let mut ss = ss.borrow_mut();
         if let Some((held, dc, _, _, _)) = ss.get(&key.0) {
@@ -1156,9 +1154,7 @@ unsafe fn ss_buffer(
                 bottom: at_y(rect.bottom),
             };
             match shape {
-                Shape::Round => {
-                    od_controls::round(dc, &r, radius * AA_SUPERSAMPLE, *color, None)
-                }
+                Shape::Round => od_controls::round(dc, &r, radius * AA_SUPERSAMPLE, *color, None),
                 Shape::Dot => od_controls::dot(dc, &r, *color),
             }
         }
@@ -1436,7 +1432,17 @@ unsafe fn draw_stepper(hdc: HDC, ctl: &Ctl, p: &Palette, window_focused: bool) {
     let hot = hot() == ctl.id;
     let pressed = pressed() == ctl.id;
     let focused = window_focused && matches!(focus(), Focus::Button(f) if f == ctl.id);
-    od_controls::fill(hdc, &rc, if pressed { p.pressed } else if hot { p.hover } else { p.well });
+    od_controls::fill(
+        hdc,
+        &rc,
+        if pressed {
+            p.pressed
+        } else if hot {
+            p.hover
+        } else {
+            p.well
+        },
+    );
     let color = if pressed || hot || focused {
         p.accent
     } else {
@@ -1605,7 +1611,13 @@ unsafe fn draw_field(hdc: HDC, ctl: &Ctl, p: &Palette, dip: Dip, window_focused:
     let rc = ctl.rect;
     // Behind the steppers the box keeps its own well: the field draws under them, so the
     // pair only has to paint its arrows.
-    od_controls::round(hdc, &rc, dip.px(4.0), p.well, Some(if focused { p.accent } else { p.hairline }));
+    od_controls::round(
+        hdc,
+        &rc,
+        dip.px(4.0),
+        p.well,
+        Some(if focused { p.accent } else { p.hairline }),
+    );
     let inner = field_inner(ctl);
     let font = ui_font();
     let (text, selection) = with_field(ctl.id, |f| (f.text.clone(), f.selection()));
@@ -3190,7 +3202,10 @@ mod tests {
                 let overlap =
                     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
                 let containment = CARDS.contains(id_a) != CARDS.contains(id_b);
-                let stepped = matches!((kind_a, kind_b), (Kind::Stepper, Kind::Edit) | (Kind::Edit, Kind::Stepper));
+                let stepped = matches!(
+                    (kind_a, kind_b),
+                    (Kind::Stepper, Kind::Edit) | (Kind::Edit, Kind::Stepper)
+                );
                 assert!(
                     !overlap || containment || stepped,
                     "controls {id_a} and {id_b} overlap"
@@ -3289,11 +3304,19 @@ mod tests {
 
             set_field(ID_EDIT_POLL_INTERVAL, "1950".to_string());
             handle_command(hwnd, ID_BTN_POLL_UP, 0);
-            assert_eq!(field_text(ID_EDIT_POLL_INTERVAL), "2000", "no clamp at the top");
+            assert_eq!(
+                field_text(ID_EDIT_POLL_INTERVAL),
+                "2000",
+                "no clamp at the top"
+            );
 
             set_field(ID_EDIT_POLL_INTERVAL, "150".to_string());
             handle_command(hwnd, ID_BTN_POLL_DOWN, 0);
-            assert_eq!(field_text(ID_EDIT_POLL_INTERVAL), "100", "no clamp at the bottom");
+            assert_eq!(
+                field_text(ID_EDIT_POLL_INTERVAL),
+                "100",
+                "no clamp at the bottom"
+            );
 
             // An empty box still steps to a usable number instead of losing the press.
             set_field(ID_EDIT_POLL_INTERVAL, String::new());
@@ -3740,7 +3763,9 @@ mod tests {
         assert_eq!(toggles.len(), 2, "two toggles");
         for (i, a) in toggles.iter().enumerate() {
             assert!(
-                a.top >= card.top && a.bottom <= card.bottom && a.left >= card.left
+                a.top >= card.top
+                    && a.bottom <= card.bottom
+                    && a.left >= card.left
                     && a.right <= card.right,
                 "toggle {i} at {a:?} is outside the settings card {card:?}"
             );
@@ -3790,7 +3815,11 @@ mod tests {
                         // The centre of a card is behind its own list, so sample the caption row.
                         let y = ctl.rect.top + dip_of().px(10.0);
                         let seen = at(cx, y);
-                        assert_eq!(seen, p.card, "card {} centre is not the card colour", ctl.id);
+                        assert_eq!(
+                            seen, p.card,
+                            "card {} centre is not the card colour",
+                            ctl.id
+                        );
                     }
                     Kind::Toggle => {
                         // Sample the track, never the knob: the knob sits on the left when
@@ -3806,7 +3835,8 @@ mod tests {
                         let want = if on { p.accent } else { p.well };
                         assert_eq!(
                             seen, want,
-                            "toggle {} pill is not drawn at its rect {x},{y}", ctl.id
+                            "toggle {} pill is not drawn at its rect {x},{y}",
+                            ctl.id
                         );
                     }
                     // A list is filled with rows and a field with text, so the body colour is
@@ -3825,7 +3855,11 @@ mod tests {
                         assert!(
                             total > 0 && same * 2 > total,
                             "{} {} body covers {same}/{total} of its rect",
-                            if ctl.kind == Kind::List { "list" } else { "field" },
+                            if ctl.kind == Kind::List {
+                                "list"
+                            } else {
+                                "field"
+                            },
                             ctl.id
                         );
                     }
@@ -3888,7 +3922,8 @@ mod tests {
             paint_frame(hwnd, mem, &rc);
 
             let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO::default();
-            bmi.bmiHeader.biSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biSize =
+                std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
             bmi.bmiHeader.biWidth = w;
             bmi.bmiHeader.biHeight = -h;
             bmi.bmiHeader.biPlanes = 1;
@@ -3944,7 +3979,7 @@ mod tests {
             od_controls::fill(dc, &full, p.card);
             // Give the toggle keyboard focus: that is what used to draw the ring.
             set_focus_value(Focus::Toggle(ctl.id));
-            draw_toggle(hwnd, dc, &ctl, &p, dip_of(), true, &cards);
+            draw_toggle(hwnd, dc, ctl, &p, dip_of(), true, &cards);
 
             let s = |v: f32| dip_of().px(v);
             let pill = RECT {

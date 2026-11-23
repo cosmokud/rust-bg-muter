@@ -134,7 +134,7 @@ fn main() {
     match res.compile() {
         Ok(_) => {
             println!("cargo:warning=Windows resources compiled successfully");
-            
+
             // For MSVC, explicitly link the resource library as a static library
             // This overrides winres's default dylib linking
             if target_env == "msvc" {

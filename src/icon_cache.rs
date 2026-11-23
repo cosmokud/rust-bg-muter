@@ -33,7 +33,7 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, DrawIconEx, HICON, ICONINFO, DI_MASK, DI_NORMAL,
+    CreateIconIndirect, DrawIconEx, DI_MASK, DI_NORMAL, HICON, ICONINFO,
 };
 
 /// File name inside the config directory.
@@ -61,10 +61,12 @@ static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 static HANDLES: OnceLock<Mutex<HashMap<String, Option<isize>>>> = OnceLock::new();
 
 fn cache() -> &'static Mutex<Cache> {
-    CACHE.get_or_init(|| Mutex::new(Cache {
-        icons: BTreeMap::new(),
-        loaded: false,
-    }))
+    CACHE.get_or_init(|| {
+        Mutex::new(Cache {
+            icons: BTreeMap::new(),
+            loaded: false,
+        })
+    })
 }
 
 fn handles() -> &'static Mutex<HashMap<String, Option<isize>>> {
@@ -278,8 +280,8 @@ unsafe fn draw_and_encode(dc: HDC, bits: *mut u8, icon: HICON, size: i32) -> Opt
     let color = std::slice::from_raw_parts(bits, len).to_vec();
 
     let mut rgba = Vec::with_capacity(len);
-    if color.chunks_exact(4).any(|px| px[3] != 0) {
-        for px in color.chunks_exact(4) {
+    if color.as_chunks::<4>().0.iter().any(|px| px[3] != 0) {
+        for px in color.as_chunks::<4>().0 {
             rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
         }
     } else {
@@ -288,7 +290,7 @@ unsafe fn draw_and_encode(dc: HDC, bits: *mut u8, icon: HICON, size: i32) -> Opt
         std::ptr::write_bytes(bits, 0, len);
         let _ = DrawIconEx(dc, 0, 0, icon, size, size, 0, HBRUSH::default(), DI_MASK);
         let mask = std::slice::from_raw_parts(bits, len);
-        for (px, m) in color.chunks_exact(4).zip(mask.chunks_exact(4)) {
+        for (px, m) in color.as_chunks::<4>().0.iter().zip(mask.as_chunks::<4>().0) {
             // White in the mask = the background shows through.
             let alpha = if m[0] > 0x80 { 0 } else { 255 };
             rgba.extend_from_slice(&[px[2], px[1], px[0], alpha]);
@@ -330,7 +332,12 @@ unsafe fn decode(png: &[u8]) -> Option<HICON> {
         let len = (w * h * 4) as usize;
         let dst = std::slice::from_raw_parts_mut(bits, len);
         // PNG hands out RGBA; a DIB takes BGRA.
-        for (dst, px) in dst.chunks_exact_mut(4).zip(rgba.as_raw().chunks_exact(4)) {
+        for (dst, px) in dst
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(rgba.as_raw().as_chunks::<4>().0)
+        {
             dst[0] = px[2];
             dst[1] = px[1];
             dst[2] = px[0];

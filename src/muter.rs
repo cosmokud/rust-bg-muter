@@ -324,7 +324,13 @@ mod tests {
             Action::Unmute
         );
         assert_eq!(
-            decide(&row(2, "music.exe", false), &config, Some(1), OWN_PID, false),
+            decide(
+                &row(2, "music.exe", false),
+                &config,
+                Some(1),
+                OWN_PID,
+                false
+            ),
             Action::Mute
         );
     }
@@ -335,17 +341,35 @@ mod tests {
     fn rule_sets_outrank_the_foreground() {
         let config = rules(&["spotify.exe"], &["steam.exe"]);
         assert_eq!(
-            decide(&row(3, "Steam.exe", false), &config, Some(3), OWN_PID, false),
+            decide(
+                &row(3, "Steam.exe", false),
+                &config,
+                Some(3),
+                OWN_PID,
+                false
+            ),
             Action::Mute,
             "an always-muted app must stay muted while focused"
         );
         assert_eq!(
-            decide(&row(4, "Spotify.exe", true), &config, Some(1), OWN_PID, false),
+            decide(
+                &row(4, "Spotify.exe", true),
+                &config,
+                Some(1),
+                OWN_PID,
+                false
+            ),
             Action::Leave,
             "a mute we do not own is the user's"
         );
         assert_eq!(
-            decide(&row(4, "spotify.exe", true), &config, Some(1), OWN_PID, true),
+            decide(
+                &row(4, "spotify.exe", true),
+                &config,
+                Some(1),
+                OWN_PID,
+                true
+            ),
             Action::Unmute
         );
     }

@@ -207,11 +207,27 @@ Licensed under the MIT License. See [LICENSE](LICENSE).
 
 ---
 
-## Part of Rust Windows Series
+<h2 align="center">Part of Rust Windows Series</h2>
 
-<p align="center">
-  <a href="https://github.com/cosmokud/rust-bg-muter"><img src="assets/series/rust-bg-muter.svg" width="56" height="56" alt="Rust Background Muter" /></a>
-  <a href="https://github.com/cosmokud/rust-image-viewer"><img src="assets/series/rust-image-viewer.svg" width="56" height="56" alt="Rust Image Viewer" /></a>
-  <a href="https://github.com/cosmokud/rust-hover-preview"><img src="assets/series/rust-hover-preview.svg" width="56" height="56" alt="Rust Hover Preview" /></a>
-  <a href="https://github.com/cosmokud/rust-win-cleaner"><img src="assets/series/rust-win-cleaner.svg" width="56" height="56" alt="Rust Win Cleaner" /></a>
-</p>
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="130">
+      <a href="https://github.com/cosmokud/rust-bg-muter"><img src="assets/series/rust-bg-muter.svg" width="56" height="56" alt="Rust Background Muter" /></a><br/>
+      <sub><b>Background Muter</b></sub>
+    </td>
+    <td align="center" width="130">
+      <a href="https://github.com/cosmokud/rust-image-viewer"><img src="assets/series/rust-image-viewer.svg" width="56" height="56" alt="Rust Image Viewer" /></a><br/>
+      <sub><b>Image Viewer</b></sub>
+    </td>
+    <td align="center" width="130">
+      <a href="https://github.com/cosmokud/rust-hover-preview"><img src="assets/series/rust-hover-preview.svg" width="56" height="56" alt="Rust Hover Preview" /></a><br/>
+      <sub><b>Hover Preview</b></sub>
+    </td>
+    <td align="center" width="130">
+      <a href="https://github.com/cosmokud/rust-win-cleaner"><img src="assets/series/rust-win-cleaner.svg" width="56" height="56" alt="Rust Win Cleaner" /></a><br/>
+      <sub><b>Win Cleaner</b></sub>
+    </td>
+  </tr>
+</table>
+</div>

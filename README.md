@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/cosmokud/rust-bg-muter/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cosmokud/rust-bg-muter?style=for-the-badge" /></a>
+  <a href="https://github.com/cosmokud/rust-bg-muter/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cosmokud/rust-bg-muter?style=for-the-badge&color=a32b8d" /></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99%2B-orange?style=for-the-badge&logo=rust" />
   <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-blue?style=for-the-badge&logo=windows" />
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-111111?style=for-the-badge" /></a>
@@ -31,15 +31,15 @@
   <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
-<p align="center">
-  <img src="docs/images/settings.jpg" width="720" alt="Rust Background Muter settings window" />
-</p>
-
 ---
 
 ## Overview
 
 The app runs quietly in the system tray, tracks the current foreground process, and applies muting rules to active audio sessions through WASAPI. It is designed for low overhead and predictable behavior, with settings persisted in a local JSON config file.
+
+<p align="center">
+  <img src="docs/images/settings.jpg" width="720" alt="Rust Background Muter settings window" />
+</p>
 
 ## Features
 

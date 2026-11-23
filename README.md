@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  A lightweight Windows 10 &amp; 11 system tray utility that automatically mutes background<br/>
-  and unfocused applications while keeping your foreground app audible — native WASAPI, no virtual audio drivers, zero GPU usage, and sub-1% idle CPU.
+  A free, open-source, lightweight Windows 10 &amp; 11 system tray utility that automatically mutes<br/>
+  background, inactive, and unfocused applications while keeping your foreground app audible — native WASAPI, portable or installer, no virtual audio drivers, zero GPU usage, and sub-1% idle CPU.
 </p>
 
 <p align="center">
@@ -29,6 +29,7 @@
   <a href="#build-from-source">Build</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#development">Develop</a> ·
+  <a href="#privacy">Privacy</a> ·
   <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
@@ -36,7 +37,7 @@
 
 ## Overview
 
-Rust Background Muter runs quietly in the Windows system tray, tracks the currently focused foreground window, and automatically mutes audio from unfocused background applications via the native Windows Audio Session API (WASAPI).
+Rust Background Muter is a free, open-source Windows audio utility that runs quietly in the system tray, tracks the currently focused foreground window, and automatically mutes audio from inactive and unfocused background applications via the native Windows Audio Session API (WASAPI).
 
 Whether you are Alt-Tabbing out of a game, switching between browser tabs and video players, or keeping distractions silent while working, it manages per-application audio cleanly with minimal overhead. All preferences are saved in a simple local JSON configuration file—no background services, no Electron bloat, and no virtual audio drivers required.
 
@@ -46,11 +47,13 @@ Whether you are Alt-Tabbing out of a game, switching between browser tabs and vi
 
 ## Features
 
-- **Automatic background muting:** Keeps only the active foreground application audible and mutes unfocused windows in real time
+- **Automatic background muting:** Keeps only the active foreground application audible and mutes inactive or unfocused windows in real time
 - **Excluded apps list (allowlist):** Keep selected apps like Spotify, Discord, or voice chat always audible in the background
 - **Always-muted apps list:** Force specific applications to stay muted at all times, even when focused
 - **Real-time audio session detection:** Automatically detects active Windows audio sessions as apps open and close
 - **Ultra-lightweight native Win32 UI:** Zero GPU/VRAM usage and sub-1% idle CPU cost using native Win32 windows and GDI rendering
+- **100% offline & private:** Zero telemetry, analytics, crash reporting, or network code — see [Privacy](#privacy)
+- **Installer or portable `.exe`:** Run standalone or install per-user with no administrator privileges required
 - **Native system tray controls:**
   - Toggle automatic muting on or off
   - Open the settings dialog (or double-click the tray icon)
@@ -71,7 +74,7 @@ Whether you are Alt-Tabbing out of a game, switching between browser tabs and vi
 
 Download the latest Windows 10 / Windows 11 build from the repository's Releases page:
 
-- [Download from GitHub Releases](../../releases)
+- [Download the latest release from GitHub](https://github.com/cosmokud/rust-bg-muter/releases/latest)
 
 Every release includes two options:
 
@@ -114,7 +117,7 @@ Run Rust Background Muter in the system tray with muting enabled. As soon as you
 
 ### Can I keep Spotify, Discord, or my browser playing while other background apps are muted?
 
-Yes. Open **Settings** and add `spotify.exe`, `discord.exe`, or any other executable to the **Excluded** list. Excluded apps remain audible even when they are in the background.
+Yes. Open **Settings** and add `spotify.exe`, `discord.exe`, or any other executable to the **Excluded** list. Excluded apps remain audible even when they are inactive or in the background.
 
 ### Does this require virtual audio drivers or administrator privileges?
 
@@ -123,6 +126,14 @@ No. Rust Background Muter uses Windows' built-in WASAPI audio session controls d
 ### How is this different from the Windows Volume Mixer or EarTrumpet?
 
 Windows Volume Mixer and EarTrumpet are designed for _manual_ per-app volume control. Rust Background Muter _automates_ muting based on window focus, so you do not have to manually mute and unmute apps every time you switch windows.
+
+| Capability                               | Rust Background Muter        | Windows Volume Mixer  | EarTrumpet            |
+| :--------------------------------------- | :--------------------------- | :-------------------- | :-------------------- |
+| **Primary focus**                        | Automatic focus-based muting | Manual per-app volume | Manual per-app volume |
+| **Auto-mute inactive & background apps** | Yes (real-time)              | No                    | No                    |
+| **Excluded (always audible) allowlist**  | Yes                          | No                    | No                    |
+| **Always-muted app list**                | Yes                          | Manual toggle         | Manual toggle         |
+| **No virtual audio drivers**             | Yes (native WASAPI)          | Built-in              | Built-in              |
 
 ### Will my apps stay muted if I close Rust Background Muter?
 

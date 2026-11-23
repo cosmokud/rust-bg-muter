@@ -204,3 +204,14 @@ Please report vulnerabilities privately, not in a public issue. See [SECURITY.md
 ## License
 
 Licensed under the MIT License. See [LICENSE](LICENSE).
+
+---
+
+## Part of Rust Windows Series
+
+<p align="center">
+  <a href="https://github.com/cosmokud/rust-bg-muter"><img src="assets/series/rust-bg-muter.svg" width="56" height="56" alt="Rust Background Muter" /></a>
+  <a href="https://github.com/cosmokud/rust-image-viewer"><img src="assets/series/rust-image-viewer.svg" width="56" height="56" alt="Rust Image Viewer" /></a>
+  <a href="https://github.com/cosmokud/rust-hover-preview"><img src="assets/series/rust-hover-preview.svg" width="56" height="56" alt="Rust Hover Preview" /></a>
+  <a href="https://github.com/cosmokud/rust-win-cleaner"><img src="assets/series/rust-win-cleaner.svg" width="56" height="56" alt="Rust Win Cleaner" /></a>
+</p>

@@ -82,8 +82,6 @@ const ID_BTN_POLL_DOWN: i32 = 125;
 const POLL_STEP_MS: u64 = 100;
 const POLL_MIN_MS: u64 = 100;
 const POLL_MAX_MS: u64 = 2000;
-const ID_LABEL_CONFIG: i32 = 124;
-const ID_LABEL_PATH: i32 = 125;
 const ID_EDIT_FILTER_EXCLUDED: i32 = 127;
 const ID_EDIT_FILTER_ALWAYS_MUTED: i32 = 128;
 const ID_BTN_EDIT_CONFIG: i32 = 129;
@@ -876,26 +874,6 @@ fn build_layout(width: i32, height: i32, dip: Dip) -> Vec<Ctl> {
         s(25.0),
         s(20.0),
     );
-    push(
-        ID_LABEL_CONFIG,
-        Kind::Label,
-        "Config file:",
-        margin + s(16.0),
-        settings_y + s(102.0),
-        s(70.0),
-        s(18.0),
-    );
-    let path = Config::config_path().to_string_lossy().to_string();
-    push(
-        ID_LABEL_PATH,
-        Kind::Label,
-        &path,
-        margin + s(88.0),
-        settings_y + s(102.0),
-        width - margin * 2 - s(96.0),
-        s(18.0),
-    );
-
     // Bottom row, right anchored: Cancel is the rightmost, then Save && Close, Save,
     // Edit Config, and Reset Mixer at the far left of the row.
     let row_y = height - s(45.0);

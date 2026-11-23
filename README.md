@@ -1,22 +1,22 @@
 <p align="center">
-  <img src="assets/icon.png" width="112" height="112" alt="Rust Background Muter" />
+  <img src="assets/icon.png" width="112" height="112" alt="Rust Background Muter Windows system tray icon" />
 </p>
 
-<h1 align="center">Rust Background Muter</h1>
+<h1 align="center">Rust Background Muter — Auto-Mute Background Apps on Windows</h1>
 
 <p align="center">
-  <b>Only the app you are looking at. Everything else goes quiet.</b>
+  <b>Only the active window plays audio. Everything else goes quiet.</b>
 </p>
 
 <p align="center">
-  A native Windows tray app that mutes audio from background applications<br/>
-  and keeps the foreground app audible — WASAPI, no drivers, sub-1% idle CPU.
+  A lightweight Windows 10 &amp; 11 system tray utility that automatically mutes background<br/>
+  and unfocused applications while keeping your foreground app audible — native WASAPI, no virtual audio drivers, zero GPU usage, and sub-1% idle CPU.
 </p>
 
 <p align="center">
   <a href="https://github.com/cosmokud/rust-bg-muter/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cosmokud/rust-bg-muter?style=for-the-badge&color=a32b8d" /></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99%2B-orange?style=for-the-badge&logo=rust" />
-  <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-blue?style=for-the-badge&logo=windows" />
+  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Platform-Windows%2010%2F11-blue?style=for-the-badge&logo=windows" />
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-111111?style=for-the-badge" /></a>
 </p>
 
@@ -25,6 +25,7 @@
   <a href="#features">Features</a> ·
   <a href="#usage">Usage</a> ·
   <a href="#configuration">Configuration</a> ·
+  <a href="#faq">FAQ</a> ·
   <a href="#build-from-source">Build</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#development">Develop</a> ·
@@ -35,61 +36,60 @@
 
 ## Overview
 
-The app runs quietly in the system tray, tracks the current foreground process, and applies muting rules to active audio sessions through WASAPI. It is designed for low overhead and predictable behavior, with settings persisted in a local JSON config file.
+Rust Background Muter runs quietly in the Windows system tray, tracks the currently focused foreground window, and automatically mutes audio from unfocused background applications via the native Windows Audio Session API (WASAPI).
+
+Whether you are Alt-Tabbing out of a game, switching between browser tabs and video players, or keeping distractions silent while working, it manages per-application audio cleanly with minimal overhead. All preferences are saved in a simple local JSON configuration file—no background services, no Electron bloat, and no virtual audio drivers required.
 
 <p align="center">
-  <img src="docs/images/settings.jpg" width="720" alt="Rust Background Muter settings window" />
+  <img src="docs/images/settings.jpg" width="720" alt="Rust Background Muter Windows settings window showing detected audio apps, excluded apps allowlist, and always-muted apps list" />
 </p>
 
 ## Features
 
-- Automatic background muting based on the currently focused application
-- Excluded apps list to keep selected apps always audible
-- Always-muted apps list to force selected apps muted at all times
-- Real-time detection of active audio sessions
-- Zero GPU/VRAM usage and sub‑1 % idle CPU cost due to the native Win32 window and GDI rendering
-- Native system tray controls:
-  - Enable or disable muting
-  - Open the settings dialog
+- **Automatic background muting:** Keeps only the active foreground application audible and mutes unfocused windows in real time
+- **Excluded apps list (allowlist):** Keep selected apps like Spotify, Discord, or voice chat always audible in the background
+- **Always-muted apps list:** Force specific applications to stay muted at all times, even when focused
+- **Real-time audio session detection:** Automatically detects active Windows audio sessions as apps open and close
+- **Ultra-lightweight native Win32 UI:** Zero GPU/VRAM usage and sub-1% idle CPU cost using native Win32 windows and GDI rendering
+- **Native system tray controls:**
+  - Toggle automatic muting on or off
+  - Open the settings dialog (or double-click the tray icon)
   - Exit the application
-- Tray icon double-click shortcut to open settings
-- Native Win32 settings dialog with:
-  - Detected audio apps list
-  - Search and filtering for detected apps
-  - Add/remove flows for Excluded and Always Muted lists
-  - Double-click a row to move an app between the detected, excluded and always-muted lists
-  - Poll interval steppers (`100`-`2000` ms)
-  - Start with Windows toggle
-  - `Reset Mixer` to redo the Windows Volume Mixer reset
-  - `Edit Config` to open `config.json` in your editor
-- Persistent configuration in `%APPDATA%\rust-bg-muter\config.json`
-- Automatic unmute cleanup for app-muted sessions on exit
+- **Built-in settings dialog:**
+  - Live list of detected audio applications
+  - Instant search and filtering for detected apps
+  - Quick add/remove controls for **Excluded** and **Always Muted** lists
+  - Double-click any row to move an app between detected, excluded, and always-muted lists
+  - Configurable poll interval (`100`–`2000` ms)
+  - **Start with Windows** toggle
+  - **Reset Mixer** button to reset Windows Volume Mixer per-app volume memory
+  - **Edit Config** shortcut to open `config.json` in your default editor
+- **Persistent local configuration:** Stored at `%APPDATA%\rust-bg-muter\config.json`
+- **Safe automatic unmute on exit:** Restores any app-muted audio sessions when the program closes
 
 ## Installation
 
-Download the latest Windows build from the repository's GitHub Releases tab:
+Download the latest Windows 10 / Windows 11 build from the repository's Releases page:
 
-- [GitHub Releases](../../releases)
+- [Download from GitHub Releases](../../releases)
 
-Every release carries two files:
+Every release includes two options:
 
-- `rust-bg-muter_x.y.z_x64-setup.exe` — an installer that places the app in
-  `%LOCALAPPDATA%\rust-bg-muter`, adds Start menu and desktop shortcuts, and registers an
-  uninstaller. No administrator rights are needed.
-- `rust-bg-muter.exe` — the portable executable. Copy it anywhere you like and run it.
+- `rust-bg-muter_x.y.z_x64-setup.exe` — Standard Windows installer that installs to `%LOCALAPPDATA%\rust-bg-muter`, adds Start menu and desktop shortcuts, and registers an uninstaller. **No administrator rights required.**
+- `rust-bg-muter.exe` — Portable standalone executable. Copy it anywhere and run it directly.
 
-Both write the same configuration, at `%APPDATA%\rust-bg-muter\config.json`.
+Both versions share the same configuration file at `%APPDATA%\rust-bg-muter\config.json`.
 
 ## Usage
 
-1. Launch `rust-bg-muter.exe`.
-2. Right-click the tray icon to open the menu.
-3. Select **Enable/Disable Muting** as needed.
-4. Open **Settings...** to manage app rules and behavior.
+1. Launch `rust-bg-muter.exe` (or open **Rust Background Muter** from the Start menu).
+2. Right-click the icon in the Windows system tray to open the menu.
+3. Select **Enable/Disable Muting** to toggle automatic background muting.
+4. Open **Settings...** (or double-click the tray icon) to manage excluded apps, always-muted apps, and startup behavior.
 
 ## Configuration
 
-Configuration is stored at `%APPDATA%\rust-bg-muter\config.json`.
+Configuration is stored locally at `%APPDATA%\rust-bg-muter\config.json`.
 
 Example:
 
@@ -106,6 +106,28 @@ Example:
 }
 ```
 
+## FAQ
+
+### How do I automatically mute games when I Alt-Tab on Windows 10 or 11?
+
+Run Rust Background Muter in the system tray with muting enabled. As soon as you Alt-Tab away from a game to another window, the game's audio session is automatically muted—and unmuted the moment you switch back.
+
+### Can I keep Spotify, Discord, or my browser playing while other background apps are muted?
+
+Yes. Open **Settings** and add `spotify.exe`, `discord.exe`, or any other executable to the **Excluded** list. Excluded apps remain audible even when they are in the background.
+
+### Does this require virtual audio drivers or administrator privileges?
+
+No. Rust Background Muter uses Windows' built-in WASAPI audio session controls directly and installs per-user under `%LOCALAPPDATA%`, so no virtual audio cables, kernel drivers, or admin rights are needed.
+
+### How is this different from the Windows Volume Mixer or EarTrumpet?
+
+Windows Volume Mixer and EarTrumpet are designed for _manual_ per-app volume control. Rust Background Muter _automates_ muting based on window focus, so you do not have to manually mute and unmute apps every time you switch windows.
+
+### Will my apps stay muted if I close Rust Background Muter?
+
+No. On exit, Rust Background Muter automatically unmutes every audio session it muted so your apps return to normal immediately.
+
 ## Build from Source
 
 ```bash
@@ -118,8 +140,7 @@ Binary output:
 
 - `target/release/rust-bg-muter.exe`
 
-Windows installer (NSIS, built with [cargo-packager](https://github.com/crabnebula-dev/cargo-packager);
-its template is `packaging/nsis/installer.nsi`):
+Windows installer (NSIS, built with [cargo-packager](https://github.com/crabnebula-dev/cargo-packager); its template is `packaging/nsis/installer.nsi`):
 
 ```powershell
 .\build-installers.ps1
@@ -150,7 +171,7 @@ src/
 
 ## Development
 
-`rust-toolchain.toml` pins the toolchain, so cargo, rustfmt and clippy answer the same on your machine as they do in CI.
+`rust-toolchain.toml` pins the toolchain, so `cargo`, `rustfmt`, and `clippy` behave identically on your machine and in CI.
 
 ```bash
 cargo build
@@ -163,7 +184,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-commit tip, and what t
 
 ## Privacy
 
-Rust Background Muter is local-first and has no network code at all: no telemetry, no analytics, no crash reporting, no update checker. It reads which process owns the foreground window and which audio sessions are playing, and mutes by setting each session's own mute flag. Settings and the icon cache live under `%APPDATA%\rust-bg-muter`, and the only registry writes are the app's own startup entry and the per-app volume memory `Reset Mixer` clears, both under `HKEY_CURRENT_USER` and both only when you ask. See [PRIVACY.md](PRIVACY.md) for full details.
+Rust Background Muter is local-first and contains no network code at all: no telemetry, no analytics, no crash reporting, and no update checker. It only reads which process owns the foreground window and which audio sessions are playing, and mutes by setting each session's own mute flag. Settings and the icon cache live under `%APPDATA%\rust-bg-muter`, and the only registry writes are the app's own startup entry and the per-app volume memory cleared by `Reset Mixer`—both under `HKEY_CURRENT_USER` and both only when you request them. See [PRIVACY.md](PRIVACY.md) for full details.
 
 ## Security
 

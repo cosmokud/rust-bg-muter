@@ -1,0 +1,25 @@
+<!-- Thanks for contributing! Please fill in the sections below. -->
+<!-- If this is your first pull request, see CONTRIBUTING.md for help. -->
+
+## What does this do?
+
+<!-- In 1-2 sentences, what did you change? Example: Fix apps staying muted after the settings dialog is closed. -->
+
+## Why?
+
+<!-- Why is this change needed? Link the issue it fixes, if there is one. Example: Fixes #12 -->
+
+## How did you test it?
+
+<!-- How do you know it works? Example: cargo test, muted Steam in the background while a video played in the foreground on Windows 11. -->
+
+- [ ] `cargo fmt --all -- --check` passes
+- [ ] `cargo clippy --all-targets -- -D warnings` passes
+- [ ] `cargo test` passes
+- [ ] `cargo test --test no_path_leaks` passes (the `pre-push` hook runs it)
+- [ ] I tested the app manually (if it changes what users see or hear)
+
+## Checklist
+
+- [ ] I linked the related issue (or wrote "No issue" if there isn't one)
+- [ ] I kept this pull request focused on one thing

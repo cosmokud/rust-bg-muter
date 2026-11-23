@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/cosmokud/rust-bg-muter/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cosmokud/rust-bg-muter?style=for-the-badge" /></a>
-  <img alt="Rust" src="https://img.shields.io/badge/Rust-1.75%2B-orange?style=for-the-badge&logo=rust" />
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99%2B-orange?style=for-the-badge&logo=rust" />
   <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-blue?style=for-the-badge&logo=windows" />
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-111111?style=for-the-badge" /></a>
 </p>
@@ -27,7 +27,8 @@
   <a href="#configuration">Configuration</a> ·
   <a href="#build-from-source">Build</a> ·
   <a href="#architecture">Architecture</a> ·
-  <a href="#development">Develop</a>
+  <a href="#development">Develop</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
 <p align="center">
@@ -149,12 +150,24 @@ src/
 
 ## Development
 
+`rust-toolchain.toml` pins the toolchain, so cargo, rustfmt and clippy answer the same on your machine as they do in CI.
+
 ```bash
 cargo build
 cargo test
-cargo fmt
-cargo clippy -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-commit tip, and what the checks do not cover.
+
+## Privacy
+
+Rust Background Muter is local-first and has no network code at all: no telemetry, no analytics, no crash reporting, no update checker. It reads which process owns the foreground window and which audio sessions are playing, and mutes by setting each session's own mute flag. Settings and the icon cache live under `%APPDATA%\rust-bg-muter`, and the only registry writes are the app's own startup entry and the per-app volume memory `Reset Mixer` clears, both under `HKEY_CURRENT_USER` and both only when you ask. See [PRIVACY.md](PRIVACY.md) for full details.
+
+## Security
+
+Please report vulnerabilities privately, not in a public issue. See [SECURITY.md](SECURITY.md).
 
 ## License
 

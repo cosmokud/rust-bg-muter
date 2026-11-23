@@ -1,0 +1,64 @@
+name: CI
+
+# What CONTRIBUTING asks for before a push, run on the push itself: the tree is formatted,
+# lint-free and passing its tests, or the run is answered with a failure and the log that
+# says what failed. It only checks — no formatting commit, no push, no release — and it is
+# given no permission beyond reading the repository, so there is nothing else it could do.
+#
+# This is the badge the README shows. The tag workflow (`deploy.yml`) does its own build;
+# nothing here can publish a release.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A branch that is pushed twice runs once: the second push cancels the first run, which
+  # can only answer a commit that is no longer the tip.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Formatting, lints and tests
+    runs-on: windows-latest
+
+    steps:
+      # SECURITY: pinned to the commit the tag it is written against pointed at, the way
+      # the deploy workflows pin theirs.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The guard reads the history of this branch, not only its tree: a path in a commit
+          # message reaches every clone the way a path in a fixture does, and the default
+          # checkout is one commit deep, which leaves it nothing to read.
+          fetch-depth: 0
+
+      # The release `rust-toolchain.toml` names, asked for by name so the version a run
+      # formats and lints with is the one in its log rather than whichever stable the
+      # runner image happens to carry that week.
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.99.1
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (2.9.2)
+
+      # Named on its own so a path written into a fixture is a line in the log under its own
+      # name, and not one more failure buried in the test list below.
+      - name: Path leaks
+        run: cargo test --test no_path_leaks
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lints
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test

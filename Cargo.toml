@@ -5,7 +5,9 @@ edition = "2021"
 authors = ["Rust Background Muter Team"]
 description = "A lightweight Windows application to mute background applications"
 license = "MIT"
-repository = "https://github.com/username/rust-bg-muter"
+repository = "https://github.com/cosmokud/rust-bg-muter"
+readme = "README.md"
+rust-version = "1.99.1"
 
 [dependencies]
 # Windows API bindings

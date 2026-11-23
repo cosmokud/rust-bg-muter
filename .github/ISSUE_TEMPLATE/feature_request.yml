@@ -1,0 +1,40 @@
+name: Feature request
+description: Have an idea for a new feature or improvement? Suggest it here.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the idea! Please fill in the sections below.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What is hard, slow, or missing today?
+      placeholder: "Example: Games that use a launcher stay muted, because the audio session belongs to the launcher and not to the game."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like to happen?
+      description: Describe your idea. Screenshots or examples help.
+      placeholder: "Example: Let me add a rule that also matches a child process of the one I excluded."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Is there another way to solve this? What did you try?
+      placeholder: "Optional. Example: I added the launcher to Excluded, but then the launcher's own sounds stay audible."
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Any other details that might help.
+      placeholder: Optional.
+    validations:
+      required: false

@@ -133,9 +133,12 @@ pub unsafe fn remember(exe_name: &str, icon: HICON) {
 
     let icons = {
         let mut cache = cache().lock();
-        cache.icons.insert(key, png);
+        cache.icons.insert(key.clone(), png);
         cache.icons.clone()
     };
+    // A row may have asked for this name before it ran and been told "no icon"; that
+    // answer is now wrong, and `icon_for` must not keep serving it.
+    handles().lock().remove(&key);
     save(&icons);
 }
 
@@ -428,6 +431,27 @@ mod tests {
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
         let icon = unsafe { decode(&png) }.expect("icon did not decode");
         assert!(!icon.0.is_null(), "decoded to a null handle");
+    }
+
+    /// A row painted while the app was closed got its "no icon" remembered; once the app
+    /// runs and stores its icon, that answer must not survive.
+    #[test]
+    fn a_remembered_icon_replaces_a_cached_miss() {
+        let _config_dir = crate::config::config_dir_lock();
+        let name = "miss-then-hit.exe";
+        handles().lock().remove(name);
+        assert!(
+            unsafe { icon_for(name) }.is_none(),
+            "a fresh name had an icon"
+        );
+
+        unsafe {
+            remember(name, own_icon());
+        }
+        assert!(
+            unsafe { icon_for(name) }.is_some(),
+            "the miss survived the icon being stored"
+        );
     }
 
     /// The reason the file exists: a name with no process behind it still answers with the

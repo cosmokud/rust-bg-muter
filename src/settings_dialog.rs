@@ -942,6 +942,23 @@ static ICON_OF_NAME: OnceLock<Mutex<HashMap<String, Option<isize>>>> = OnceLock:
 /// Names that resolved to no running process; a repaint must not rescan for them.
 static MISSING_PATHS: OnceLock<Mutex<HashMap<String, ()>>> = OnceLock::new();
 
+/// Drops the icon answers a repaint remembered as missing. A fresh scan may find an app
+/// that was closed last time, and an app that has since started also got its icon written
+/// to `icon_cache` - so a negative name answer must be retried, not kept for the whole
+/// process lifetime. PIDs are recycled, so the id-keyed answers go too; path-keyed icons
+/// stay, an extracted icon never becomes wrong.
+unsafe fn forget_stale_icons() {
+    if let Some(missing) = MISSING_PATHS.get() {
+        missing.lock().clear();
+    }
+    if let Some(by_name) = ICON_OF_NAME.get() {
+        by_name.lock().clear();
+    }
+    if let Some(by_pid) = ICON_OF_PID.get() {
+        by_pid.lock().clear();
+    }
+}
+
 /// Small icon for a list row. `pid` is the real process (detected list); otherwise the
 /// text is a process name, so the first running process with that name supplies the path.
 ///
@@ -2085,14 +2102,7 @@ unsafe fn refresh_detected_apps(hwnd: HWND) {
             s.last_refresh = Some(Instant::now());
         }
     });
-    // A fresh scan may now find apps that were gone last time, so retry their icons.
-    // PIDs are recycled, so the id-keyed answers go too; path-keyed icons stay.
-    if let Some(missing) = MISSING_PATHS.get() {
-        missing.lock().clear();
-    }
-    if let Some(by_pid) = ICON_OF_PID.get() {
-        by_pid.lock().clear();
-    }
+    forget_stale_icons();
     DIALOG_STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
             let sessions = s.audio_manager.snapshot().rows;
@@ -3560,6 +3570,33 @@ mod tests {
             assert_no_overlaps(hwnd);
         }
         teardown(hwnd);
+    }
+
+    /// A named row painted while its app was closed used to keep "no icon" for the whole
+    /// process lifetime, so the row stayed iconless even after the app started and its icon
+    /// was cached. A refresh must throw that answer away.
+    #[test]
+    fn a_refresh_retries_a_row_that_had_no_icon() {
+        unsafe {
+            forget_stale_icons();
+            assert!(
+                row_icon(0, "no-such-app-for-this-test.exe").is_none(),
+                "a missing exe name produced an icon"
+            );
+            // Stand-in for the app starting and its icon reaching `icon_cache`.
+            ICON_OF_NAME
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .insert("no-such-app-for-this-test.exe".to_string(), Some(1));
+            forget_stale_icons();
+            assert!(
+                !ICON_OF_NAME
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .contains_key("no-such-app-for-this-test.exe"),
+                "the negative answer survived a refresh"
+            );
+        }
     }
 
     /// Rows in the exclusion / always-muted panels carry no PID, so their icon comes from

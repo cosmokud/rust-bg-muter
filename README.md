@@ -15,9 +15,9 @@
 
 <p align="center">
   <a href="https://github.com/cosmokud/rust-bg-muter/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cosmokud/rust-bg-muter?style=for-the-badge" /></a>
-  <a href="https://github.com/cosmokud/rust-bg-muter/releases/latest"><img alt="Downloads" src="https://img.shields.io/github/downloads/cosmokud/rust-bg-muter/total?style=for-the-badge" /></a>
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-1.75%2B-orange?style=for-the-badge&logo=rust" />
+  <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-blue?style=for-the-badge&logo=windows" />
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-111111?style=for-the-badge" /></a>
-  <a href="https://github.com/cosmokud/rust-bg-muter/actions/workflows/nightly.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/cosmokud/rust-bg-muter/nightly.yml?style=for-the-badge" /></a>
 </p>
 
 <p align="center">

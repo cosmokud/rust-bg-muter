@@ -1,10 +1,40 @@
-# Rust Background Muter
+<p align="center">
+  <img src="assets/icon.png" width="112" height="112" alt="Rust Background Muter" />
+</p>
 
-![Rust](https://img.shields.io/badge/Rust-1.75+-orange?logo=rust) ![Platform](https://img.shields.io/badge/Platform-Windows-blue?logo=windows) ![License](https://img.shields.io/badge/License-MIT-green)
+<h1 align="center">Rust Background Muter</h1>
 
-Rust Background Muter is a native Windows tray application written in Rust that automatically mutes audio from background applications while keeping the active app audible.
+<p align="center">
+  <b>Only the app you are looking at. Everything else goes quiet.</b>
+</p>
 
-![Showcase](https://github.com/user-attachments/assets/ee6017fe-11a3-4727-a5e1-9ac254e502ec)
+<p align="center">
+  A native Windows tray app that mutes audio from background applications<br/>
+  and keeps the foreground app audible — WASAPI, no drivers, sub-1% idle CPU.
+</p>
+
+<p align="center">
+  <a href="https://github.com/cosmokud/rust-bg-muter/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cosmokud/rust-bg-muter?style=for-the-badge" /></a>
+  <a href="https://github.com/cosmokud/rust-bg-muter/releases/latest"><img alt="Downloads" src="https://img.shields.io/github/downloads/cosmokud/rust-bg-muter/total?style=for-the-badge" /></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-111111?style=for-the-badge" /></a>
+  <a href="https://github.com/cosmokud/rust-bg-muter/actions/workflows/nightly.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/cosmokud/rust-bg-muter/nightly.yml?style=for-the-badge" /></a>
+</p>
+
+<p align="center">
+  <a href="#installation">Install</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#build-from-source">Build</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#development">Develop</a>
+</p>
+
+<p align="center">
+  <img src="docs/images/settings.jpg" width="720" alt="Rust Background Muter settings window" />
+</p>
+
+---
 
 ## Overview
 
@@ -78,7 +108,7 @@ Example:
 ## Build from Source
 
 ```bash
-git clone https://github.com/username/rust-bg-muter.git
+git clone https://github.com/cosmokud/rust-bg-muter.git
 cd rust-bg-muter
 cargo build --release
 ```

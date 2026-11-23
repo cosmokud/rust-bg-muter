@@ -58,7 +58,7 @@ See [README.md](README.md) for app usage and configuration keys.
    cargo test
    ```
 
-If a check fails, fix it before opening a pull request. `rust-toolchain.toml` pins the toolchain, so cargo, rustfmt and clippy answer the same on every machine as they do in CI. `ci.yml` runs those three on every push and pull request and is given nothing but read access to the repository.
+If a check fails, fix it before opening a pull request. `rust-toolchain.toml` pins the toolchain, so cargo, rustfmt and clippy answer the same on every machine as they do in CI. `manual-ci.yml` runs those three on demand — started by hand from the Actions tab, against whichever branch or commit is chosen there — and is given nothing but read access to the repository.
 4. Write a clear commit message in the present tense, for example `Fix mute state lost on theme change` rather than `Fixed...`.
 5. Push your branch and open a pull request against `main`.
 

@@ -1,26 +1,19 @@
-name: CI
+name: Manual CI
 
-# What CONTRIBUTING asks for before a push, run on the push itself: the tree is formatted,
-# lint-free and passing its tests, or the run is answered with a failure and the log that
-# says what failed. It only checks — no formatting commit, no push, no release — and it is
-# given no permission beyond reading the repository, so there is nothing else it could do.
+# What CONTRIBUTING asks for before a push, run on demand rather than on every commit: the
+# tree is formatted, lint-free and passing its tests, or the run is answered with a failure
+# and the log that says what failed. It only checks — no formatting commit, no push, no
+# release — and it is given no permission beyond reading the repository, so there is nothing
+# else it could do.
 #
-# This is the badge the README shows. The tag workflow (`deploy.yml`) does its own build;
-# nothing here can publish a release.
+# It runs when it is started by hand from the Actions tab, against whichever branch or commit
+# is chosen there, and never on its own.
 
 on:
-  push:
-    branches: ["**"]
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
-
-concurrency:
-  # A branch that is pushed twice runs once: the second push cancels the first run, which
-  # can only answer a commit that is no longer the tip.
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   checks:

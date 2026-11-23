@@ -1,0 +1,192 @@
+name: Manual Deploy By Tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_to_build:
+        description: "The exact tag to build and release"
+        required: true
+        type: string
+
+jobs:
+  windows-installers:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      # SECURITY: Validate input to prevent someone from typing "main" or injecting shell commands
+      - name: Validate tag format
+        env:
+          INPUT_TAG: ${{ inputs.tag_to_build }}
+        shell: bash
+        run: |
+          if [[ ! "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
+            echo "Error: Tag must start with 'v' followed by semantic versioning (e.g., v1.0.0)"
+            exit 1
+          fi
+
+      # SECURITY: The input names a tag, so it has to be one. `ref:` below takes a branch
+      # or a commit just as happily, and a branch named like a version would build code
+      # that was never released.
+      - name: Fail if the tag does not exist
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag_to_build }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=$(curl -sS -o tag.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/git/ref/tags/${TAG}")
+          if [[ "${status}" != "200" ]]; then
+            echo "no tag named ${TAG} in ${REPO}: status ${status}"
+            cat tag.json || true
+            exit 1
+          fi
+
+      # IDEMPOTENCY: Check if release already exists.
+      # Prevents you from accidentally overwriting a good release via a typo in the manual input.
+      - name: Fail if release already exists
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag_to_build }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_url="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
+          status=$(curl -sS -o release.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${api_url}")
+          if [[ "${status}" == "200" ]]; then
+            echo "release already exists for tag ${TAG}; refusing to overwrite"
+            cat release.json
+            exit 1
+          fi
+          if [[ "${status}" != "404" ]]; then
+            echo "unexpected API status while checking tag ${TAG}: ${status}"
+            cat release.json || true
+            exit 1
+          fi
+
+      # SECURITY: Every action is pinned to the commit the tag it is written against
+      # pointed at, not to the tag itself: a tag is its publisher's to move, and these run
+      # with a token that can publish a release. The comment beside each pin names the
+      # release it is, for the bump that moves it.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tag_to_build }}
+          # The guard reads the history of the branch it is building, not only its tree: a path
+          # in a commit message reaches every clone the way a path in a fixture does, and the
+          # default checkout is one commit deep, which leaves it nothing to read.
+          fetch-depth: 0
+
+      # The two things a release must not get wrong, checked before anything is built: the
+      # installer is named for the manifest's version, and a release whose notes are
+      # generated instead of taken from the changelog is one that cannot say what changed.
+      - name: The tag, the manifest and the changelog agree
+        id: version
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag_to_build }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::${TAG} names '${VERSION}': a release is X.Y.Z, or X.Y.Z-rc.1"
+            exit 1
+          fi
+
+          manifest=$(grep -m1 -E '^version = "' Cargo.toml | cut -d'"' -f2)
+          if [[ "$manifest" != "$VERSION" ]]; then
+            echo "::error::Cargo.toml in this tag says '${manifest}' and the tag says '${VERSION}': the installer is built under one version and asked for under the other"
+            exit 1
+          fi
+
+          if ! grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section: the release would carry the generated notes instead of it"
+            exit 1
+          fi
+
+          echo "the tag, Cargo.toml and the changelog agree on ${VERSION}"
+
+          # A pre-release is published as one. This build is not the release the latest-release
+          # link points at either way — `make_latest: false` is what does that — but the badge is
+          # what tells a reader of the releases page that this one is not a stable release.
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "${VERSION} is a pre-release"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust (MSVC)
+        # Pinned to a commit in master's history, with the toolchain named in the input:
+        # this action reads its ref as the toolchain otherwise, and a pin outside master
+        # is one that gets garbage-collected.
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.99.1
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (2.9.2)
+
+      # The same gate deploy.yml runs, for the same reason: this workflow publishes a release
+      # from a tag by hand, and an immutable release is one that cannot be taken back.
+      - name: Path leaks
+        run: cargo test --test no_path_leaks
+
+      - name: Install cargo-packager
+        shell: pwsh
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: .\build-installers.ps1
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-bg-muter-installers-${{ inputs.tag_to_build }}
+          path: |
+            target/packager/rust-bg-muter_*-setup.exe
+            target/release/rust-bg-muter.exe
+          if-no-files-found: error
+
+      - name: Extract Changelog
+        shell: bash
+        env:
+          # SECURITY: the tag goes through the environment and is never written into the
+          # script: an input may hold `$(…)`, which a shell would run.
+          TAG: ${{ inputs.tag_to_build }}
+        run: |
+          VERSION="${TAG#v}"
+
+          # Extract changelog section for the current version
+          awk -v heading="## [$VERSION]" 'index($0, heading) == 1 {flag=1; next} /^## \[/{flag=0} flag' CHANGELOG.md > release_notes.md
+
+          if [[ ! -s release_notes.md ]]; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section: the release would publish empty notes"
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ inputs.tag_to_build }}
+          name: ${{ inputs.tag_to_build }}
+          body_path: release_notes.md
+          # Set by the check above: a version carrying a suffix goes out as a pre-release.
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          make_latest: false
+          files: |
+            target/packager/rust-bg-muter_*-setup.exe
+            target/release/rust-bg-muter.exe

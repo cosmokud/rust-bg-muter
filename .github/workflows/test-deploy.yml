@@ -1,0 +1,423 @@
+name: Test Deploy
+
+# Everything the deploy workflows do, up to and not including the release. What it tests is the
+# latest commit of the default branch — what it does when the input is left empty, and the
+# check to make *before* a tag is pushed — or a tag, branch or commit named in the input. For a
+# reference that is not a tag it asks the version `Cargo.toml` holds there, the changelog
+# section for it, whether that version is newer than the newest tag, and whether the tag is
+# still free to push: so a mistake costs a run rather than a tag, and with immutable releases a
+# tag is not something that can be taken back.
+#
+# The guards are also run against tags that must pass and tags that must not, the changelog
+# extraction is asserted, and — where a build is asked for — the installers are built and
+# uploaded as artifacts and checked against the names the release publishes. Nothing here can
+# publish a release, because nothing here is given the permission to.
+#
+# It is a second copy of what `deploy.yml` and `manual-deploy.yml` do rather than a call into
+# them, so that a test failing is never the shared code failing to call itself. What is not
+# shared is asserted instead: the first step reads both workflows and refuses the shape a tag
+# must not be written into a shell in.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref_to_test:
+        description: "A tag to test as a deploy, or a branch/commit to test as the next release; empty means the latest commit"
+        required: false
+        type: string
+      build:
+        description: "Build the installers as well, as artifacts (no release is made either way)"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  guards:
+    name: Guards
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+      version: ${{ steps.ref.outputs.version }}
+      tag: ${{ steps.ref.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # What to test, and the version a release of it would carry. A workflow input cannot
+      # default to something computed — its `default` is a literal string — so an empty box is
+      # what asks for the latest commit of the default branch, which is the check to make before
+      # a tag is pushed. Anything else is taken as a tag that exists, or as a branch or commit;
+      # a reference that is not a tag is tested as the *next* release, whose version is the one
+      # `Cargo.toml` holds there, since no tag names it yet. What is found here goes into this
+      # job's environment, where every step after this one reads it, and into the job's outputs,
+      # for the build job to check out and name its artifacts by.
+      - name: The reference to test, and the version it would release
+        id: ref
+        shell: bash
+        env:
+          INPUT_REF: ${{ inputs.ref_to_test }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$INPUT_REF" ]]; then
+            REF=$(git ls-remote origin HEAD | cut -f1)
+            MODE=commit
+          elif [[ -n "$(git ls-remote --tags origin "refs/tags/${INPUT_REF}")" ]]; then
+            REF="$INPUT_REF"
+            MODE=tag
+          elif [[ -n "$(git ls-remote --heads origin "refs/heads/${INPUT_REF}")" ]] || [[ "$INPUT_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            REF="$INPUT_REF"
+            MODE=commit
+          else
+            echo "::error::no tag, branch or full commit named '${INPUT_REF}'"
+            exit 1
+          fi
+
+          if [[ -z "$REF" ]]; then
+            echo "::error::there is nothing to test: the default branch could not be read, so name a tag, branch or commit in the input"
+            exit 1
+          fi
+
+          if [[ "$MODE" == tag ]]; then
+            VERSION="${REF#v}"
+            TAG="$REF"
+            echo "${REF} is a tag: testing it as a deploy"
+          else
+            curl -sSf "https://raw.githubusercontent.com/${REPO}/${REF}/Cargo.toml" -o cargo-at-ref.toml
+            VERSION=$(grep -m1 -E '^version = "' cargo-at-ref.toml | cut -d'"' -f2)
+            TAG="v${VERSION}"
+            echo "${REF} is a branch or commit: testing it as the next release, ${TAG}"
+          fi
+
+          {
+            echo "REF=${REF}"
+            echo "VERSION=${VERSION}"
+            echo "TAG=${TAG}"
+            echo "MODE=${MODE}"
+          } >> "$GITHUB_ENV"
+          {
+            echo "ref=${REF}"
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      # SECURITY: the shape the injection took — an expression assigned inside a script,
+      # where the shell runs what it holds. `env:` is where an input belongs.
+      - name: No deploy workflow writes an expression into a script
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -nE '=[[:space:]]*\$\{\{' .github/workflows/deploy.yml .github/workflows/manual-deploy.yml; then
+            echo "::error::an expression is assigned inside a script: pass it through env: and read it from there"
+            exit 1
+          fi
+          echo "both deploy workflows pass their tags through the environment"
+
+      - name: The tag shape, against tags that pass and tags that do not
+        shell: bash
+        run: |
+          set -euo pipefail
+          shape() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; }
+
+          # The tag this release would be under, whether it is one already or one to push.
+          if ! shape "$TAG"; then
+            echo "::error::${TAG} is not the shape the deploy workflows accept"
+            exit 1
+          fi
+          echo "accepted: ${TAG}"
+
+          refused=0
+          for bad in main v1.0 1.2.3 latest ""; do
+            if shape "$bad"; then
+              echo "::error::'${bad}' should have been refused"
+              refused=1
+            else
+              echo "refused, as it should be: '${bad}'"
+            fi
+          done
+          exit $refused
+
+      - name: The tag is either there to deploy or free to push
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_status() {
+            curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/git/ref/tags/$1"
+          }
+
+          status=$(tag_status "$TAG")
+          if [[ "$MODE" == tag ]]; then
+            if [[ "$status" != "200" ]]; then
+              echo "::error::no tag named ${TAG} in ${REPO}: status ${status}"
+              exit 1
+            fi
+            echo "${TAG} is a tag that exists"
+          else
+            if [[ "$status" != "404" ]]; then
+              echo "::error::${TAG} is taken already: bump the version in Cargo.toml before tagging, or test the tag that is there"
+              exit 1
+            fi
+            echo "${TAG} is free to push"
+          fi
+
+          missing=$(tag_status "v0.0.0-no-such-tag")
+          if [[ "$missing" != "404" ]]; then
+            echo "::error::a tag that does not exist answered ${missing} rather than 404"
+            exit 1
+          fi
+          echo "a tag that does not exist is answered with ${missing}"
+
+      # The same three things `deploy.yml` refuses a release over, read at the reference rather
+      # than from this branch: what a release carries comes from the commit being released, so
+      # the manifest and the notes there are the ones that have to agree with it. Where the
+      # reference is a commit rather than a tag, the question a pre-flight has to answer is
+      # added: that the version is newer than the newest tag — a version that was not bumped is
+      # a tag that cannot be pushed.
+      - name: The reference, the manifest and the changelog agree
+        env:
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSf "https://raw.githubusercontent.com/${REPO}/${REF}/Cargo.toml" -o cargo-at-ref.toml
+          curl -sSf "https://raw.githubusercontent.com/${REPO}/${REF}/CHANGELOG.md" -o changelog-at-ref.md
+
+          manifest=$(grep -m1 -E '^version = "' cargo-at-ref.toml | cut -d'"' -f2)
+          if [[ "$manifest" != "$VERSION" ]]; then
+            echo "::error::Cargo.toml at ${REF} says '${manifest}' and the release would be '${VERSION}': the installer would be built under one version and published as the other"
+            exit 1
+          fi
+
+          if ! grep -q "^## \[${VERSION}\]" changelog-at-ref.md; then
+            echo "::error::CHANGELOG.md at ${REF} has no '## [${VERSION}]' section: the release would carry the generated notes instead of it"
+            exit 1
+          fi
+
+          if [[ "$MODE" == tag ]]; then
+            echo "the tag, Cargo.toml and the changelog agree on ${VERSION}"
+            exit 0
+          fi
+
+          newest=$(git ls-remote --tags --sort=-v:refname --refs origin 'v*' \
+            | head -n 1 | sed 's|.*refs/tags/||')
+          if [[ -n "$newest" ]]; then
+            higher=$(printf '%s\n%s\n' "$VERSION" "${newest#v}" | sort -V | tail -n 1)
+            if [[ "$higher" != "$VERSION" || "$VERSION" == "${newest#v}" ]]; then
+              echo "::error::${REF} holds ${VERSION} and the newest tag is ${newest}: bump the version before tagging, since a tag cannot be pushed over one that is there"
+              exit 1
+            fi
+            echo "${VERSION} is newer than the newest tag, ${newest}"
+          fi
+
+          echo "Cargo.toml and the changelog agree on ${VERSION} at ${REF}"
+
+      # The idempotency guard both deploy workflows start with, asked before a tag exists.
+      - name: What the release guard would decide
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/releases/tags/${TAG}")
+          case "${status}" in
+            200) echo "${TAG} already has a release: a deploy would refuse to touch it." ;;
+            404) echo "${TAG} has no release yet: a deploy would go ahead and make one." ;;
+            *) echo "::error::unexpected status ${status}"; exit 1 ;;
+          esac
+
+      # The same extraction `deploy.yml` and `manual-deploy.yml` write, asserted on the notes at
+      # the reference: the section, and nothing past the next version's heading.
+      - name: The changelog section for the version is the section, and nothing past it
+        shell: bash
+        run: |
+          set -euo pipefail
+          awk -v heading="## [$VERSION]" 'index($0, heading) == 1 {flag=1; next} /^## \[/{flag=0} flag' changelog-at-ref.md > release_notes.md
+
+          if [[ ! -s release_notes.md ]]; then
+            echo "::error::no changelog section for ${VERSION}"
+            exit 1
+          fi
+          if grep -q '^## \[' release_notes.md; then
+            echo "::error::the extraction ran on past the next version's heading"
+            exit 1
+          fi
+          echo "the section for ${VERSION} is $(wc -l < release_notes.md) lines:"
+          head -n 3 release_notes.md
+
+      # The regression this is here for: a tag carrying shell syntax reached the script as
+      # command substitution. It reaches it as data now, which is what the canary checks.
+      - name: A tag carrying shell syntax is read as a name and nothing else
+        env:
+          TAG: 'v1.0.0$(touch /tmp/rust-bg-muter-injection)'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f /tmp/rust-bg-muter-injection
+          VERSION="${TAG#v}"
+          awk -v heading="## [$VERSION]" 'index($0, heading) == 1 {flag=1; next} /^## \[/{flag=0} flag' CHANGELOG.md > release_notes.md
+
+          if [[ -e /tmp/rust-bg-muter-injection ]]; then
+            echo "::error::the tag was run as a command"
+            exit 1
+          fi
+          if [[ -s release_notes.md ]]; then
+            echo "::error::a tag naming no section produced notes"
+            exit 1
+          fi
+          echo "nothing ran, and nothing was extracted: the tag was read as a name"
+
+      - name: The version is one the deploy path can publish
+        shell: bash
+        run: |
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "'${VERSION}' is a stable release."
+          elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.]+$ ]]; then
+            echo "'${VERSION}' is a pre-release: published as one, and every installer is named after it."
+          else
+            echo "::error::'${VERSION}' is neither X.Y.Z nor X.Y.Z-rc.1: the deploy path refuses it"
+            exit 1
+          fi
+
+      # A path typed into a fixture is in every clone of the thing under test from the moment a
+      # release exists, and an immutable release is one that cannot be taken back. This is why
+      # the check is here, before a tag is pushed, rather than only in the deploy path after one
+      # has been: it is the last point at which a leak is still a failed run. It is a grep rather
+      # than `cargo test --test no_path_leaks` because this job runs on a runner with no
+      # toolchain and asks for nothing heavier than an answer. The shapes are
+      # `.githooks/pre-push`'s four, and the two must stay the same.
+      - name: No path in the reference names an account's own directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The default checkout is shallow and is not the reference, so the reference is
+          # fetched before it is read. A tag, a branch or a full commit all name a commit this
+          # can fetch. The depth is the whole history rather than one commit, because the second
+          # check below reads the messages of every commit behind the reference and a one-deep
+          # fetch gives it one message to read.
+          git fetch --depth=2147483647 origin "$REF"
+
+          # Each shape is written as two quoted halves, which bash joins, so that this workflow
+          # file does not match itself: a pattern is a literal string, and a literal string
+          # written whole is found in the very line that writes it.
+          SHAPES=$(printf '%s\n' \
+            '[:\\/]Users''[:\\/]' \
+            ':/Us''ers/' \
+            '/hom''e/' \
+            '/Us''ers/')
+
+          if git grep -nI -E "$SHAPES" FETCH_HEAD -- .; then
+            echo "::error::the tree at ${REF} names a profile directory, which is named after the account that owns it"
+            exit 1
+          fi
+
+          # A message is not a file, so the check above cannot see one, and a path in a commit
+          # message reaches every clone of the thing under test the same way a path in a fixture
+          # does. This says that something behind the reference names an account directory and
+          # stops; it names no commit, since this job asks for nothing heavier than an answer.
+          if git log --format='%H%n%an%n%ae%n%cn%n%ce%n%B' FETCH_HEAD | grep -qE "$SHAPES"; then
+            echo "::error::a commit message behind ${REF} names a profile directory, which is named after the account that owns it"
+            exit 1
+          fi
+
+          echo "nothing at ${REF} is named after an account's own directory"
+
+      - name: Summary
+        env:
+          BUILD: ${{ inputs.build }}
+        shell: bash
+        run: |
+          {
+            echo "### Test deploy"
+            echo ""
+            echo "- reference: \`${REF}\` (${MODE})"
+            echo "- tag a release would carry: \`${TAG}\`"
+            echo "- version in it: \`${VERSION}\`"
+            echo "- a release is never made by this workflow"
+            echo "- installers built: \`${BUILD}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  installers:
+    name: The installers a release would carry
+    needs: guards
+    if: inputs.build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.guards.outputs.ref }}
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.99.1
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (2.9.2)
+
+      - name: Install cargo-packager
+        shell: pwsh
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: .\build-installers.ps1
+
+      # What `deploy.yml` publishes, done the other way round: the two globs a release carries
+      # are named here, and a release whose glob matches neither fails only after a tag has been
+      # pushed. The version is the manifest's, because that is what the packager names the
+      # installer after whatever tag is being built.
+      - name: What the release would carry, and whether the names are the ones published
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.guards.outputs.version }}
+          TAG: ${{ needs.guards.outputs.tag }}
+        run: |
+          $version = $env:VERSION
+          $manifest = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+
+          Get-ChildItem 'target/packager', 'target/release' -File |
+            Where-Object { $_.Name -like 'rust-bg-muter*' } |
+            Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+          $problems = @()
+          if ($manifest -ne $version) {
+            $problems += "Cargo.toml here says '$manifest' and the tag would be $($env:TAG) with '$version': the release would be named one version and built as the other"
+          }
+          if (-not (Get-ChildItem 'target/packager' -Filter 'rust-bg-muter_*-setup.exe' -File)) {
+            $problems += "deploy.yml publishes 'target/packager/rust-bg-muter_*-setup.exe' by glob and no such file was built"
+          }
+          if (-not (Test-Path 'target/release/rust-bg-muter.exe')) {
+            $problems += "deploy.yml publishes 'target/release/rust-bg-muter.exe' and no such file was built"
+          }
+          if ($problems) {
+            foreach ($problem in $problems) { Write-Host "::error::$problem" }
+            exit 1
+          }
+          Write-Host "the release this reference makes carries exactly the files deploy.yml publishes"
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-bg-muter-dry-run-${{ needs.guards.outputs.tag }}
+          path: |
+            target/packager/rust-bg-muter_*-setup.exe
+            target/release/rust-bg-muter.exe
+          if-no-files-found: error

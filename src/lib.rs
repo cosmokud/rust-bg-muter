@@ -14,6 +14,7 @@ pub mod od_controls;
 pub mod process;
 pub mod settings_dialog;
 pub mod shell;
+pub mod single_instance;
 pub mod startup;
 pub mod theme;
 pub mod tray;

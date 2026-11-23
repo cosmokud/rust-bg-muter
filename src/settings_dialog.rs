@@ -429,12 +429,36 @@ fn init_common_controls() {
     }
 }
 
+/// Window title of the one main window; also what a second launch looks up to refocus it.
+pub fn window_title() -> String {
+    format!("{} - Settings", crate::tray::APP_NAME)
+}
+
+/// The main window can only be one: focuses it when it already exists, else reports false
+/// so the caller opens it. Tray events are dispatched from this window's own message pump,
+/// so this normally runs on the thread that owns it and the foreground call is allowed.
+pub fn focus_if_open() -> bool {
+    let class = to_wide(SETTINGS_CLASS);
+    let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }) else {
+        return false;
+    };
+    if hwnd.is_invalid() {
+        return false;
+    }
+    crate::single_instance::bring_forward(hwnd);
+    true
+}
+
 /// Opens the settings dialog (blocks until closed)
 pub fn open_settings_dialog(
     config: Arc<RwLock<Config>>,
     muting_enabled: Arc<AtomicBool>,
     audio_manager: Arc<AudioManager>,
 ) {
+    if focus_if_open() {
+        return;
+    }
+
     DIALOG_STATE.with(|state| {
         *state.borrow_mut() = Some(DialogState {
             config,
@@ -506,7 +530,7 @@ unsafe fn create_dialog_window() -> Option<HWND> {
     RegisterClassExW(&wc);
 
     let (width, height, x, y) = initial_geometry();
-    let title = to_wide(&format!("{} - Settings", crate::tray::APP_NAME));
+    let title = to_wide(&window_title());
 
     let hwnd = CreateWindowExW(
         // No WS_EX_COMPOSITED: with one window painting one complete frame per size

@@ -83,12 +83,21 @@ impl SystemTray {
 
         // Menu event handler
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            // The settings entry is answered here, not on the tray loop: while the window is
+            // open that loop is blocked inside the window's own message pump, so a queued
+            // command would not be drained until the very window it should refocus closes.
+            if event.id == settings_id {
+                if crate::settings_dialog::focus_if_open() {
+                    return;
+                }
+                let _ = tx.try_send(TrayCommand::OpenSettings);
+                return;
+            }
+
             let cmd = if event.id == toggle_id {
                 Some(TrayCommand::ToggleMuting)
             } else if event.id == mute_all_id {
                 Some(TrayCommand::MuteAllNow)
-            } else if event.id == settings_id {
-                Some(TrayCommand::OpenSettings)
             } else if event.id == edit_config_id {
                 Some(TrayCommand::EditConfig)
             } else if event.id == exit_id {
@@ -108,7 +117,7 @@ impl SystemTray {
         TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
             // Only handle double-click with left mouse button
             if let TrayIconEvent::DoubleClick { button, .. } = event {
-                if button == MouseButton::Left {
+                if button == MouseButton::Left && !crate::settings_dialog::focus_if_open() {
                     let _ = tx_tray.try_send(TrayCommand::OpenSettings);
                 }
             }

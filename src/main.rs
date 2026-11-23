@@ -16,6 +16,7 @@ mod od_controls;
 mod process;
 mod settings_dialog;
 mod shell;
+mod single_instance;
 mod startup;
 mod theme;
 mod tray;
@@ -41,6 +42,15 @@ fn main() {
     }
 
     log::info!("Rust Background Muter starting (lightweight mode)...");
+
+    // One instance only: a second launch just brings the running window forward, the way
+    // a taskbar button would. Exit silently when there is nothing to show yet.
+    if !single_instance::acquire() {
+        log::info!("Another instance is running; focusing it");
+        let title = settings_dialog::window_title();
+        let _ = single_instance::focus_existing(&title);
+        return;
+    }
 
     // Load configuration
     let config = Arc::new(RwLock::new(Config::load()));

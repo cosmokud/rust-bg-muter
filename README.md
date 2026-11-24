@@ -205,6 +205,8 @@ Please report vulnerabilities privately, not in a public issue. See [SECURITY.md
 
 Licensed under the MIT License. See [LICENSE](LICENSE).
 
+The app is built out of other people's code as much as its own — the Windows bindings, the tray icon, the image decoders, the settings storage — and each of those carries its own licence, with the notices MIT and BSD ask to be reproduced. [THIRD-PARTY.md](THIRD-PARTY.md) lists every dependency grouped by licence, with the copyright holders beside it, and the full texts are in [`LICENSES/`](LICENSES). Both are generated from the dependency tree rather than kept by hand; `generate-attribution.ps1` refreshes them.
+
 ---
 
 <h2 align="center">Part of Rust Windows Series</h2>
